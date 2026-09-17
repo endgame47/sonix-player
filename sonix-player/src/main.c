@@ -949,8 +949,13 @@ static void tune_kinetic_scroll(lv_indev_t *indev) {
 	indev->scroll_limit = SCROLL_START_LIMIT_PX;
 }
 
-#define SCREEN_WIDTH 480
-#define SCREEN_HEIGHT 720
+#if defined(BOARD_R1)
+	#define SCREEN_WIDTH 480
+	#define SCREEN_HEIGHT 800
+#else
+	#define SCREEN_WIDTH 480
+	#define SCREEN_HEIGHT 720
+#endif
 
 static uint32_t custom_tick_get(void) {
 	struct timespec ts;
