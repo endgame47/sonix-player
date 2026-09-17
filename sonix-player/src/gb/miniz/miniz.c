@@ -1,9 +1,8 @@
-// Vedere miniz.h per il perche' di questo file al posto di miniz intero.
+// See miniz.h for what this file stands in for.
 
 #include "miniz.h"
 
-// CRC32 di zlib, tabella calcolata al primo uso invece che scritta qui: 1 KB
-// di tabella nel sorgente non aggiunge niente a 15 righe di codice.
+// The zlib CRC32, polynomial 0xEDB88320. The table is built on first use.
 mz_ulong mz_crc32(mz_ulong crc, const unsigned char *ptr, size_t buf_len) {
 	static unsigned long table[256];
 	static int built;
@@ -30,11 +29,9 @@ mz_ulong mz_crc32(mz_ulong crc, const unsigned char *ptr, size_t buf_len) {
 	return (mz_ulong)((c ^ 0xFFFFFFFFUL) & 0xFFFFFFFFUL);
 }
 
-// --- lo zip che non c'e' ---------------------------------------------------
+// --- the zip that is not there ----------------------------------------------
 //
-// Rispondere "non e' uno zip" e' la risposta giusta: Cartridge::LoadFromZipFile
-// ci arriva solo quando il nome del file finisce per .zip, e in questo player
-// le ROM arrivano da un buffer.
+// Cartridge::LoadFromZipFile is reached only when the file name ends in .zip.
 
 mz_bool mz_zip_reader_init_mem(mz_zip_archive *zip, const void *mem, size_t size, mz_uint flags) {
 	(void)zip;

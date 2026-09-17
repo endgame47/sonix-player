@@ -1,21 +1,15 @@
 #ifndef GB_MINIZ_SHIM_H
 #define GB_MINIZ_SHIM_H
 
-// Il pezzetto di miniz che serve a Gearboy, e nient'altro.
+// The part of miniz Gearboy reaches for, and nothing else.
 //
-// Perche' non miniz vero. Gearboy usa miniz per due cose molto diverse: il
-// CRC32 con cui riconosce un paio di cartucce multi-gioco, e la lettura di ROM
-// dentro un file .zip. Il primo servono venti righe; il secondo ottomila, e in
-// questo player non serve a niente -- le ROM arrivano da un buffer in memoria.
+// Gearboy calls miniz for two things: the CRC32 it identifies the M161 and
+// MultiMBC1 cartridges with, and reading a ROM out of a .zip. Only the CRC32
+// is real here; the zip reader always answers "not a zip".
 //
-// E miniz intero non si puo' nemmeno mettere accanto a quello che il player ha
-// gia': src/system/image/miniz e' il sottoinsieme di inflate che decodifica i
-// PNG delle copertine, e i due esportano gli stessi simboli. Il linker se ne
-// accorge subito ("multiple definition of tinfl_decompressor_free").
-//
-// Quindi: CRC32 vero, lettore di zip che risponde sempre "no". Cosi' i
-// sorgenti di Gearboy restano identici a quelli a monte -- e aggiornarli
-// resta una copia e non una fusione a mano.
+// Real miniz cannot be linked beside src/system/image/miniz, the inflate
+// subset that decodes cover-art PNGs: the two export the same symbols, and the
+// link stops at "multiple definition of tinfl_decompressor_free".
 
 #include <stddef.h>
 
@@ -29,12 +23,11 @@ typedef unsigned long mz_ulong;
 
 #define MZ_CRC32_INIT (0)
 
-// Il CRC32 di zlib, quello vero: Gearboy ci riconosce le cartucce M161 e
-// MultiMBC1 confrontando somme note, quindi qui una scorciatoia darebbe il
-// mapper sbagliato su quelle due.
+// The real zlib CRC32: Gearboy matches the result against known cartridge
+// sums, so an approximation picks the wrong mapper on those two.
 mz_ulong mz_crc32(mz_ulong crc, const unsigned char *ptr, size_t buf_len);
 
-// --- il lettore di zip, che qui non legge niente --------------------------
+// --- the zip reader, which reads nothing ----------------------------------
 
 typedef struct {
 	void *unused;
