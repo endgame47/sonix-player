@@ -1145,7 +1145,11 @@ static bool combo_release(int code) {
 static keymap_button_t keymap_button_for_code(int code) {
 	switch (code) {
 	case KEY_NEXTSONG:
+#if defined(BOARD_R1)
+		return KEYMAP_BTN_NEXT;
+#else
 		return KEYMAP_BTN_PREV;
+#endif
 	case KEY_PREVIOUSSONG:
 		return KEYMAP_BTN_NEXT;
 	case KEY_PLAYPAUSE:
