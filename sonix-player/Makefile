@@ -1,5 +1,13 @@
 # Makefile for sonix_player
 
+# Board selector -- `make target BOARD=r1` (default r3proii if unset). 
+# Gates BOARD_DEFINE (-DBOARD_R3PROII / -DBOARD_R1
+BOARD ?= r3proii
+ifeq ($(filter $(BOARD),r3proii r1),)
+$(error Unknown BOARD '$(BOARD)' -- expected r3proii or r1)
+endif
+BOARD_DEFINE = -DBOARD_$(shell echo $(BOARD) | tr a-z A-Z)
+
 # Target executables
 HOST_BIN = sonix_player_host
 TARGET_BIN = sonix_player
@@ -50,13 +58,13 @@ CFLAGS = -O3 -g -Wall -MMD -MP -D_FILE_OFFSET_BITS=64 -I. -I$(LVGL_DIR) -DLV_CON
 # libwavpack-dev); on the target they are the ones this Makefile builds below.
 # opusfile.h includes <opus_multistream.h> unprefixed, so the opus/ directory
 # has to be among the -I in both cases.
-HOST_CFLAGS = $(CFLAGS) -DHOST_BUILD=1 $(shell sdl2-config --cflags) $(shell pkg-config --cflags freetype2) \
+HOST_CFLAGS = $(CFLAGS) -DHOST_BUILD=1 $(BOARD_DEFINE) $(shell sdl2-config --cflags) $(shell pkg-config --cflags freetype2) \
 			  $(shell pkg-config --cflags opusfile wavpack)
 # -include glibc_compat.h must enter EVERY translation unit of the target
 # build: it carries the .symver lines that keep five maths functions on the
 # names the device's glibc 2.22 knows, and a .symver applies only to its own
 # unit. Target only.
-TARGET_CFLAGS = $(CFLAGS) -I$(LVGL_DIR)/src -I$(FREETYPE_PREFIX)/include/freetype2 \
+TARGET_CFLAGS = $(CFLAGS) $(BOARD_DEFINE) -I$(LVGL_DIR)/src -I$(FREETYPE_PREFIX)/include/freetype2 \
 				-I$(AUDIO_PREFIX)/include -I$(AUDIO_PREFIX)/include/opus \
 				-include src/system/core/glibc_compat.h
 
