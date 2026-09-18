@@ -1624,21 +1624,28 @@ void power_hold_screen_on(bool hold) {
 // FUN_00481fc0). With it on, blanking the panel leaves the controller
 // listening for a double tap, which it reports as a power-key press -- the
 // button threads then wake the screen exactly as the real power key would.
-#define GESTURE_WAKE_NODE "/sys/devices/i2c-1/1-0014/gesture_sw"
 
 bool power_double_tap_wake_enabled(void) { return g_double_tap_wake; }
 
-void power_set_double_tap_wake(bool enabled) {
-	g_double_tap_wake = enabled;
-	FILE *f = fopen(GESTURE_WAKE_NODE, "w");
-	if (!f) {
-		printf("power: gesture node %s not writable\n", GESTURE_WAKE_NODE);
-		return; // host build, or an unexpected firmware: nothing to switch
+#ifdef BOARD_R1
+	// R1 does not support the required "gesture". GESTURE_WAKE_NODE does 
+	// not exist and there is no equivalent i2c device
+	void power_set_double_tap_wake(bool enabled) { }
+#else
+	#define GESTURE_WAKE_NODE "/sys/devices/i2c-1/1-0014/gesture_sw"
+
+	void power_set_double_tap_wake(bool enabled) {
+		g_double_tap_wake = enabled;
+		FILE *f = fopen(GESTURE_WAKE_NODE, "w");
+		if (!f) {
+			printf("power: gesture node %s not writable\n", GESTURE_WAKE_NODE);
+			return; // host build, or an unexpected firmware: nothing to switch
+		}
+		fputs(enabled ? "on" : "off", f);
+		fclose(f);
+		printf("power: double-tap wake %s\n", enabled ? "on" : "off");
 	}
-	fputs(enabled ? "on" : "off", f);
-	fclose(f);
-	printf("power: double-tap wake %s\n", enabled ? "on" : "off");
-}
+#endif
 
 void power_set_screen_off_enabled(bool enabled) { g_cfg.screen_off_enabled = enabled; }
 void power_set_screen_off_timeout(uint32_t ms) { g_cfg.screen_off_timeout_ms = ms; }

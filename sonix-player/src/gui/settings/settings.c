@@ -56,20 +56,26 @@ static lv_obj_t *screensettings_screen;
 static lv_obj_t *othersettings_screen;
 static lv_obj_t *brightness_slider;
 static lv_obj_t *brightness_value;
+#ifndef BOARD_R1
 static lv_obj_t *doubletap_switch;
+#endif
 static lv_obj_t *screensaver_switch;
 static lv_obj_t *screensaver_pills;
 static lv_obj_t *screensaver_album_pill;
 static lv_obj_t *screensaver_images_pill;
 static lv_obj_t *rotate_switch;
 
-static void doubletap_toggle_cb(lv_event_t *e) {
-	(void)e;
-	bool on = lv_obj_has_state(doubletap_switch, LV_STATE_CHECKED);
-	config_set_int("screen", "double_tap_wake", on ? 1 : 0);
-	config_save();
-	power_set_double_tap_wake(on);
-}
+#ifdef BOARD_R1
+	// R1 does not support the required "gesture"
+#else
+	static void doubletap_toggle_cb(lv_event_t *e) {
+		(void)e;
+		bool on = lv_obj_has_state(doubletap_switch, LV_STATE_CHECKED);
+		config_set_int("screen", "double_tap_wake", on ? 1 : 0);
+		config_save();
+		power_set_double_tap_wake(on);
+	}
+#endif
 
 // The two pills under the switch, and which of them is lit. Hidden with the
 // screensaver off: "album or pictures" means nothing when there is no
@@ -249,13 +255,17 @@ static void build_screen_page(gui_config_t *cfg) {
 	lv_obj_add_event_cb(brightness_slider, brightness_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
 	lv_obj_add_event_cb(brightness_slider, brightness_released_cb, LV_EVENT_RELEASED, NULL);
 
-	// Double-tap to wake: the touch controller's gesture mode. With the
-	// screen off, two taps light it back up -- the way the stock player's
-	// option works, through the same sysfs switch.
-	settingsrow_toggle(container, "settings_double_tap_to_wake", &doubletap_switch, doubletap_toggle_cb);
-	if (config_get_int("screen", "double_tap_wake", 0)) {
-		lv_obj_add_state(doubletap_switch, LV_STATE_CHECKED);
-	}
+	#ifdef BOARD_R1
+		// R1 does not support the required "gesture"
+	#else
+		// Double-tap to wake: the touch controller's gesture mode. With the
+		// screen off, two taps light it back up -- the way the stock player's
+		// option works, through the same sysfs switch.
+		settingsrow_toggle(container, "settings_double_tap_to_wake", &doubletap_switch, doubletap_toggle_cb);
+		if (config_get_int("screen", "double_tap_wake", 0)) {
+			lv_obj_add_state(doubletap_switch, LV_STATE_CHECKED);
+		}
+	#endif
 
 	// The screensaver: a picture, the track and the time over everything else
 	// the moment the panel lights back up. A swipe up puts it away. The pills
