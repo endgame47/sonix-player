@@ -557,7 +557,11 @@ static void route_info(client_t *c) {
 	memset(&j, 0, sizeof(j));
 	buf_str(&j, "{");
 	buf_json_field(&j, "name", device_name_text, true);
-	buf_json_field(&j, "model", "HiBy R3 Pro II", true);
+	#ifdef BOARD_R1
+		buf_json_field(&j, "model", "HiBy R1", true);
+	#else
+		buf_json_field(&j, "model", "HiBy R3 Pro II", true);
+	#endif
 	buf_json_field(&j, "firmware", sysinfo_os_version(), true);
 	buf_json_field(&j, "serial", sysinfo_serial_number(), true);
 	buf_fmt(&j, "\"api\":1,\"port\":%d,", SONIXLINK_PORT);
