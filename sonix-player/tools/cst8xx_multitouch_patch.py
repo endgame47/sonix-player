@@ -2,17 +2,16 @@
 """
 Removes the one-contact cap from the R1's touchscreen driver.
 
-The stock cst8xx_touch.ko reports a single finger even though the FIXME
-panel under it reports two. Two separate things cause that, and both have to
+The stock cst8xx_touch.ko reports a single finger even though the panel 
+under it reports two. Two separate things cause that, and both have to
 be dealt with:
 
-  1. FIXME
-     This script patches it out of the compiled module.
-  2. cst_max_touch_number=2 on the insmod line, which makes the driver throw
-     away any frame carrying more contacts than that. This script rewrites the
-     insmod line in cst8xx_touch.sh.
+  1. Setting the number of allowed touches to 1 in init_module.
+     This script patches it in the compiled module.
+  2. cst_max_touch_number=1 on the insmod line. 
+     This script rewrites the line in cst8xx_touch.sh.
 
-FIXME: PATCHES.md has the full account of both.
+FIXME: Explain things in PATCHES.md.
 
     python3 tools/cst8xx_multitouch_patch.py <module_driver directory>
     python3 tools/cst8xx_multitouch_patch.py --check  <directory>
@@ -34,7 +33,15 @@ MODULE = "cst8xx_touch.ko"
 SCRIPT = "cst8xx_touch.sh"
 BACKUP_SUFFIX = ".orig"
 
-# FIXME
+# The three instructions that set touches to 1, as they are assembled in the
+# stock module:
+#
+#       00  05  02  24    li         v0,0x500           puVar4[0x13] = 0x500;
+#       4c  00  22  ae    sw         v0,0x4c (s1)
+#       01  00  02  24    li         v0,0x1             puVar4[0x16] = 1;
+#
+# The first two are matched only to place the third, which is the one replaced.
+# Little-endian words, as they sit in the file.
 
 ANCHOR = struct.pack("<III", 0x24020500, 0xAE22004C, 0x24020001)
 BRANCH_OFFSET = 8 # where the instruction sits inside ANCHOR
@@ -43,7 +50,7 @@ PATCHED_BRANCH = struct.pack("<I", 0x24020002)
 # What a patched module looks like: the same two instructions, then the value 2
 ANCHOR_PATCHED = ANCHOR[:BRANCH_OFFSET] + PATCHED_BRANCH
 
-# Contacts the FIXME reports.
+# Contacts the panel reports.
 MAX_TOUCH = 2
 
 
