@@ -3,6 +3,7 @@
 Removes the one-contact cap from the R1's touchscreen driver.
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 The stock cst8xx_touch.ko reports a single finger even though the panel 
 under it reports two. Two separate things cause that, and both have to
 be dealt with:
@@ -16,16 +17,23 @@ FIXME: Explain things in PATCHES.md.
 =======
 The stock cst8xx_touch.ko reports a single finger even though the FIXME
 panel under it reports two. Two separate things cause that, and both have to
+=======
+The stock cst8xx_touch.ko reports a single finger even though the panel 
+under it reports two. Two separate things cause that, and both have to
+>>>>>>> 533e97b (Update some documentation in cst8xx_multitouch_patch.py)
 be dealt with:
 
-  1. FIXME
-     This script patches it out of the compiled module.
-  2. cst_max_touch_number=2 on the insmod line, which makes the driver throw
-     away any frame carrying more contacts than that. This script rewrites the
-     insmod line in cst8xx_touch.sh.
+  1. Setting the number of allowed touches to 1 in init_module.
+     This script patches it in the compiled module.
+  2. cst_max_touch_number=1 on the insmod line. 
+     This script rewrites the line in cst8xx_touch.sh.
 
+<<<<<<< HEAD
 FIXME: PATCHES.md has the full account of both.
 >>>>>>> 4da2910 (Script to patch the R1's cst8xxx driver to allow for two touches instead of one.)
+=======
+FIXME: Explain things in PATCHES.md.
+>>>>>>> 533e97b (Update some documentation in cst8xx_multitouch_patch.py)
 
     python3 tools/cst8xx_multitouch_patch.py <module_driver directory>
     python3 tools/cst8xx_multitouch_patch.py --check  <directory>
@@ -48,6 +56,9 @@ SCRIPT = "cst8xx_touch.sh"
 BACKUP_SUFFIX = ".orig"
 
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 533e97b (Update some documentation in cst8xx_multitouch_patch.py)
 # The three instructions that set touches to 1, as they are assembled in the
 # stock module:
 #
@@ -57,9 +68,12 @@ BACKUP_SUFFIX = ".orig"
 #
 # The first two are matched only to place the third, which is the one replaced.
 # Little-endian words, as they sit in the file.
+<<<<<<< HEAD
 =======
 # FIXME
 >>>>>>> 4da2910 (Script to patch the R1's cst8xxx driver to allow for two touches instead of one.)
+=======
+>>>>>>> 533e97b (Update some documentation in cst8xx_multitouch_patch.py)
 
 ANCHOR = struct.pack("<III", 0x24020500, 0xAE22004C, 0x24020001)
 BRANCH_OFFSET = 8 # where the instruction sits inside ANCHOR
@@ -69,10 +83,14 @@ PATCHED_BRANCH = struct.pack("<I", 0x24020002)
 ANCHOR_PATCHED = ANCHOR[:BRANCH_OFFSET] + PATCHED_BRANCH
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 # Contacts the panel reports.
 =======
 # Contacts the FIXME reports.
 >>>>>>> 4da2910 (Script to patch the R1's cst8xxx driver to allow for two touches instead of one.)
+=======
+# Contacts the panel reports.
+>>>>>>> 533e97b (Update some documentation in cst8xx_multitouch_patch.py)
 MAX_TOUCH = 2
 
 
