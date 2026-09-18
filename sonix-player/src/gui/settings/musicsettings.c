@@ -1493,17 +1493,25 @@ void musicsettings_init(gui_config_t *cfg) {
 	build_filter_page(cfg);
 	settingsrow_add(container, "musicsettings_filters", NULL, switch_screen_cb, dacfilter_screen);
 
-	// Non-oversampling, off by default like the stock player.
-	settingsrow_toggle(container, "musicsettings_nos", &nos_switch, nos_toggle_cb);
-	if (config_get_int("audio", "dac_nos", 0)) {
-		lv_obj_add_state(nos_switch, LV_STATE_CHECKED);
-	}
+	#ifdef BOARD_R1
+		// R1 does not have the NOS_EN option in ALSA
+	#else
+		// Non-oversampling, off by default like the stock player.
+		settingsrow_toggle(container, "musicsettings_nos", &nos_switch, nos_toggle_cb);
+		if (config_get_int("audio", "dac_nos", 0)) {
+			lv_obj_add_state(nos_switch, LV_STATE_CHECKED);
+		}
+	#endif
 
-	// The DAC's dynamic-range enhancement, on by default like the stock player.
-	settingsrow_toggle(container, "musicsettings_dac_dre", &dre_switch, dre_toggle_cb);
-	if (config_get_int("audio", "dac_dre", 1)) {
-		lv_obj_add_state(dre_switch, LV_STATE_CHECKED);
-	}
+	#ifdef BOARD_R1
+		// R1 does not have the DRE_EN option in ALSA
+	#else
+		// The DAC's dynamic-range enhancement, on by default like the stock player.
+		settingsrow_toggle(container, "musicsettings_dac_dre", &dre_switch, dre_toggle_cb);
+		if (config_get_int("audio", "dac_dre", 1)) {
+			lv_obj_add_state(dre_switch, LV_STATE_CHECKED);
+		}
+	#endif
 
 	theme_register_refresh(rg_refresh);
 	theme_register_refresh(dsd_refresh);
