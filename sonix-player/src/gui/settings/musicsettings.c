@@ -1494,7 +1494,7 @@ void musicsettings_init(gui_config_t *cfg) {
 	settingsrow_add(container, "musicsettings_filters", NULL, switch_screen_cb, dacfilter_screen);
 
 	#ifdef BOARD_R1
-		// R1 does not have the NOS_EN option in amixer
+		// R1 does not have the NOS_EN option in ALSA
 	#else
 		// Non-oversampling, off by default like the stock player.
 		settingsrow_toggle(container, "musicsettings_nos", &nos_switch, nos_toggle_cb);
@@ -1504,7 +1504,7 @@ void musicsettings_init(gui_config_t *cfg) {
 	#endif
 
 	#ifdef BOARD_R1
-		// R1 does not have the DRE_EN option in amxier
+		// R1 does not have the DRE_EN option in ALSA
 	#else
 		// The DAC's dynamic-range enhancement, on by default like the stock player.
 		settingsrow_toggle(container, "musicsettings_dac_dre", &dre_switch, dre_toggle_cb);
