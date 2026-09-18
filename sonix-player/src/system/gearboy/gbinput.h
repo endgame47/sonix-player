@@ -37,7 +37,11 @@ typedef struct {
 
 // How many contacts are tracked. Five is what the patched driver reports, one
 // finger more than needed.
-#define GBINPUT_MAX_CONTACTS 5
+#ifdef BOARD_R1
+	#define GBINPUT_MAX_CONTACTS 2
+#else
+	#define GBINPUT_MAX_CONTACTS 5
+#endif
 
 // Takes the screen. `zones` is copied, so the caller may free it. False when
 // the evdev node does not open: play then has no controls, which is useless but

@@ -55,8 +55,13 @@ static void (*menu_cb)(void);
 //
 // Named GLASS_ rather than PANEL_ because PANEL_H is already the include guard
 // of panel.h, which this file includes.
-#define GLASS_W 480
-#define GLASS_H 720
+#ifdef BOARD_R1
+	#define GLASS_W 480
+	#define GLASS_H 800
+#else
+	#define GLASS_W 480
+	#define GLASS_H 720
+#endif
 
 static int abs_min_x, abs_max_x, abs_min_y, abs_max_y;
 
