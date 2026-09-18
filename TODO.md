@@ -11,7 +11,8 @@
 - [x] Hard-coded settings/strings (like About screen)  
 - [x] Disable DAC-specific settings the R1 does not have (NOS, DRE)  
 - [x] Create patch for cst8xx (similar to R3ProII's gt9xx patch) touchscreen multi-touch  
-- [-] Adapt Gearboy to R1's screen resolution  
+- [ ] Adapt Gearboy to R1's screen resolution  
+- [ ] Tap
 
 ## Sonix Packer
 
