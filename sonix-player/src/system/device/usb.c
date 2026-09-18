@@ -72,13 +72,21 @@ static enum { EXPORT_NONE, EXPORT_OWN_GADGET, EXPORT_ADB_COMPOSITE } export_mode
 // shown a card reader wearing the same identity.
 #define USB_ID_PRODUCT "0x0101"
 #define USB_MANUFACTURER "HiBy"
-#define USB_PRODUCT "R3 Pro II"
+#ifdef BOARD_R1
+	#define USB_PRODUCT "R1"
+#else
+	#define USB_PRODUCT "R3 Pro II"
+#endif
 
 // What the LUN answers to a SCSI INQUIRY: vendor (8), product (16), revision
 // (4). Without it the mass-storage function reports "Linux / File-Stor Gadget",
 // which is what a bare gadget looks like; the stock writes its own, and some
 // hosts -- Android among them -- are fussier about a card reader than a PC is.
-#define USB_INQUIRY_STRING "HiBy    R3 Pro II U-DISK0100"
+#ifdef BOARD_R1
+	#define USB_INQUIRY_STRING "HiBy    R1 U-DISK0100"
+#else
+	#define USB_INQUIRY_STRING "HiBy    R3 Pro II U-DISK0100"
+#endif
 
 #define STORAGE_GADGET "/sys/kernel/config/usb_gadget/android0"
 

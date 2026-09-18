@@ -238,11 +238,19 @@ static void build_sysinfo_page(gui_config_t *cfg) {
 	// number are the same in every language.
 	lv_obj_t *device_value = NULL;
 	info_row(container, "system_device", &device_value);
-	lv_label_set_text(device_value, "Hiby R3 Pro II");
+	#ifdef BOARD_R1
+		lv_label_set_text(device_value, "Hiby R1");
+	#else
+		lv_label_set_text(device_value, "Hiby R3 Pro II");
+	#endif
 
 	lv_obj_t *dac_value = NULL;
 	info_row(container, "dac", &dac_value);
-	lv_label_set_text(dac_value, "Dual Cirrus Logic CS43198");
+	#ifdef BOARD_R1
+		lv_label_set_text(dac_value, "Cirrus Logic CS43131");
+	#else
+		lv_label_set_text(dac_value, "Dual Cirrus Logic CS43198");
+	#endif
 
 	// The serial number, from the SoC efuse: the same one printed on the box
 	// ("R3PII" plus the first eight hex digits of the chip id). Not translated,
