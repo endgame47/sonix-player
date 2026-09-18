@@ -12,7 +12,11 @@
 - [x] Disable DAC-specific settings the R1 does not have (NOS, DRE)  
 - [x] Create patch for cst8xx (similar to R3ProII's gt9xx patch) touchscreen multi-touch  
 - [ ] Adapt Gearboy to R1's screen resolution  
+<<<<<<< HEAD
 - [x] Remove "Double tap to wake" option, R1 does not have the required hardware  
+=======
+- [ ] Tap
+>>>>>>> 430ddde (Suppress warnings for unused NOS/DRE functions)
 
 ## Sonix Packer
 
