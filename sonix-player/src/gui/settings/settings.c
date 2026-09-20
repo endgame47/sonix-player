@@ -56,6 +56,8 @@ static lv_obj_t *screensettings_screen;
 static lv_obj_t *othersettings_screen;
 static lv_obj_t *brightness_slider;
 static lv_obj_t *brightness_value;
+static lv_obj_t *screen_off_value;
+static lv_obj_t *screen_off_slider;
 #ifndef BOARD_R1
 static lv_obj_t *doubletap_switch;
 #endif
@@ -295,6 +297,14 @@ static void build_screen_page(gui_config_t *cfg) {
 
 	lv_obj_add_event_cb(brightness_slider, brightness_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
 	lv_obj_add_event_cb(brightness_slider, brightness_released_cb, LV_EVENT_RELEASED, NULL);
+
+	// How long the panel waits before it goes dark. Straight under the
+	// brightness: both are about the panel, and the one that switches it off is
+	// the first thing looked for after the one that sets how bright it is.
+	settingsrow_slider(container, "power_screen_off", SCREEN_OFF_COUNT, &screen_off_value, &screen_off_slider,
+					   screen_off_changed_cb);
+	lv_slider_set_value(screen_off_slider, screen_off_index(), LV_ANIM_OFF);
+	lv_label_set_text(screen_off_value, tr(SCREEN_OFF[screen_off_index()].label));
 
 	#ifdef BOARD_R1
 		// R1 does not support the required "gesture"
