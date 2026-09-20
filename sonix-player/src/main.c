@@ -22,6 +22,7 @@
 #include "src/gui/shell/gui.h"
 #include "src/gui/nowplaying/player.h"
 #include "src/gui/settings/powersettings.h"
+#include "src/gui/settings/settings.h"
 #include "src/system/device/adb.h"
 #include "src/system/audio/alsa-controls.h"
 #include "src/system/playback/sleeptimer.h"
@@ -464,6 +465,12 @@ static void crash_handler(int sig, siginfo_t *info, void *context) {
 	fsync(STDERR_FILENO);
 	sync();
 
+	// The charger back on. The player is about to sit here doing nothing, and
+	// if it went down holding the charge limit the battery would never fill
+	// again -- the charger driver keeps that bit until the next boot. One write
+	// to one sysfs node, which is safe enough to do from here.
+	power_charging_release();
+
 	for (;;) {
 		pause();
 	}
@@ -748,7 +755,18 @@ static void watchdog_dump_threads(void) {
 static void *watchdog_thread(void *arg) {
 	(void)arg;
 
+	// Above the playback thread, which runs SCHED_RR at 10.
+	//
+	// The whole point of this thread is to report a device that has stopped
+	// answering, and the way it stops answering on one core is a real-time
+	// thread that never blocks. At normal priority the watchdog is exactly as
+	// starved as the interface it is meant to report on -- which is why a freeze
+	// can leave a log with nothing in it at all. It sleeps a second at a time
+	// and then reads a few files, so it cannot take anything from the audio.
+	thread_be_realtime("watchdog", 20);
+
 	uint32_t last = ui_heartbeat;
+	unsigned last_turns = audio_loop_turns();
 	int stalled_for = 0;
 	bool dumped = false;
 
@@ -761,6 +779,10 @@ static void *watchdog_thread(void *arg) {
 
 	for (;;) {
 		sleep(1);
+
+		unsigned turns = audio_loop_turns();
+		unsigned turns_this_second = turns - last_turns;
+		last_turns = turns;
 
 		long waiting_ms = audio_play_request_age_ms();
 		if (waiting_ms >= WATCHDOG_PLAY_STALL_MS) {
@@ -787,7 +809,9 @@ static void *watchdog_thread(void *arg) {
 
 		stalled_for++;
 		if (stalled_for >= WATCHDOG_STALL_SECONDS && !dumped) {
-			fprintf(stderr, "watchdog: UI thread has not run for %d s -- thread dump:\n", stalled_for);
+			fprintf(stderr, "watchdog: UI thread has not run for %d s (playback loop %u turns in the last second) "
+							"-- thread dump:\n",
+					stalled_for, turns_this_second);
 			watchdog_dump_threads();
 			dumped = true; // once per stall, not once per second
 		}
@@ -2022,8 +2046,10 @@ int main(int argc, char **argv) {
 
 	power_init(&power_cfg, disp);
 
-	// Screen timeout, charge limit and automatic shutdown, as they were left.
+	// Charge limit, automatic shutdown and standby, as they were left. The
+	// screen timeout is the Screen page's setting and comes from there.
 	powersettings_apply();
+	settings_apply_screen_off();
 
 #ifndef HOST_BUILD
 	// Bluetooth off. A firmware whose /etc/init.d/S80_bt_init has not been

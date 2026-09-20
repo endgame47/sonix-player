@@ -48,6 +48,15 @@ void gui_post_service(void);
 
 void gui_notify_popup(const char *text);
 
+// Whether the card is there and ours. False while it is exported to a computer
+// and false when there is none in the slot.
+bool gui_card_available(void);
+
+// Says which of the two it is. The library cannot tell them apart -- its index
+// is on the card either way -- and the wrong one of the two sends the user
+// looking for a cable that is not plugged in, or for a card that is.
+void gui_notify_no_card(void);
+
 // The same three-second notice with a glyph over the sentence, recoloured to
 // `color`. For the messages that are about a thing rather than about a
 // failure -- the headphones, when the volume belongs to them and not to the

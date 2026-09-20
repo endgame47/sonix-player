@@ -2508,13 +2508,12 @@ static void show_corner(lv_obj_t *btn, bool shown) {
 }
 
 void medialist_open(const char *title, library_list_t kind, library_filter_t filter, const char *filter_value) {
-	// Nothing to open while the card is at the computer. The index lives on the
-	// card and the export closes it, so every list here would come up empty --
-	// and an empty list under a title, with "scan the library" written across
-	// it, tells the user to do the one thing that cannot work right now. The
-	// message the export itself puts up says what is actually going on.
+	// Nothing to open without the card. The index lives on it, so every list
+	// here would come up empty -- and an empty list under a title, with "scan
+	// the library" written across it, tells the user to do the one thing that
+	// cannot work right now.
 	if (!library_is_open()) {
-		gui_notify_popup("usb_storage_shared");
+		gui_notify_no_card();
 		return;
 	}
 

@@ -83,9 +83,10 @@ unsigned usbdac_serial(void);
 // drawing charge current off the same cable it is taking audio from is a noise
 // source, and some people would rather run off the battery.
 //
-// This clamps the input current the charger is allowed to take, through
-// /sys/class/power_supply/usb/charge_control_limit_max. It is remembered in
-// config as [usb] dac_charge_disable and applied whenever DAC mode starts.
+// It stops the charge rather than throttling the input: the cable keeps
+// supplying the player, and only what would go into the battery is held off.
+// Remembered in config as [usb] dac_charge_disable and applied whenever DAC
+// mode starts.
 void usbdac_set_charging(bool enabled);
 bool usbdac_charging_enabled(void);
 

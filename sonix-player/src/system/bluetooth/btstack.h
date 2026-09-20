@@ -198,9 +198,35 @@ bool btstack_media_command(const char *address, const char *member);
 // end caused the change.
 bool btstack_media_status(char *out, size_t size);
 
-// Reads that property outright, for the moment a link comes up and no signal
-// has been sent yet. On the Bluetooth worker, like everything else here.
+// What the remote player says it is playing, out of AVRCP's track metadata.
+// bluez publishes it as the MediaPlayer1 Track property and announces every
+// change, so this is a cache rather than a call.
+typedef struct {
+	char title[128];
+	char artist[128];
+	char album[128];
+	unsigned duration_ms; // 0 when the sender did not say
+} btstack_track_t;
+
+bool btstack_media_track(btstack_track_t *out);
+
+// Bumped whenever the cache above changes, so a page can redraw on the change
+// rather than on a timer.
+unsigned btstack_media_serial(void);
+
+// Reads the status and the track outright, for the moment a link comes up and
+// no signal has been sent yet. On the Bluetooth worker, like everything else
+// here.
+//
+// What it reads replaces the cache; what it fails to read leaves the cache
+// alone. The player object is looked up on every call and the reads can be
+// refused while a link is renegotiating, and a failure there says nothing about
+// what the device is playing.
 void btstack_refresh_media_status(const char *address);
+
+// Empties both caches. For the sender going away: nothing is streaming, so the
+// last track is not what is playing.
+void btstack_forget_media(void);
 
 // Records a status without asking anyone. For the instant after a command is
 // sent: the signal that confirms it is a round trip away, and a second press
@@ -213,6 +239,18 @@ void btstack_refresh_audio(void);
 
 // What the sink offers and what it settled on, over org.bluealsa.PCM1.
 int btstack_codecs(const char *address, char out[][BT_CODEC_NAME_MAX], int max, char *selected, size_t selected_size);
+
+// The same two, either way round. `receiving` picks the a2dpsnk/source PCM --
+// what a phone is sending to this player -- instead of the a2dpsrc/sink one.
+int btstack_codecs_dir(const char *address, bool receiving, char out[][BT_CODEC_NAME_MAX], int max, char *selected,
+					   size_t selected_size);
+bool btstack_select_codec_dir(const char *address, bool receiving, const char *codec);
+
+// The PCM's volume word, both channels and their mute bits together. Carried
+// whole across a codec change: the new PCM starts at bluealsa's default and
+// nothing resends what the other end had already set.
+bool btstack_pcm_volume_get(const char *address, bool receiving, int *out);
+bool btstack_pcm_volume_set(const char *address, bool receiving, int volume);
 bool btstack_select_codec(const char *address, const char *codec);
 
 // One line describing the audio path bluealsa has actually built: the codec it

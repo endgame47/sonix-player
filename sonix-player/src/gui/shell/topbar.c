@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <time.h>
 
 #include "lvgl/lvgl.h"
@@ -70,6 +71,14 @@
 // while the plug is still going in, which is the only rate that reads as
 // "immediately".
 #define JACK_POLL_MS 250
+
+// How many of those polls have to agree before the charge state is acted on.
+#define CHARGE_SETTLE_POLLS 3
+
+// How far down a press has to end, with no drag having started, for the pull on
+// the status bar to count as a flick and open the control centre anyway.
+// Comfortably more than the wobble of a tap.
+#define FLICK_OPEN_PX 24
 
 static lv_obj_t *top_bar;
 static lv_obj_t *bat_widget;
@@ -303,6 +312,61 @@ static void refresh_headphone_icon(void) {
 	}
 }
 
+// The codec the Bluetooth link is carrying, in whichever direction it runs:
+// headphones being fed from here, or a phone sending to this player. Both are
+// cache reads, so this is safe on the poll. Empty when nothing is connected.
+static void bt_current_codec(char *out, size_t size) {
+	out[0] = '\0';
+
+	if (bluetooth_audio_active()) {
+		char offered[BT_MAX_CODECS][BT_CODEC_MAX];
+		char selected[BT_CODEC_MAX] = "";
+		bluetooth_get_codecs(offered, BT_MAX_CODECS, selected, sizeof(selected));
+		snprintf(out, size, "%s", selected);
+		return;
+	}
+
+	bt_stream_t stream;
+	if (bluetooth_receiver_stream(&stream)) {
+		snprintf(out, size, "%s", stream.codec);
+	}
+}
+
+// The Bluetooth glyph wears the colour of the codec family in use, out of the
+// Adwaita palette the rest of the interface is drawn from: orange for SBC,
+// green for AAC, purple for aptX, blue for LDAC, each in the light or dark
+// variant the palette gives for it.
+//
+// By family and not by name: aptX-HD is aptX and SBC-XQ is SBC, and a codec
+// this has never heard of gets no colour at all rather than a wrong one.
+// Compared on letters and digits only, in lower case, the way bluetooth.c
+// compares them -- bluealsa spells it "aptX-HD" and a config file might say
+// "aptx_hd".
+static bool bt_codec_color(const char *codec, lv_color_t *out) {
+	char key[BT_CODEC_MAX];
+	size_t used = 0;
+	for (const char *p = codec; *p && used + 1 < sizeof(key); p++) {
+		if (isalnum((unsigned char)*p)) {
+			key[used++] = (char)tolower((unsigned char)*p);
+		}
+	}
+	key[used] = '\0';
+
+	bool dark = theme_is_dark();
+	if (strncmp(key, "ldac", 4) == 0) {
+		*out = dark ? lv_color_make(0x62, 0xA0, 0xEA) : lv_color_make(0x1A, 0x5F, 0xB4);
+	} else if (strncmp(key, "aptx", 4) == 0) {
+		*out = dark ? lv_color_make(0xDC, 0x8A, 0xDD) : lv_color_make(0x81, 0x3D, 0x9C);
+	} else if (strncmp(key, "aac", 3) == 0) {
+		*out = dark ? lv_color_make(0x57, 0xE3, 0x89) : lv_color_make(0x26, 0xA2, 0x69);
+	} else if (strncmp(key, "sbc", 3) == 0) {
+		*out = dark ? lv_color_make(0xFF, 0xA3, 0x48) : lv_color_make(0xC6, 0x46, 0x00);
+	} else {
+		return false;
+	}
+	return true;
+}
+
 // The two radios, immediately left of the charge percentage: bluetooth first,
 // then wifi, so switching one on never moves the other. Each is hidden while
 // its radio is off and drawn at RADIO_IDLE_OPA while the radio is up with
@@ -355,6 +419,20 @@ void topbar_refresh_radios(void) {
 			lv_obj_remove_flag(bt_icon, LV_OBJ_FLAG_HIDDEN);
 			lv_obj_set_style_image_opa(bt_icon,
 									   bluetooth_get_state() == BT_STATE_CONNECTED ? LV_OPA_COVER : RADIO_IDLE_OPA, 0);
+
+			// A local colour while a codec is known, and the shared icon style
+			// back when it is not: a radio that is merely on has no codec to
+			// name, and the glyph belongs to the theme again.
+			char codec[BT_CODEC_MAX];
+			lv_color_t color;
+			bt_current_codec(codec, sizeof(codec));
+			if (codec[0] && bt_codec_color(codec, &color)) {
+				lv_obj_set_style_image_recolor(bt_icon, color, 0);
+				lv_obj_set_style_image_recolor_opa(bt_icon, LV_OPA_COVER, 0);
+			} else {
+				lv_obj_remove_local_style_prop(bt_icon, LV_STYLE_IMAGE_RECOLOR, 0);
+				lv_obj_remove_local_style_prop(bt_icon, LV_STYLE_IMAGE_RECOLOR_OPA, 0);
+			}
 		}
 	}
 
@@ -455,20 +533,66 @@ static void jack_timer_cb(lv_timer_t *timer) {
 	device_state_t state;
 	device_state_get(&state);
 	int percent = parse_percent(state.battery_percent);
-	int charging = state.battery_charging ? 1 : 0;
-	if (percent == last_battery_percent && charging == last_battery_charging) {
+
+	// "Charging" out of the power supplies means a cable that is supplying,
+	// which stays true long after the battery has stopped taking anything. What
+	// the bolt and the red LED are for is a charge in progress, so the two
+	// endings of one are taken out of it: the battery full, and the charger held
+	// off at the configured limit. The cable is still in and the player still
+	// runs off it -- there is simply nothing left to indicate.
+	bool done = state.battery_charging && percent >= 0 && (percent >= 100 || power_charging_held());
+
+	// One number for the whole answer, so the two halves can never disagree:
+	// 0 no cable, 1 a cable with nothing going into the battery, 2 charging.
+	int charge_state = !state.battery_charging ? 0 : (done ? 1 : 2);
+
+	// A new answer has to come back the same way CHARGE_SETTLE_POLLS times
+	// before it is acted on.
+	//
+	// The supplies do not read straight for a few seconds after the panel comes
+	// back: the panel's rails are opened and closed at the AXP2101, and
+	// /sys/class/power_supply/usb is that same PMIC, so the load step at the
+	// unblank lands in the middle of what is being read. Unfiltered it is a bolt
+	// appearing and vanishing four times a second, and -- the reason this is
+	// here -- an LED pattern rewritten on every flip. The charging red is a
+	// ramp programmed into the SGM31324, and a rewrite restarts the ramp, so
+	// what comes out is a red that stutters for as long as the reading wobbles.
+	//
+	// Three polls is three quarters of a second, which still shows a cable going
+	// in while the plug is still moving.
+	static int settled = -1; // the charge state currently being acted on
+	static int candidate = -1;
+	static int candidate_polls;
+
+	if (charge_state != candidate) {
+		candidate = charge_state;
+		candidate_polls = 1;
+		if (settled >= 0 && candidate != settled) {
+			static const char *const NAMES[] = {"no cable", "cable, not charging", "charging"};
+			printf("battery: the charge reading says %s; waiting for it to settle\n", NAMES[candidate]);
+		}
+	} else if (candidate_polls < CHARGE_SETTLE_POLLS) {
+		candidate_polls++;
+	}
+	if (settled < 0 || candidate_polls >= CHARGE_SETTLE_POLLS) {
+		settled = candidate;
+	}
+
+	if (percent == last_battery_percent && settled == last_battery_charging) {
 		return;
 	}
 	last_battery_percent = percent;
-	last_battery_charging = charging;
+	last_battery_charging = settled;
 
-	update_battery_indicator(percent, state.battery_charging);
+	update_battery_indicator(percent, settled == 2);
 
-	// And the LED, which says the same thing in the dark.
-	bool full = state.battery_charging && percent >= 0 &&
-				(percent >= 100 || percent >= power_get_charge_limit());
-	led_set_charge_full(full);
-	led_set_charging(state.battery_charging);
+	// And the LED, which says the same thing in the dark, from the same settled
+	// answer: the pattern is never rewritten for a reading that is about to
+	// change back. The cable goes with it -- a charge that has finished still
+	// leaves the player on a charger, and that is what keeps the LED off the
+	// darken-in-standby option.
+	led_set_charging(settled == 2);
+	led_set_on_charger(settled != 0);
 }
 
 // The periodic poll: battery, volume persistence, playback glyph and the
@@ -499,8 +623,11 @@ static void timer_update_cb(lv_timer_t *timer) {
 	led_update_playback(state.status == AUDIO_STATUS_PLAYING, state.stream_sample_rate,
 						!state.live && podcastcache_owns(state.current_file));
 	// Wi-Fi transfer takes the same route: its pattern stays lit, screen off
-	// included, for as long as the server runs.
-	led_set_wifi_transfer(wifitransfer_running());
+	// included, for as long as the transfer is on. The switch rather than the
+	// process, because this poll is five seconds apart and the server takes a
+	// moment to come up and to die -- the light would lag the toggle by most of
+	// a poll in both directions.
+	led_set_wifi_transfer(wifitransfer_get_enabled());
 
 	// And Bluetooth receiver mode, which like the transfer is a thing the
 	// player is doing rather than something it is playing: the blue stays on
@@ -525,6 +652,12 @@ void topbar_set_clock_position(int pos) {
 		return;
 	}
 
+	if (pos == TOPBAR_CLOCK_HIDDEN) {
+		lv_obj_add_flag(clock_label, LV_OBJ_FLAG_HIDDEN);
+		return;
+	}
+	lv_obj_remove_flag(clock_label, LV_OBJ_FLAG_HIDDEN);
+
 	if (pos == TOPBAR_CLOCK_LEFT) {
 		lv_obj_set_parent(clock_label, container_left);
 		lv_obj_move_to_index(clock_label, 0); // before the volume number
@@ -541,11 +674,18 @@ void topbar_set_clock_position(int pos) {
 // Re-runs the battery paint so its colours follow a theme switch. The reading
 // is thrown away first, or the poll would see the same numbers as last time and
 // keep the old colours.
+//
+// The radios come with it: the Bluetooth glyph carries a codec colour set by
+// hand, which has a light and a dark variant and would otherwise keep the one
+// from before the switch until the next poll.
 static void topbar_refresh_theme(void) {
 	last_battery_percent = -2;
 	last_battery_charging = -1;
 	if (jack_timer) {
 		lv_timer_ready(jack_timer);
+	}
+	if (radio_timer) {
+		lv_timer_ready(radio_timer);
 	}
 }
 
@@ -598,7 +738,40 @@ static void topbar_drag_cb(lv_event_t *e) {
 		if (engaged) {
 			engaged = false;
 			quickpanel_drag_end();
+			return;
 		}
+
+		// A flick quick enough to be over between two reads of the touch panel
+		// produces a press and a release with no PRESSING in between, so the
+		// drag above never began and the panel stayed shut -- which from the
+		// outside is a control centre that sometimes ignores a fast swipe. The
+		// gesture did happen: the finger went down on the bar and came up this
+		// far below where it landed.
+		if (dy >= FLICK_OPEN_PX) {
+			quickpanel_open();
+		}
+	}
+}
+
+// Nothing inside the bar takes a press; the bar does.
+//
+// Every press on the status bar has one meaning -- pull the control centre down
+// -- and topbar_drag_cb() is on the bar itself, so a child that takes the press
+// first is a strip of bar where the gesture does not start. LVGL hands the
+// press to the topmost clickable object under the finger and nothing bubbles up
+// unless asked to, so one clickable child is one dead patch.
+//
+// It is easy to add one by accident: lv_obj_create() returns a clickable object
+// by default, while lv_image_create() and lv_label_create() do not. So this is
+// done by walking what was built rather than by remembering at each call --
+// the battery indicator is two plain objects and had been taking every press
+// that landed on it.
+static void topbar_clear_child_presses(lv_obj_t *obj) {
+	uint32_t n = lv_obj_get_child_count(obj);
+	for (uint32_t i = 0; i < n; i++) {
+		lv_obj_t *child = lv_obj_get_child(obj, (int32_t)i);
+		lv_obj_remove_flag(child, LV_OBJ_FLAG_CLICKABLE);
+		topbar_clear_child_presses(child);
 	}
 }
 
@@ -805,6 +978,11 @@ void topbar_init(gui_config_t *cfg) {
 	radio_timer = lv_timer_create(radio_timer_cb, RADIO_POLL_MS, NULL);
 	lv_timer_ready(radio_timer);
 	power_pause_in_standby(radio_timer);
+
+	// Last, once everything that lives on the bar exists: see the note over the
+	// function. The bar keeps its own CLICKABLE, which is what the drag hangs
+	// off; only what is inside it gives presses up.
+	topbar_clear_child_presses(top_bar);
 
 	// The battery shell is recoloured by hand rather than by a style, so it needs
 	// a repaint when the palette changes.

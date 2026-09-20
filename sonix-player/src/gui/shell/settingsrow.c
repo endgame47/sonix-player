@@ -135,18 +135,14 @@ static void fit_title(lv_obj_t *label, int width) {
 	// The text must be sized with the ellipsis out of the way: a
 	// LV_LABEL_LONG_DOT label does not keep the original string, so once LVGL
 	// has shortened it lv_label_get_text() returns the truncated form, which
-	// fits, and the step-down would never trigger.
-	lv_label_long_mode_t mode = lv_label_get_long_mode(label);
-	bool dotted = (mode == LV_LABEL_LONG_DOT);
-	if (dotted) {
-		lv_label_set_long_mode(label, LV_LABEL_LONG_CLIP);
-	}
+	// fits, and the step-down would never trigger. Setting the text to NULL is
+	// LVGL's own "restore and refresh" and puts the covered characters back;
+	// changing the long mode only asks for a refresh that has not happened yet
+	// when the text is read on the next line.
+	lv_label_set_text(label, NULL);
 
 	const char *text = lv_label_get_text(label);
 	if (!text || !text[0] || width <= 0) {
-		if (dotted) {
-			lv_label_set_long_mode(label, mode);
-		}
 		return;
 	}
 
@@ -158,10 +154,6 @@ static void fit_title(lv_obj_t *label, int width) {
 			lv_obj_set_height(label, lv_font_get_line_height(STEPS[i]));
 			break;
 		}
-	}
-
-	if (dotted) {
-		lv_label_set_long_mode(label, mode);
 	}
 }
 
@@ -747,8 +739,8 @@ lv_obj_t *settingsrow_toggle_pills(lv_obj_t *parent, const char *title, lv_event
 }
 
 // The same card without the switch, for a choice that is always one of its
-// options rather than something that can be off. DSD output is one: a DSD file
-// goes out either as DoP or converted, never as neither.
+// options rather than something that can be off: the player layout is one, and
+// so is the repeat mode.
 lv_obj_t *settingsrow_pills(lv_obj_t *parent, const char *title, lv_obj_t **pills_out) {
 	lv_obj_t *card = lv_obj_create(parent);
 	lv_obj_set_width(card, lv_pct(100));

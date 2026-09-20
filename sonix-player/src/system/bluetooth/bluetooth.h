@@ -84,6 +84,12 @@ bt_state_t bluetooth_get_state(void);
 // The name of the device as other phones see it.
 const char *bluetooth_local_name(void);
 
+// Renames the player. Kept in the config, so it survives a reboot and outlives
+// the firmware's own name file, which is on a read-only filesystem. False for a
+// name that is empty once its spaces are taken off. The adapter is told at once
+// when the radio is on, and at the next bring-up when it is not.
+bool bluetooth_set_local_name(const char *name);
+
 // Paired devices, then the ones a scan has turned up. Bumped whenever either
 // list changes.
 uint32_t bluetooth_devices_serial(void);
@@ -239,6 +245,28 @@ bool bluetooth_receiver_device(char *mac_out, int mac_size, char *name_out, int 
 // to move, and the answer is one that came after the question.
 void bluetooth_refresh_receiver(void);
 bool bluetooth_receiver_stream(bt_stream_t *out);
+
+// The title, artist and album the other end is playing.
+typedef struct {
+	char title[128];
+	char artist[128];
+	char album[128];
+	unsigned duration_ms; // 0 when the sender did not say
+} bt_track_t;
+
+// The codecs the sending device offered on the link that is up, and the one it
+// is using. Read on the spot rather than cached: only the receiver page asks.
+// Returns how many names landed in `out`.
+int bluetooth_receiver_codecs(char out[][BT_CODEC_MAX], int max, char *selected, int selected_size);
+
+// What the sending device says it is playing, out of AVRCP's track metadata.
+// False when it has said nothing -- a laptop streaming system audio usually
+// has no track to name.
+bool bluetooth_receiver_track(bt_track_t *out);
+
+// Moves the incoming stream onto another of them. The link is renegotiated, so
+// the audio stops for a moment and comes back on the new codec.
+void bluetooth_receiver_set_codec(const char *codec);
 unsigned bluetooth_receiver_stream_serial(void);
 
 // An AVRCP transport command sent to that device: "Play", "Pause", "Next" or

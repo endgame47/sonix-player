@@ -345,9 +345,9 @@ bool gb_core_set_bootroms(gb_core_t *wrap, const char *dmg_path, const char *cgb
 
 const char *gb_core_build(void) {
 #ifdef PERFORMANCE
-	return "Gearboy PERFORMANCE (75 cicli macchina fra un aggiornamento e l'altro)";
+	return "Gearboy PERFORMANCE (75 machine cycles between updates)";
 #else
-	return "Gearboy preciso (un ciclo macchina alla volta)";
+	return "Gearboy accurate (one machine cycle at a time)";
 #endif
 }
 

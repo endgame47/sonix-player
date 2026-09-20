@@ -66,8 +66,9 @@ static bool s_led_enabled = true; // the LED master switch
 static bool s_idle_off_enabled;
 static bool s_standby;		  // screen off (set by power.c)
 static time_t s_standby_since; // when the screen went off
-static bool s_charge_full;	  // battery at 100% or at the configured limit
 static time_t s_last_playing; // when something was last playing
+static bool s_on_charger;	  // a cable is supplying, charge finished or not
+static time_t s_charger_since; // when that last changed
 
 static void write_str(const char *path, const char *value) {
 	FILE *f = fopen(path, "w");
@@ -104,17 +105,29 @@ static int rate_pattern(int sample_rate) {
 	return PATTERN_PCM_48K;
 }
 
-// When the "off in standby" countdown starts: the later of the screen going
-// dark and the last moment something was playing.
+// When the "off in standby" countdown starts: the latest of the screen going
+// dark, the last moment something was playing, and the cable going in or out.
 static time_t idle_window_start(void) {
-	return s_standby_since > s_last_playing ? s_standby_since : s_last_playing;
+	time_t latest = s_standby_since > s_last_playing ? s_standby_since : s_last_playing;
+	return s_charger_since > latest ? s_charger_since : latest;
 }
 
 static void apply(void) {
-	// Charging red counts only while there is still charging to indicate:
-	// once the battery reaches 100% (or the configured charge limit) the
-	// indicator's job is done and the LED goes dark.
-	bool charging_now = s_charging && !s_charge_full;
+	// s_charging is "a charge is going in", not "a cable is in": the caller
+	// takes the battery being full, or held at its limit, out of it, and hands
+	// this a settled answer rather than a reading that is still wobbling. See
+	// led.h.
+	bool charging_now = s_charging;
+
+	// The separate red classdev, where the firmware has one, driven the way the
+	// stock binary's own red-LED helper drives it: breathing on the charger,
+	// released otherwise. No module on this firmware registers it, so the write
+	// is skipped and the charging red comes from the pattern below.
+	int want_red = charging_now ? 1 : 0;
+	if (have_red_node && want_red != red_trigger_state) {
+		red_trigger_state = want_red;
+		write_str(RED_TRIGGER_NODE, charging_now ? "breathing" : "none");
+	}
 
 	int pattern;
 	if (!s_led_enabled) {
@@ -158,20 +171,23 @@ static void apply(void) {
 		// only sign the player is a sound card, so the standby option does not
 		// reach it.
 		pattern = PATTERN_IDLE_AQUA;
-	} else if (s_charging && s_charge_full) {
-		// On the charger, done charging: off, the "charge complete" signal.
-		// Below the two branches above on purpose: a transfer server and a
-		// sound card are things the player is doing, and the screen is dark, so
-		// they outrank a charge that has nothing left to report.
-		pattern = PATTERN_OFF;
-	} else if (s_idle_off_enabled && s_standby && time(NULL) - idle_window_start() >= IDLE_OFF_SECONDS) {
+	} else if (s_idle_off_enabled && !s_on_charger && s_standby &&
+			   time(NULL) - idle_window_start() >= IDLE_OFF_SECONDS) {
 		// LED off in standby: the screen has been off this long with nothing
 		// playing and nothing else going on. The window runs from whichever
-		// came last -- the screen going dark, or playback stopping. Counted
-		// from the screen alone, a track paused with the screen already off
-		// would find the window long since elapsed and put the LED out the
-		// instant the music stopped, with no aqua in between. With the screen
-		// on the aqua stays: the device is visibly in use.
+		// came last -- the screen going dark, playback stopping, the cable
+		// going in or out. Counted from the screen alone, a track paused with
+		// the screen already off would find the window long since elapsed and
+		// put the LED out the instant the music stopped, with no aqua in
+		// between. With the screen on the aqua stays: the device is visibly in
+		// use.
+		//
+		// And not on the charger at all, which is the point of s_on_charger: a
+		// battery that reaches 100%, or its configured limit, has nothing left
+		// to say in red, and a player left plugged in overnight would answer
+		// the end of its charge by going dark. On a cable the LED keeps the
+		// aqua that says the device is there -- the same exemption the transfer
+		// server, the receiver and DAC mode have above.
 		pattern = PATTERN_OFF;
 	} else {
 		pattern = PATTERN_IDLE_AQUA;
@@ -202,16 +218,19 @@ void led_init(void) {
 
 void led_set_charging(bool charging) {
 	s_charging = charging;
-	apply(); // cheap: set_pattern() only writes on change
+	apply(); // cheap: both writes only happen on a change
+}
 
-	// If the firmware ever grows a dedicated red LED classdev, drive it the
-	// way the stock binary's own red-LED helper does (breathing trigger on the
-	// charger, released otherwise). Missing node: quietly skipped.
-	int want = charging ? 1 : 0;
-	if (have_red_node && want != red_trigger_state) {
-		red_trigger_state = want;
-		write_str(RED_TRIGGER_NODE, charging ? "breathing" : "none");
+void led_set_on_charger(bool present) {
+	if (present == s_on_charger) {
+		return;
 	}
+	s_on_charger = present;
+	// A cable going in or out restarts the idle window, so the aqua gets its
+	// twenty seconds after an unplug instead of the LED going dark in the same
+	// instant as the cable leaves.
+	s_charger_since = time(NULL);
+	apply();
 }
 
 void led_update_playback(bool playing, int sample_rate, bool podcast) {
@@ -274,7 +293,3 @@ void led_set_standby(bool standby) {
 	apply();
 }
 
-void led_set_charge_full(bool full) {
-	s_charge_full = full;
-	apply();
-}

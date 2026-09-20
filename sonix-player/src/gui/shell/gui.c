@@ -75,6 +75,8 @@
 #include "src/gui/wireless/wifitransfer.h"
 #include "src/gui/wireless/wireless.h"
 #include "src/system/bluetooth/bluetooth.h"
+#include "src/system/device/system.h"
+#include "src/system/device/usb.h"
 #include "src/system/device/power.h"
 
 #include "lvgl/lvgl.h"
@@ -319,6 +321,17 @@ static void popup_notify(const char *text, const lv_image_dsc_t *icon, lv_color_
 }
 
 void gui_notify_popup(const char *text) { popup_notify(text, NULL, lv_color_black()); }
+
+bool gui_card_available(void) {
+	if (usb_storage_active()) {
+		return false;
+	}
+	// Not the block device name: that is remembered from the last card and
+	// survives the card being pulled out.
+	return storage_card_attached();
+}
+
+void gui_notify_no_card(void) { gui_notify_popup(usb_storage_active() ? "usb_storage_shared" : "sd_card_missing"); }
 
 void gui_notify_popup_icon(const char *text, const lv_image_dsc_t *icon, lv_color_t color) {
 	popup_notify(text, icon, color);

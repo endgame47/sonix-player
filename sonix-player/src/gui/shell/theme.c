@@ -282,13 +282,89 @@ void theme_set_dark(bool dark) {
 	theme_toggle();
 }
 
-// Repaints everything after a palette change: LVGL walks the object tree once
-// for the shared styles, and the callbacks catch what cannot be expressed as
-// one -- an icon recoloured at runtime, the blurred artwork behind the
-// controls.
+// Which palette the pages on screen were last walked for.
+//
+// lv_obj_report_style_change(NULL) walks every object of every screen and
+// refreshes each one against its whole subtree. The pages here are built at
+// startup and stay built, so that is the entire interface -- thousands of
+// objects -- for a change that moves nothing but colours, and it takes far
+// longer than a frame: the finger is still on the switch when it starts.
+//
+// A colour is read out of the style at draw time, so the page in front of the
+// user is the only one that has to be walked at the moment of the change. The
+// pages behind it are walked the first time they are shown again, which is
+// where a redraw was going to happen anyway.
+static unsigned palette_generation = 1;
+
+static struct screen_generation {
+	lv_obj_t *screen;
+	unsigned generation;
+} *screen_gens;
+static int screen_gen_count;
+static int screen_gen_capacity;
+
+// True when `screen` still carries an older palette than the one in force, and
+// records it as walked for this one. A screen this has never seen is taken as
+// current: it was built from the styles as they stand.
+//
+// An allocation that fails costs a walk per page change rather than a page
+// with the wrong colours, which is why the failure is silent here.
+static bool screen_is_stale(lv_obj_t *screen) {
+	for (int i = 0; i < screen_gen_count; i++) {
+		if (screen_gens[i].screen != screen) {
+			continue;
+		}
+		if (screen_gens[i].generation == palette_generation) {
+			return false;
+		}
+		screen_gens[i].generation = palette_generation;
+		return true;
+	}
+
+	if (screen_gen_count == screen_gen_capacity) {
+		int wanted = screen_gen_capacity ? screen_gen_capacity * 2 : 32;
+		struct screen_generation *grown = realloc(screen_gens, (size_t)wanted * sizeof(*grown));
+		if (!grown) {
+			return true;
+		}
+		screen_gens = grown;
+		screen_gen_capacity = wanted;
+	}
+
+	screen_gens[screen_gen_count].screen = screen;
+	screen_gens[screen_gen_count].generation = palette_generation;
+	screen_gen_count++;
+	return false;
+}
+
+// One tree, refreshed against the styles it carries. LV_STYLE_PROP_ANY takes
+// the object's own properties and recurses into its children.
+static void refresh_tree(lv_obj_t *obj) {
+	if (obj) {
+		lv_obj_refresh_style(obj, LV_PART_ANY, LV_STYLE_PROP_ANY);
+	}
+}
+
+void theme_notify_screen_shown(lv_obj_t *screen) {
+	if (screen && screen_is_stale(screen)) {
+		refresh_tree(screen);
+	}
+}
+
+// Repaints after a palette change: the page on screen and the three layers the
+// status bar, the player sheet and the popups live on, then the callbacks,
+// which catch what cannot be expressed as a shared style -- an icon recoloured
+// at runtime, the blurred artwork behind the controls. Those run for every
+// page, on screen or not, and cost about as much as one frame in total.
 static void refresh_all(void) {
-	// NULL means "every style changed".
-	lv_obj_report_style_change(NULL);
+	palette_generation++;
+
+	lv_obj_t *screen = lv_screen_active();
+	screen_is_stale(screen);
+	refresh_tree(screen);
+	refresh_tree(lv_layer_top());
+	refresh_tree(lv_layer_sys());
+	refresh_tree(lv_layer_bottom());
 
 	for (int i = 0; i < refresh_cb_count; i++) {
 		refresh_cbs[i]();

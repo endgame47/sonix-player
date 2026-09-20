@@ -155,6 +155,18 @@ void power_set_charge_limit(int percent);
 int power_get_charge_limit(void); // 100 when no limit is set
 bool power_charge_limit_supported(void);
 
+// True while the charger is being held off -- the battery is at the limit, or
+// DAC mode has forbidden charging. The cable is still in and the player still
+// runs off it; nothing is going into the battery. What the status bar and the
+// LED follow, so neither claims a charge that is not happening.
+bool power_charging_held(void);
+
+// Puts the charger back on and forgets the limit is holding it off. For the
+// paths that end the player: the charger driver keeps the bit across a
+// shutdown, so a device switched off at its charge limit would come back to a
+// cable that does nothing until the next boot resets the chip.
+void power_charging_release(void);
+
 // Forbids or allows charging outright, on top of the percentage limit. Used by
 // DAC mode, where the point of not charging is to keep the charger's noise off
 // the cable. Stopping the charger takes three writes in a set order -- see

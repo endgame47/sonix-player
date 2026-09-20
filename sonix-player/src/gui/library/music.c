@@ -28,9 +28,31 @@ static void open_album_artists(void) {
 }
 static void open_genres(void) { medialist_open(tr("music_genres"), LIBRARY_LIST_GENRES, LIBRARY_FILTER_NONE, NULL); }
 
+// Browse and Playlists trade places.
+//
+// The tile is the sixth one and the corner button is the second: which of the
+// two holds which is the "playlists first" option, and nothing else about
+// either of them changes. So there is one opener for each position rather than
+// one for each destination.
+static lv_obj_t *tile_grid;
+static lv_obj_t *playlists_btn;
+static lv_obj_t *playlists_icon;
+
+static void open_tile_slot(void) {
+	if (musicsettings_playlists_first()) {
+		playlistpage_open();
+	} else {
+		switch_screen(browser_screen);
+	}
+}
+
 static void playlists_cb(lv_event_t *e) {
 	(void)e;
-	playlistpage_open();
+	if (musicsettings_playlists_first()) {
+		switch_screen(browser_screen);
+	} else {
+		playlistpage_open();
+	}
 }
 
 static void search_cb(lv_event_t *e) {
@@ -68,10 +90,13 @@ void music_init(gui_config_t *cfg) {
 		{"artists", &icon_menu_artist, NULL, open_artists},
 		{"music_album_artists", &icon_menu_album_artist, NULL, open_album_artists},
 		{"music_genres", &icon_menu_genre, NULL, open_genres},
-		{"music_browse", &icon_menu_explorer, &browser_screen, NULL},
+		// An opener rather than a target: what this tile is depends on the
+		// option, and music_refresh_layout() paints it accordingly.
+		{"music_browse", &icon_menu_explorer, NULL, open_tile_slot},
 	};
 
 	lv_obj_t *grid = gridpage_build(music_screen, cfg, entries, (int)(sizeof(entries) / sizeof(entries[0])), 2, 3, true);
+	tile_grid = grid;
 
 	// The pull from the bottom edge that opens the album carousel. It goes on
 	// the grid because that is where a tile's press stops bubbling.
@@ -83,7 +108,8 @@ void music_init(gui_config_t *cfg) {
 	lv_obj_t *settings_btn = corner_button(cfg, 0, &icon_music_settings);
 	lv_obj_add_event_cb(settings_btn, switch_screen_cb, LV_EVENT_CLICKED, musicsettings_screen);
 
-	lv_obj_t *playlists_btn = corner_button(cfg, 1, &icon_list_music);
+	playlists_btn = corner_button(cfg, 1, &icon_list_music);
+	playlists_icon = lv_obj_get_child(playlists_btn, 0);
 	lv_obj_add_event_cb(playlists_btn, playlists_cb, LV_EVENT_CLICKED, NULL);
 
 	lv_obj_t *favourites_btn = corner_button(cfg, 2, &icon_star_corner);
@@ -91,4 +117,17 @@ void music_init(gui_config_t *cfg) {
 
 	lv_obj_t *search_btn = corner_button(cfg, 3, &icon_search);
 	lv_obj_add_event_cb(search_btn, search_cb, LV_EVENT_CLICKED, NULL);
+
+	music_refresh_layout();
+}
+
+void music_refresh_layout(void) {
+	bool playlists_first = musicsettings_playlists_first();
+
+	gridpage_set_tile(tile_grid, 5, playlists_first ? &icon_menu_playlist : &icon_menu_explorer,
+					  playlists_first ? "playlists" : "music_browse");
+
+	if (playlists_icon) {
+		lv_image_set_src(playlists_icon, playlists_first ? &icon_folder_corner : &icon_list_music);
+	}
 }

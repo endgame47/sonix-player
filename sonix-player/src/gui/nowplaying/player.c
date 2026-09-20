@@ -59,6 +59,7 @@ static lv_obj_t *song_title_label;
 static lv_obj_t *song_artist_label;
 static lv_obj_t *format_label; // "16/44.1 FLAC", right of the artist line
 static lv_obj_t *fav_btn_obj;  // the button it sits on, hidden on a book
+static lv_obj_t *controls_row; // transport row: where the ellipsis lives, and the star in Studio
 static lv_obj_t *fav_btn_icon; // the star above it
 
 static void update_fav_button(void);
@@ -149,6 +150,11 @@ static lv_obj_t *repeat_btn_obj;
 static lv_obj_t *speed_btn_obj;	 // stands in the repeat button's place on a book
 static lv_obj_t *speed_btn_icon;
 static lv_obj_t *below_slider_obj; // the two clocks under the bar
+// How far the four source marks keep from the corner of the artwork they
+// share. One number, because they replace each other in that corner and a
+// difference between them would read as the mark jumping.
+#define BADGE_INSET 14
+
 static lv_obj_t *live_badge;	   // live indicator, top right over the artwork
 static lv_obj_t *qobuz_badge;	   // the Qobuz mark, in the same corner
 static lv_obj_t *tidal_badge;	   // and the Tidal one, over it: only one ever shows
@@ -245,8 +251,9 @@ static int cover_box_w, cover_box_h;   // the artwork spans the full screen widt
 // and a Qobuz track is a cache entry that will be gone tomorrow. So the setting
 // says what the user wants for their music, and `layout_alt_now` says whether
 // what is playing is music of that kind. Everything that draws asks the second.
-static bool layout_alternative; // the setting, saved in the config
+static player_layout_t layout_choice; // the setting, saved in the config
 static bool layout_alt_now;		// and whether the current source can use it
+static bool layout_studio_now;	// likewise for the third arrangement
 
 static uint32_t album_tone; // the sleeve's colour, 0 when there is no sleeve
 
@@ -265,6 +272,12 @@ static bool wave_have;		// the shape of this track is known
 static int wave_drawn = -1; // where the playhead was, in pixels, when it was drawn
 static uint32_t wave_drawn_tone = 1;
 static int backdrop_w, backdrop_h;	   // size of the controls block it sits behind
+// Studio shows the same blurred copy behind the whole screen, so there it is
+// asked for at that shape instead: a picture made for the block behind the
+// controls is a third of the height and stretching it up is both distorted and
+// coarse. `backdrop_is_studio` is the shape the picture on hand was made at.
+static int backdrop_studio_h;
+static bool backdrop_is_studio;
 
 static double current_total_length = 0; // cached from the last device_state snapshot, so slider math works between polls
 static char progress_label_text[32];
@@ -456,11 +469,14 @@ static void apply_audiobook_mode(bool book, bool podcast) {
 		}
 	}
 
-	// A book with no artwork gets the book, not a musical note -- the same
-	// glyph its scan page uses. Only touched when a station is not up: live
-	// mode owns this icon while it is on.
+	// A book with no artwork gets the book and an episode the microphone, not
+	// a musical note -- each the glyph its own page uses, drawn at the size
+	// this one is, which is why the podcast row's 40 px copy is not the one
+	// named here. Only touched when a station is not up: live mode owns this
+	// icon while it is on.
 	if (cover_placeholder_icon && !live_mode) {
-		lv_image_set_src(cover_placeholder_icon, book ? &icon_book_headphones : &icon_music_note);
+		const lv_image_dsc_t *mark = book ? &icon_book_headphones : podcast ? &icon_podcast_cover : &icon_music_note;
+		lv_image_set_src(cover_placeholder_icon, mark);
 	}
 }
 
@@ -705,6 +721,32 @@ static enum {
 // light in both themes. Local style props are laid over the theme styles
 // while the cover is up, and removed again when it goes, so the plain
 // no-cover panel keeps following the theme.
+// The picture at the width of the screen, and the note that stands in for it.
+//
+// One place, because Studio hides both -- the sleeve there is a smaller picture
+// of its own over the blurred copy -- and the artwork arrives on a worker, so
+// whatever the arrangement did when it was set up would be undone the moment a
+// cover landed.
+static void cover_show(bool have_cover) {
+	if (!cover_img) {
+		return;
+	}
+	bool studio = layout_studio_now;
+	if (have_cover && !studio) {
+		lv_obj_remove_flag(cover_img, LV_OBJ_FLAG_HIDDEN);
+	} else {
+		lv_obj_add_flag(cover_img, LV_OBJ_FLAG_HIDDEN);
+	}
+	if (!cover_placeholder_icon) {
+		return;
+	}
+	if (!have_cover && !studio) {
+		lv_obj_remove_flag(cover_placeholder_icon, LV_OBJ_FLAG_HIDDEN);
+	} else {
+		lv_obj_add_flag(cover_placeholder_icon, LV_OBJ_FLAG_HIDDEN);
+	}
+}
+
 static void set_over_cover(bool on) {
 	chrome_over_cover = on;
 
@@ -774,6 +816,8 @@ void player_set_cover_release_cb(void (*cb)(void)) { cover_release_cb = cb; }
 // several times a minute (every new on-air title), and re-decoding the same
 // station icon each time would be pointless work on the UI thread.
 static char cover_shown_path[512];
+
+static void reload_cover(const char *filepath);
 
 // Shows the placeholder and asks the worker for the album art of `filepath`.
 // Nothing is read or decoded here: on the X1600E that work is seconds long,
@@ -973,6 +1017,318 @@ static void slider_over_waveform(bool over) {
 	lv_obj_remove_local_style_prop(progress_slider, LV_STYLE_OPA, LV_PART_KNOB);
 }
 
+// ---------------------------------------------------------------------------
+// Studio: the sleeve in the middle, the blurred artwork behind the whole screen
+//
+// Nothing here is drawn by hand. The sleeve is the picture the page already
+// decoded, shown at the size this arrangement wants, and the background is the
+// blurred copy the page already makes for behind the controls, asked for at the
+// size of the whole screen instead. What this section owns is where they go and
+// when.
+// ---------------------------------------------------------------------------
+
+#define STUDIO_MARGIN 14	  // what the sleeve keeps to the side edges
+#define STUDIO_HEAD_H 78	  // the title, the artist and the ellipsis
+#define STUDIO_COVER_GAP 24	  // between the head and the top of the sleeve
+#define STUDIO_BADGE_GAP 6	  // between the head and the source mark under the ellipsis
+#define STUDIO_QUALITY_GAP 10 // between the sleeve and the line under it
+#define STUDIO_QUALITY_H 30
+#define STUDIO_BOTTOM 10 // under that line, before the controls begin
+
+static lv_obj_t *studio_bg;		  // the blurred sleeve, the size of the screen
+static lv_obj_t *studio_box;	  // what everything else is laid out on
+static lv_obj_t *studio_head;	  // title and artist across the top
+static lv_obj_t *studio_text_col; // the two of them, stacked and centred
+static lv_obj_t *studio_cover;
+static lv_obj_t *studio_empty;		  // the square shown where a track has no artwork
+static lv_obj_t *studio_empty_icon;
+static lv_obj_t *studio_quality;	  // the icon and the format line under the sleeve
+static lv_obj_t *studio_quality_icon;
+static bool studio_up;
+static int studio_box_w, studio_box_h; // the panel this arrangement is laid out on
+static int studio_cover_size;
+
+// Which of the four quality marks belongs to what is playing.
+//
+// Asked of the stream and not of the library, so a radio station and a track
+// still downloading are answered as well as a file that has been indexed.
+//
+// A podcast gets none of them. The marks rank an encoding against what music
+// needs, and an episode is speech at whatever bitrate the publisher chose:
+// "lossy" beside it is true and says nothing anyone would act on.
+static const lv_image_dsc_t *studio_quality_mark(const device_state_t *state) {
+	if (!state->live && podcastcache_owns(state->current_file)) {
+		return NULL;
+	}
+	if (audio_get_dsd_multiple() > 0) {
+		return &icon_quality_dsd;
+	}
+	if (state->live || audio_stream_is_lossy()) {
+		return &icon_quality_lossy;
+	}
+	int rate = 0, channels = 0;
+	audio_get_stream_info(&rate, &channels);
+	int bits = audio_get_stream_bits();
+	if (rate > 48000 || bits > 16) {
+		return &icon_quality_hifi;
+	}
+	if (rate > 0) {
+		return &icon_quality_cd;
+	}
+	return NULL;
+}
+
+// The top of the sleeve, and how large it is.
+//
+// The sleeve is as large as the narrower of the two constraints allows: the
+// width left between the margins, and the height left between the head and the
+// line under it, which on this panel is what decides.
+//
+// Worked out from the numbers rather than from the widgets, so it can be asked
+// before the panel has been laid out -- which is where the artwork is ordered
+// at the size this arrangement will draw it.
+static int studio_cover_geometry(int *top_out) {
+	int head_top = back_btn_centre_y() - STUDIO_HEAD_H / 2;
+	if (head_top < 2) {
+		head_top = 2;
+	}
+
+	int top = head_top + STUDIO_HEAD_H + STUDIO_COVER_GAP;
+	int size = studio_box_w - 2 * STUDIO_MARGIN;
+	int room = studio_box_h - top - STUDIO_QUALITY_GAP - STUDIO_QUALITY_H - STUDIO_BOTTOM;
+	if (size > room) {
+		size = room;
+	}
+	if (size < 64) {
+		size = 64;
+	}
+	if (top_out) {
+		*top_out = top + (room - size) / 2;
+	}
+	return size;
+}
+
+// The four marks that say where a track comes from -- Qobuz, Tidal, podcast,
+// and the red one for a live stream -- share the top right corner of the
+// artwork, which in this arrangement is where the ellipsis went. They move
+// down under it and keep its right edge, so the two read as one column.
+//
+// `parent` of NULL leaves them where they are and only re-places them, which
+// is what studio_place() wants on a relayout.
+static void studio_badges_move(lv_obj_t *parent, int y) {
+	lv_obj_t *const marks[] = {live_badge, qobuz_badge, tidal_badge, podcast_badge};
+	for (size_t i = 0; i < sizeof(marks) / sizeof(marks[0]); i++) {
+		if (!marks[i]) {
+			continue;
+		}
+		if (parent) {
+			lv_obj_set_parent(marks[i], parent);
+		}
+		lv_obj_align(marks[i], LV_ALIGN_TOP_RIGHT, -STUDIO_MARGIN, y);
+	}
+}
+
+// Where everything goes.
+static void studio_place(void) {
+	if (!studio_box) {
+		return;
+	}
+
+	int screen_w = studio_box_w;
+	int head_top = back_btn_centre_y() - STUDIO_HEAD_H / 2;
+	if (head_top < 2) {
+		head_top = 2;
+	}
+
+	int cover_y = 0;
+	int size = studio_cover_geometry(&cover_y);
+	studio_cover_size = size;
+
+	int cover_x = (screen_w - size) / 2;
+
+	lv_obj_set_pos(studio_head, STUDIO_MARGIN, head_top);
+	lv_obj_set_size(studio_head, screen_w - 2 * STUDIO_MARGIN, STUDIO_HEAD_H);
+
+	studio_badges_move(NULL, head_top + STUDIO_HEAD_H + STUDIO_BADGE_GAP);
+
+	lv_obj_set_size(studio_cover, size, size);
+	lv_obj_set_pos(studio_cover, cover_x, cover_y);
+
+	// The same square, so a track with no artwork keeps the arrangement rather
+	// than leaving a bare screen.
+	lv_obj_set_size(studio_empty, size, size);
+	lv_obj_set_pos(studio_empty, cover_x, cover_y);
+
+	lv_obj_set_size(studio_quality, size, STUDIO_QUALITY_H);
+	lv_obj_set_pos(studio_quality, cover_x, cover_y + size + STUDIO_QUALITY_GAP);
+}
+
+// Points the sleeve and the background at the pictures the page already holds.
+static void studio_refresh_cover(void) {
+	if (!studio_cover) {
+		return;
+	}
+	bool have = current_cover.pixels != NULL;
+	lv_image_set_src(studio_cover, have ? &current_cover.dsc : NULL);
+	if (have) {
+		lv_obj_remove_flag(studio_cover, LV_OBJ_FLAG_HIDDEN);
+	} else {
+		lv_obj_add_flag(studio_cover, LV_OBJ_FLAG_HIDDEN);
+	}
+
+	// One of the two squares is always up. Without this a track with no artwork
+	// left the arrangement with nothing in it at all: no sleeve, no blurred
+	// background behind it, and the page's own colour across the whole screen.
+	if (studio_empty) {
+		if (have) {
+			lv_obj_add_flag(studio_empty, LV_OBJ_FLAG_HIDDEN);
+		} else {
+			lv_obj_remove_flag(studio_empty, LV_OBJ_FLAG_HIDDEN);
+		}
+	}
+	if (studio_empty_icon) {
+		// The same mark the full-width cover panel stands in with: the note, the
+		// headphones for a book, the aerial for a station.
+		lv_image_set_src(studio_empty_icon, lv_image_get_src(cover_placeholder_icon));
+		lv_obj_set_style_image_recolor(studio_empty_icon, theme()->text_secondary, 0);
+	}
+
+	if (studio_bg) {
+		lv_image_set_src(studio_bg, current_backdrop.pixels ? &current_backdrop.dsc : NULL);
+		if (current_backdrop.pixels) {
+			lv_obj_remove_flag(studio_bg, LV_OBJ_FLAG_HIDDEN);
+		} else {
+			lv_obj_add_flag(studio_bg, LV_OBJ_FLAG_HIDDEN);
+		}
+	}
+}
+
+// Puts the ellipsis and the star back where every other arrangement keeps them,
+// and takes the panel down. Called before each arrangement is laid out, so the
+// two that know nothing about Studio find the page as they left it.
+static void studio_take_back(void) {
+	if (!studio_box) {
+		return;
+	}
+	lv_obj_add_flag(studio_box, LV_OBJ_FLAG_HIDDEN);
+	if (studio_bg) {
+		lv_obj_add_flag(studio_bg, LV_OBJ_FLAG_HIDDEN);
+	}
+	if (studio_empty) {
+		lv_obj_add_flag(studio_empty, LV_OBJ_FLAG_HIDDEN);
+	}
+
+	// The surfaces this arrangement made transparent, and the light chrome that
+	// goes with the blurred sleeve. Only put back by the arrangement that took
+	// them away: every other path leaves the cover to decide, as it always has.
+	if (studio_up) {
+		studio_up = false;
+		lv_obj_remove_local_style_prop(cover_panel, LV_STYLE_BG_OPA, 0);
+		if (player_menu) {
+			lv_obj_remove_local_style_prop(player_menu, LV_STYLE_BG_OPA, 0);
+			lv_obj_remove_local_style_prop(player_menu, LV_STYLE_BG_IMAGE_OPA, 0);
+		}
+		// The picture at full width comes back, and the note with it when there
+		// is no picture. studio_up is already down, so cover_show() agrees.
+		cover_show(current_cover.pixels != NULL);
+		if (format_label && song_side_obj) {
+			lv_obj_set_parent(format_label, song_side_obj);
+			lv_obj_set_style_text_align(format_label, LV_TEXT_ALIGN_RIGHT, 0);
+		}
+		// The marks go back to the corner of the artwork they share with every
+		// other arrangement.
+		lv_obj_t *const marks[] = {live_badge, qobuz_badge, tidal_badge, podcast_badge};
+		for (size_t i = 0; i < sizeof(marks) / sizeof(marks[0]); i++) {
+			if (marks[i]) {
+				lv_obj_set_parent(marks[i], cover_panel);
+				lv_obj_align(marks[i], LV_ALIGN_TOP_RIGHT, -BADGE_INSET, BADGE_INSET);
+			}
+		}
+		set_over_cover(current_cover.pixels != NULL);
+	}
+
+	if (more_btn_obj && controls_row) {
+		lv_obj_set_parent(more_btn_obj, controls_row);
+		lv_obj_add_flag(more_btn_obj, LV_OBJ_FLAG_IGNORE_LAYOUT);
+		lv_obj_align(more_btn_obj, LV_ALIGN_RIGHT_MID, 0, 0);
+	}
+	if (fav_btn_obj) {
+		// Laid out by its row again: the next step decides which row that is.
+		lv_obj_remove_flag(fav_btn_obj, LV_OBJ_FLAG_IGNORE_LAYOUT);
+	}
+}
+
+static void studio_put(void) {
+	if (!studio_box) {
+		return;
+	}
+
+	if (song_title_label) {
+		lv_obj_set_parent(song_title_label, studio_text_col);
+		lv_obj_move_to_index(song_title_label, 0);
+		lv_obj_set_width(song_title_label, lv_pct(100));
+		lv_obj_set_style_max_width(song_title_label, LV_COORD_MAX, 0);
+	}
+	if (song_artist_label) {
+		lv_obj_set_parent(song_artist_label, studio_text_col);
+		lv_obj_move_to_index(song_artist_label, 1);
+		lv_obj_set_width(song_artist_label, lv_pct(100));
+		lv_obj_set_style_max_width(song_artist_label, LV_COORD_MAX, 0);
+	}
+	lv_obj_add_flag(song_text_obj, LV_OBJ_FLAG_HIDDEN);
+	if (song_side_obj) {
+		lv_obj_add_flag(song_side_obj, LV_OBJ_FLAG_HIDDEN);
+	}
+
+	// The line under the sleeve is the same label the standard arrangement
+	// keeps beside the artist -- it already knows how to say "16/44.1 FLAC",
+	// "320 kbps MP3" and "DSD256", a station included. Moved, not copied.
+	if (format_label) {
+		lv_obj_set_parent(format_label, studio_quality);
+		lv_obj_remove_flag(format_label, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_width(format_label, LV_SIZE_CONTENT);
+		lv_obj_set_style_text_align(format_label, LV_TEXT_ALIGN_LEFT, 0);
+	}
+
+	// The two buttons change places: the ellipsis belongs beside the title it
+	// is about, and the star takes the corner of the transport row it left.
+	if (more_btn_obj && studio_head) {
+		lv_obj_set_parent(more_btn_obj, studio_head);
+		lv_obj_add_flag(more_btn_obj, LV_OBJ_FLAG_IGNORE_LAYOUT);
+		lv_obj_align(more_btn_obj, LV_ALIGN_RIGHT_MID, 0, 0);
+	}
+	if (fav_btn_obj && controls_row) {
+		lv_obj_set_parent(fav_btn_obj, controls_row);
+		lv_obj_add_flag(fav_btn_obj, LV_OBJ_FLAG_IGNORE_LAYOUT);
+		lv_obj_align(fav_btn_obj, LV_ALIGN_RIGHT_MID, 0, 0);
+	}
+
+	// Onto the panel, so they draw over the sleeve rather than under it, and
+	// below the ellipsis. studio_place() settles where.
+	studio_badges_move(studio_box, 0);
+
+	// The blurred sleeve is the whole background here, so everything that would
+	// otherwise cover it gets out of the way: the two panels' own fills, the
+	// picture at full width, and the note that stands in for it.
+	studio_up = true;
+	lv_obj_set_style_bg_opa(cover_panel, LV_OPA_TRANSP, 0);
+	if (player_menu) {
+		lv_obj_set_style_bg_opa(player_menu, LV_OPA_TRANSP, 0);
+		// Its own blurred copy too: it is the same picture at a different crop,
+		// and two of them meeting at the controls is a seam across the screen.
+		lv_obj_set_style_bg_image_opa(player_menu, LV_OPA_TRANSP, 0);
+	}
+	cover_show(current_cover.pixels != NULL);
+
+	lv_obj_remove_flag(studio_box, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_move_foreground(studio_box);
+	if (studio_bg) {
+		lv_obj_move_background(studio_bg);
+	}
+	studio_place();
+	studio_refresh_cover();
+}
+
 // Moves the pieces between the two arrangements.
 //
 // Reparenting and not rebuilding: the title label carries its scrolling, the
@@ -982,6 +1338,10 @@ static void apply_layout(void) {
 	if (!alt_title_pill || !song_text_obj) {
 		return;
 	}
+
+	// Always first: the two arrangements below know nothing about Studio, so
+	// they have to find the ellipsis and the star where they left them.
+	studio_take_back();
 
 	if (layout_alt_now) {
 		// A pill each, and not one pill with two lines in it: the title and the
@@ -1063,6 +1423,10 @@ static void apply_layout(void) {
 		}
 	}
 
+	if (layout_studio_now) {
+		studio_put();
+	}
+
 	paint_alt_tint();
 }
 
@@ -1076,12 +1440,25 @@ static void apply_layout(void) {
 // waveform: the bar's parent, size and transparency are decided here and
 // nowhere else.
 static void update_layout(const device_state_t *state) {
-	bool wanted = layout_alternative && playing_local_file(state);
-	if (wanted == layout_alt_now && alt_title_pill) {
+	// Studio only wants a picture and a name, and takes whatever is playing:
+	// a file, a cached Qobuz or Tidal track, a podcast, a book, a station.
+	bool studio = layout_choice == PLAYER_LAYOUT_STUDIO;
+	bool alt = layout_choice == PLAYER_LAYOUT_ALTERNATIVE && playing_local_file(state);
+
+	if (studio == layout_studio_now && alt == layout_alt_now && alt_title_pill) {
 		return;
 	}
-	layout_alt_now = wanted;
+	layout_studio_now = studio;
+	layout_alt_now = alt;
 	apply_layout();
+
+	// The blurred copy is made at the shape of whatever shows it, so moving in
+	// or out of Studio means the one on hand is the wrong shape and the picture
+	// is asked for again. Only on a change of arrangement, which is a setting
+	// the user has just touched.
+	if (studio != backdrop_is_studio && cover_shown_path[0]) {
+		reload_cover(cover_shown_path);
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1264,8 +1641,13 @@ static void reload_cover(const char *filepath) {
 	cover_free(&current_cover);
 	cover_free(&current_backdrop);
 
-	lv_obj_add_flag(cover_img, LV_OBJ_FLAG_HIDDEN);
-	lv_obj_remove_flag(cover_placeholder_icon, LV_OBJ_FLAG_HIDDEN);
+	cover_show(false);
+	// Studio holds pointers to both of those, so it is told in the same breath:
+	// its sleeve and its background come down and the empty square goes up for
+	// as long as the decode takes.
+	if (layout_studio_now) {
+		studio_refresh_cover();
+	}
 
 	// Backdrop gone: the chrome goes back to following the theme.
 	set_over_cover(false);
@@ -1276,7 +1658,20 @@ static void reload_cover(const char *filepath) {
 	lv_obj_invalidate(player_menu);
 
 	if (filepath && filepath[0]) {
-		coverloader_request_player(filepath, cover_box_w, cover_box_h, backdrop_w, backdrop_h);
+		backdrop_is_studio = layout_studio_now;
+		cover_set_backdrop_upright(backdrop_is_studio);
+
+		// The sleeve is asked for at the size the arrangement in force will
+		// draw it. A picture that does not match its widget is resampled by
+		// LVGL on every frame it is drawn, and every frame is what a sheet
+		// being dragged, or the control centre coming down over it, means: in
+		// Studio the picture is decoded at the width of the screen and shown
+		// at two thirds of it, and that resampling is the interface's core
+		// being spent again and again on an answer that never changes.
+		int cover_w = backdrop_is_studio ? studio_cover_geometry(NULL) : cover_box_w;
+		int cover_h = backdrop_is_studio ? cover_w : cover_box_h;
+		coverloader_request_player(filepath, cover_w, cover_h, backdrop_w,
+								   backdrop_is_studio ? backdrop_studio_h : backdrop_h);
 		cover_request_outstanding = true;
 
 		// The collector rides on the progress timer; make sure it is ticking
@@ -1384,8 +1779,7 @@ static void apply_cover_result(void) {
 		lv_obj_set_size(cover_img, current_cover.dsc.header.w, current_cover.dsc.header.h);
 		lv_obj_center(cover_img);
 
-		lv_obj_remove_flag(cover_img, LV_OBJ_FLAG_HIDDEN);
-		lv_obj_add_flag(cover_placeholder_icon, LV_OBJ_FLAG_HIDDEN);
+		cover_show(true);
 
 		if (new_backdrop.pixels) {
 			current_backdrop = new_backdrop;
@@ -1408,6 +1802,13 @@ static void apply_cover_result(void) {
 		cover_shown_id = 0; // nothing to compare the next track against
 	}
 	cover_incoming_id = 0;
+
+	// Studio draws both of these itself -- the sleeve smaller and the blurred
+	// copy across the whole screen -- so it is told here, where they land,
+	// rather than asked on a timer.
+	if (layout_studio_now) {
+		studio_refresh_cover();
+	}
 	// No artwork: the placeholder is already showing.
 }
 
@@ -1429,6 +1830,10 @@ static void update_repeat_button(void);
 static void player_refresh_theme(void) {
 	if (!cover_panel)
 		return;
+
+	if (studio_box) {
+		lv_obj_set_style_bg_color(studio_box, theme()->screen_bg, 0);
+	}
 
 	lv_obj_set_style_bg_color(cover_panel, theme()->cover_bg, 0);
 	lv_obj_set_style_image_recolor(cover_placeholder_icon, theme()->text_secondary, 0);
@@ -1796,6 +2201,19 @@ static void fav_btn_event_cb(lv_event_t *e) {
 
 // The format line, the way the stock player writes it: "16/44.1 FLAC".
 static void update_format_label(const device_state_t *state) {
+	// The mark beside it in Studio, which is the same question asked of the
+	// stream rather than of the library. Here because this is where the format
+	// line is worked out, and the two say one thing between them.
+	if (layout_studio_now && studio_quality_icon) {
+		const lv_image_dsc_t *mark = studio_quality_mark(state);
+		if (mark) {
+			lv_image_set_src(studio_quality_icon, mark);
+			lv_obj_remove_flag(studio_quality_icon, LV_OBJ_FLAG_HIDDEN);
+		} else {
+			lv_obj_add_flag(studio_quality_icon, LV_OBJ_FLAG_HIDDEN);
+		}
+	}
+
 	if (!format_label) {
 		return;
 	}
@@ -1845,13 +2263,10 @@ static void update_format_label(const device_state_t *state) {
 
 	// A DSD track says what it is rather than what carries it: "24/176.4 DSF"
 	// is true of a DSD64 file and of a DSD256 one, and tells the listener
-	// nothing. DoP is worth saying too, since it is the difference between
-	// bits reaching the DAC untouched and being filtered here.
-	bool dop = false;
-	int dsd = audio_get_dsd_multiple(&dop);
+	// nothing. How it gets there is not said: DoP is the only way it does.
+	int dsd = audio_get_dsd_multiple();
 	if (dsd > 0) {
-		// "DoP" and "PCM" are acronyms, the same in every language: literal.
-		lv_label_set_text_fmt(format_label, "DSD%d %s", dsd, dop ? "DoP" : "PCM");
+		lv_label_set_text_fmt(format_label, "DSD%d", dsd);
 		return;
 	}
 
@@ -2409,14 +2824,14 @@ void player_play_file(const char *filepath) {
 // again. The button glyph is corrected here rather than left to the next poll
 // because half a second of a pause button over a paused track reads as a
 // control that did not take.
-bool player_layout_is_alternative(void) { return layout_alternative; }
+player_layout_t player_layout_get(void) { return layout_choice; }
 
-void player_set_layout_alternative(bool alternative) {
-	if (alternative == layout_alternative) {
+void player_layout_set(player_layout_t layout) {
+	if (layout == layout_choice) {
 		return;
 	}
-	layout_alternative = alternative;
-	config_set_int("screen", "player_layout_alt", alternative ? 1 : 0);
+	layout_choice = layout;
+	config_set_int("screen", "player_layout_alt", (int)layout);
 	config_save();
 
 	// Not apply_layout() directly: choosing Alternative while a radio station
@@ -2829,6 +3244,7 @@ void player_init(gui_config_t *cfg) {
 	cover_box_h = cover_size;
 	backdrop_w = (int)cfg->screen_width;
 	backdrop_h = menu_height;
+	backdrop_studio_h = (int)cfg->screen_height;
 
 	// The controls block. Its background is the current track's artwork,
 	// flipped and blurred (set per track in refresh_cover); the panel colour is
@@ -3031,6 +3447,7 @@ void player_init(gui_config_t *cfg) {
 	// Transport: prev, play/pause, next -- with the repeat toggle parked on
 	// the left, out of the way of the transport controls.
 	lv_obj_t *player_controls_buttons = lv_obj_create(player_menu);
+	controls_row = player_controls_buttons;
 	lv_obj_set_size(player_controls_buttons, lv_pct(100), LV_SIZE_CONTENT);
 	lv_obj_set_style_bg_opa(player_controls_buttons, 0, 0);
 	lv_obj_set_style_border_width(player_controls_buttons, 0, 0);
@@ -3162,7 +3579,7 @@ void player_init(gui_config_t *cfg) {
 	lv_obj_set_style_radius(live_badge, 6, 0);
 	lv_obj_set_style_pad_hor(live_badge, 10, 0);
 	lv_obj_set_style_pad_ver(live_badge, 5, 0);
-	lv_obj_align(live_badge, LV_ALIGN_TOP_RIGHT, -14, 14);
+	lv_obj_align(live_badge, LV_ALIGN_TOP_RIGHT, -BADGE_INSET, BADGE_INSET);
 	lv_obj_add_flag(live_badge, LV_OBJ_FLAG_HIDDEN);
 
 	// The Qobuz mark, in the same corner and for the same reason: say where
@@ -3171,20 +3588,20 @@ void player_init(gui_config_t *cfg) {
 	// it into a solid square).
 	qobuz_badge = lv_image_create(cover_panel);
 	lv_image_set_src(qobuz_badge, &icon_qobuz_badge);
-	lv_obj_align(qobuz_badge, LV_ALIGN_TOP_RIGHT, -14, 14);
+	lv_obj_align(qobuz_badge, LV_ALIGN_TOP_RIGHT, -BADGE_INSET, BADGE_INSET);
 	lv_obj_add_flag(qobuz_badge, LV_OBJ_FLAG_HIDDEN);
 
 	// Same corner, same size: the marks replace each other instead of sitting
 	// side by side, and update_qobuz_badge() decides which.
 	tidal_badge = lv_image_create(cover_panel);
 	lv_image_set_src(tidal_badge, &icon_tidal_badge);
-	lv_obj_align(tidal_badge, LV_ALIGN_TOP_RIGHT, -14, 14);
+	lv_obj_align(tidal_badge, LV_ALIGN_TOP_RIGHT, -BADGE_INSET, BADGE_INSET);
 	lv_obj_add_flag(tidal_badge, LV_OBJ_FLAG_HIDDEN);
 
 	// And the third, same corner and same size as the other two.
 	podcast_badge = lv_image_create(cover_panel);
 	lv_image_set_src(podcast_badge, &icon_podcast_badge);
-	lv_obj_align(podcast_badge, LV_ALIGN_TOP_RIGHT, -14, 14);
+	lv_obj_align(podcast_badge, LV_ALIGN_TOP_RIGHT, -BADGE_INSET, BADGE_INSET);
 	lv_obj_add_flag(podcast_badge, LV_OBJ_FLAG_HIDDEN);
 
 	// Shown while there is no artwork for the current track.
@@ -3256,6 +3673,97 @@ void player_init(gui_config_t *cfg) {
 	lv_obj_center(cover_img);
 	lv_obj_add_flag(cover_img, LV_OBJ_FLAG_HIDDEN);
 
+	// ---------------------------------------------------------------------
+	// Studio: the blurred sleeve behind the whole screen, and everything else
+	// laid out over it.
+	//
+	// The background is a child of the page rather than of the artwork, so it
+	// reaches under the controls as well; the panel that carries the rest is a
+	// child of the artwork, so it travels with the sheet. Nothing on either
+	// takes a press: the surface under them is what the player is pushed shut
+	// by, and the buttons that do take presses are moved here from elsewhere.
+	// ---------------------------------------------------------------------
+	studio_bg = lv_image_create(player_screen);
+	lv_obj_add_flag(studio_bg, LV_OBJ_FLAG_IGNORE_LAYOUT);
+	lv_obj_set_size(studio_bg, cfg->screen_width, cfg->screen_height);
+	lv_obj_set_pos(studio_bg, 0, 0);
+	// COVER and not STRETCH: the blurred copy is asked for at the shape of the
+	// screen, but between a change of arrangement and the picture that follows
+	// it the one on hand is still the old shape, and stretching that is a
+	// visibly squashed sleeve.
+	lv_image_set_inner_align(studio_bg, LV_IMAGE_ALIGN_COVER);
+	lv_obj_remove_flag(studio_bg, LV_OBJ_FLAG_CLICKABLE);
+	lv_obj_add_flag(studio_bg, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_move_background(studio_bg);
+
+	studio_box_w = studio_box_h = cover_size;
+	studio_box = lv_obj_create(cover_panel);
+	lv_obj_remove_style_all(studio_box);
+	lv_obj_set_size(studio_box, studio_box_w, studio_box_h);
+	lv_obj_set_pos(studio_box, 0, 0);
+	lv_obj_remove_flag(studio_box, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_remove_flag(studio_box, LV_OBJ_FLAG_CLICKABLE);
+	lv_obj_add_flag(studio_box, LV_OBJ_FLAG_HIDDEN);
+
+	studio_head = lv_obj_create(studio_box);
+	lv_obj_remove_style_all(studio_head);
+	lv_obj_set_size(studio_head, cover_size - 2 * STUDIO_MARGIN, STUDIO_HEAD_H);
+	lv_obj_remove_flag(studio_head, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_remove_flag(studio_head, LV_OBJ_FLAG_CLICKABLE);
+
+	// Centred in the head and not filling it: the ellipsis sits at the right
+	// edge and the chevron at the left, and the two names have to stop before
+	// they reach either -- on both sides, or a long title would be centred
+	// against one of them.
+	studio_text_col = lv_obj_create(studio_head);
+	lv_obj_remove_style_all(studio_text_col);
+	lv_obj_set_size(studio_text_col, cover_size - 2 * STUDIO_MARGIN - 2 * 68, LV_SIZE_CONTENT);
+	lv_obj_align(studio_text_col, LV_ALIGN_CENTER, 0, 0);
+	lv_obj_set_flex_flow(studio_text_col, LV_FLEX_FLOW_COLUMN);
+	lv_obj_set_flex_align(studio_text_col, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+	lv_obj_set_style_pad_row(studio_text_col, 4, 0);
+	lv_obj_set_style_text_align(studio_text_col, LV_TEXT_ALIGN_CENTER, 0);
+	lv_obj_remove_flag(studio_text_col, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_remove_flag(studio_text_col, LV_OBJ_FLAG_CLICKABLE);
+
+	// The sleeve at whatever size studio_place() settles on. The picture is
+	// decoded at the width of the screen for the standard arrangement, so it is
+	// scaled down here rather than decoded twice.
+	studio_cover = lv_image_create(studio_box);
+	lv_obj_add_flag(studio_cover, LV_OBJ_FLAG_IGNORE_LAYOUT);
+	lv_image_set_inner_align(studio_cover, LV_IMAGE_ALIGN_STRETCH);
+	lv_obj_remove_flag(studio_cover, LV_OBJ_FLAG_CLICKABLE);
+
+	// What stands in the sleeve's place when the track has no artwork: the same
+	// surface and the same mark the full-width cover panel uses, at the size
+	// this arrangement gives the sleeve.
+	studio_empty = lv_obj_create(studio_box);
+	lv_obj_add_flag(studio_empty, LV_OBJ_FLAG_IGNORE_LAYOUT);
+	lv_obj_add_style(studio_empty, &theme_style_panel, 0);
+	lv_obj_set_style_border_width(studio_empty, 0, 0);
+	lv_obj_set_style_radius(studio_empty, 8, 0);
+	lv_obj_remove_flag(studio_empty, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_remove_flag(studio_empty, LV_OBJ_FLAG_CLICKABLE);
+	lv_obj_add_flag(studio_empty, LV_OBJ_FLAG_HIDDEN);
+
+	studio_empty_icon = lv_image_create(studio_empty);
+	lv_obj_set_style_image_recolor_opa(studio_empty_icon, LV_OPA_COVER, 0);
+	lv_obj_center(studio_empty_icon);
+	lv_obj_remove_flag(studio_empty_icon, LV_OBJ_FLAG_CLICKABLE);
+
+	studio_quality = lv_obj_create(studio_box);
+	lv_obj_remove_style_all(studio_quality);
+	lv_obj_set_flex_flow(studio_quality, LV_FLEX_FLOW_ROW);
+	lv_obj_set_flex_align(studio_quality, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+	lv_obj_set_style_pad_column(studio_quality, 8, 0);
+	lv_obj_remove_flag(studio_quality, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_remove_flag(studio_quality, LV_OBJ_FLAG_CLICKABLE);
+
+	// No theme_style_icon here: the four quality marks carry their own colours,
+	// which is how the track lists draw them, and a recolour to the text colour
+	// flattens all four into the same grey glyph.
+	studio_quality_icon = lv_image_create(studio_quality);
+
 	// Last, so it is above the artwork: an invisible strip exactly where the
 	// status bar would be, owning the pull-down that opens the control centre.
 	lv_obj_t *panel_edge = lv_obj_create(player_screen);
@@ -3276,8 +3784,12 @@ void player_init(gui_config_t *cfg) {
 
 	// Whichever arrangement was left selected, now that every widget it moves
 	// exists.
-	layout_alternative = config_get_int("screen", "player_layout_alt", 0) != 0;
+	int saved = (int)config_get_int("screen", "player_layout_alt", 0);
+	layout_choice = (saved == (int)PLAYER_LAYOUT_ALTERNATIVE)	? PLAYER_LAYOUT_ALTERNATIVE
+					: (saved == (int)PLAYER_LAYOUT_STUDIO)		? PLAYER_LAYOUT_STUDIO
+																: PLAYER_LAYOUT_STANDARD;
 	layout_alt_now = false; // apply_layout() below puts the standard one up first
+	layout_studio_now = false;
 	apply_layout();
 
 	theme_register_refresh(player_refresh_theme);

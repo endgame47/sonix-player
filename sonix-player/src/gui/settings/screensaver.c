@@ -367,7 +367,13 @@ static void refresh_content(void) {
 	// The strip first: the artwork below is scaled to whatever is left above
 	// it, so its height has to be settled before that sum is done.
 	const lv_image_dsc_t *backdrop = player_backdrop_image();
-	set_strip_height(backdrop ? (int)backdrop->header.h : DEFAULT_STRIP_H);
+	// The player's blurred copy is as tall as whatever shows it, and one
+	// arrangement shows it behind the whole screen: a strip that tall is the
+	// screen, so that one keeps the default height and takes the top of the
+	// picture instead.
+	int strip_from_backdrop = backdrop ? (int)backdrop->header.h : 0;
+	set_strip_height(strip_from_backdrop > 0 && strip_from_backdrop < screen_h ? strip_from_backdrop
+																			  : DEFAULT_STRIP_H);
 
 	const lv_image_dsc_t *cover = shown_cover;
 	if (cover) {

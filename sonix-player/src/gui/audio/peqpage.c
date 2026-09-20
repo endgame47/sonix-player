@@ -578,13 +578,15 @@ static void apply_enabled(bool on) {
 			continue;
 		}
 		if (on) {
-			lv_obj_remove_state(band_rows[i], LV_STATE_DISABLED);
 			lv_obj_add_flag(band_rows[i], LV_OBJ_FLAG_CLICKABLE);
-			lv_obj_set_style_opa(band_rows[i], LV_OPA_COVER, 0);
 		} else {
-			lv_obj_add_state(band_rows[i], LV_STATE_DISABLED);
 			lv_obj_remove_flag(band_rows[i], LV_OBJ_FLAG_CLICKABLE);
-			lv_obj_set_style_opa(band_rows[i], LV_OPA_40, 0);
+		}
+		lv_obj_set_style_opa(band_rows[i], LV_OPA_COVER, 0);
+
+		uint32_t children = lv_obj_get_child_count(band_rows[i]);
+		for (uint32_t c = 0; c < children; c++) {
+			lv_obj_set_style_opa(lv_obj_get_child(band_rows[i], c), on ? LV_OPA_COVER : LV_OPA_50, 0);
 		}
 	}
 }

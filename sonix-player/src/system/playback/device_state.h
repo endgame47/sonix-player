@@ -177,6 +177,16 @@ void device_state_scrub_commit(void);
 bool device_state_scrub_active(double *position_out);
 void device_state_stop(void);
 
+// Call just before stopping playback because the storage it is reading from is
+// being taken away -- the card removed, or exported to a computer. It notes
+// where the track was, so that the next press of play carries on from there
+// instead of starting the track again: from the engine's side that stop looks
+// exactly like a track that ended.
+//
+// The note belongs to one press. Any track load clears it, and so does a play
+// whose file is not the one that was interrupted.
+void device_state_note_storage_gone(void);
+
 void device_state_set_volume(long volume);
 void device_state_change_volume(long amount);
 

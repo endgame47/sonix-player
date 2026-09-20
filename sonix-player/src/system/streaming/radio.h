@@ -14,8 +14,9 @@
 //                       holding the starred stations and the last few played.
 //                       Same shape as the music library's own database, and
 //                       next to it.
-//   * the transport  -- one thread that pulls the stream, decodes it and
-//                       hands the frames to audio_external_*(), the same door
+//   * the transport  -- one thread that pulls the stream into a buffer of a
+//                       few seconds and one that decodes out of it and hands
+//                       the frames to audio_external_*(), the same door
 //                       AirPlay uses. audio.c's own decoder is not involved:
 //                       a live stream has no length, no seeking and no end,
 //                       and pretending otherwise would mean lying to every

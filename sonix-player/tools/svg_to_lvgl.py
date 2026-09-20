@@ -53,6 +53,8 @@ ICONS = [
     ("eye.svg", "eye", 30),                 # shows the password in clear
     ("eye-off.svg", "eye_off", 30),
     ("folder.svg", "folder", 32),
+    # The Music page corner button when Playlists has taken the tile.
+    ("folder.svg", "folder_corner", 34),
     ("folder-root.svg", "folder_root", 34), # browser corner: back to the card root
     ("file.svg", "file", 32),
     ("music-settings.svg", "music_settings", 34),
@@ -140,6 +142,8 @@ ICONS = [
     ("wifi-search.svg", "wifi_search", 36),
     ("bluetooth-search.svg", "bluetooth_search", 36),
     ("bluetooth-receiver.svg", "bluetooth_receiver", 36),
+    # The receiver page corner button: the codec the phone is sending on.
+    ("change_codec_receiver.svg", "change_codec", 34),
     # Dialog glyphs: a pairing in flight, and "the volume is over there".
     ("bluetooth-connecting.svg", "bluetooth_connecting", 56),
     ("headphones.svg", "headphones_big", 56),
@@ -199,6 +203,9 @@ ICONS = [
     ("circle-alert.svg", "circle_alert", 64), # ...and what a failure shows instead
     ("book-headphones.svg", "book_headphones", 128),
     ("book-headphones.svg", "book_headphones_row", 64), # audiobook rows with no cover
+    # The same glyph the podcast rows use, at the size the three the player
+    # stands in with are drawn: an episode with no artwork gets this one.
+    ("podcast-list.svg", "podcast_cover", 128),
     # Player extras. Shuffle and shuffle-repeat share a button.
     ("shuffle.svg", "shuffle", 30),
     ("shuffle-repeat.svg", "shuffle_repeat", 30),
@@ -340,6 +347,8 @@ COLOR_ICONS = [
     ("album_artist.png", "menu_album_artist", SECTION_ICON_SIZE),
     ("genre.png", "menu_genre", SECTION_ICON_SIZE),
     ("explorer.png", "menu_explorer", SECTION_ICON_SIZE),
+    # The tile Explorer swaps with when playlists are put first.
+    ("playlist.png", "menu_playlist", SECTION_ICON_SIZE),
     ("streaming.png", "menu_streaming", MAIN_MENU_ICON_SIZE),
     ("wireless.png", "menu_wireless", MAIN_MENU_ICON_SIZE),
     # The Wireless section's own grid.

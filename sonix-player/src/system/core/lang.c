@@ -27,7 +27,8 @@
 typedef struct {
 	uint32_t key_at; // offsets into the arena, not pointers: it moves as it grows
 	uint32_t value_at;
-	int next; // index of the next entry in this bucket, -1 at the end
+	int next;		// index of the next entry in this bucket, -1 at the end
+	int value_next; // the same chain for the by-value index below
 } entry_t;
 
 typedef struct {
@@ -36,6 +37,11 @@ typedef struct {
 	entry_t entries[MAX_ENTRIES];
 	int count;
 	int buckets[BUCKETS];
+	// The same index the other way round, keyed on the translation rather than
+	// on the tag. The re-labelling below asks nine hundred-odd questions of it
+	// for every label on every page at once, and walking the whole table for
+	// each of them is the language change taking seconds rather than a moment.
+	int value_buckets[BUCKETS];
 } table_t;
 
 static table_t live;
@@ -62,6 +68,7 @@ static void table_reset(table_t *t) {
 	t->count = 0;
 	for (int i = 0; i < BUCKETS; i++) {
 		t->buckets[i] = -1;
+		t->value_buckets[i] = -1;
 	}
 }
 
@@ -103,10 +110,13 @@ static void table_add(table_t *t, const char *key, const char *value) {
 	}
 
 	unsigned b = hash_of(at(t, k)) % BUCKETS;
+	unsigned vb = hash_of(at(t, v)) % BUCKETS;
 	t->entries[t->count].key_at = k;
 	t->entries[t->count].value_at = v;
 	t->entries[t->count].next = t->buckets[b];
+	t->entries[t->count].value_next = t->value_buckets[vb];
 	t->buckets[b] = t->count;
+	t->value_buckets[vb] = t->count;
 	t->count++;
 }
 
@@ -123,15 +133,21 @@ static const char *table_find(const table_t *t, const char *key) {
 }
 
 // The other direction, for the re-labelling below: what is on screen is the
-// translation and the key has to be recovered from it. Linear, but it runs
-// once per label on one language change.
+// translation and the key has to be recovered from it.
+//
+// Two tags can carry the same text in one language and different text in
+// another, so which of them answers has to be settled: the lowest entry, which
+// is the one nearest the top of the file, exactly as a walk from the start
+// would have found. The chain is built by prepending, so it is walked to the
+// end rather than stopped at the first match.
 static const char *table_find_by_value(const table_t *t, const char *value) {
-	for (int i = 0; i < t->count; i++) {
-		if (strcmp(entry_value(t, i), value) == 0) {
-			return entry_key(t, i);
+	int best = -1;
+	for (int i = t->value_buckets[hash_of(value) % BUCKETS]; i >= 0; i = t->entries[i].value_next) {
+		if (strcmp(entry_value(t, i), value) == 0 && (best < 0 || i < best)) {
+			best = i;
 		}
 	}
-	return NULL;
+	return best >= 0 ? entry_key(t, best) : NULL;
 }
 
 // ---------------------------------------------------------------------------
@@ -287,19 +303,22 @@ static void relabel_tree(lv_obj_t *obj) {
 	if (lv_obj_check_type(obj, &lv_label_class)) {
 		// A label set to LV_LABEL_LONG_DOT does not keep the text it was
 		// given: once LVGL has decided the text is too long it overwrites the
-		// tail with dots, and lv_label_get_text() then hands back "..." --
-		// which matches nothing and would leave every page heading in the old
-		// language. Every page in this interface is built at startup, before
-		// it has ever been laid out at its real width, so this is not the edge
-		// case it sounds like: it is all of them.
+		// tail with dots, remembers the characters it covered, and
+		// lv_label_get_text() then hands back the shortened form. A page built
+		// at startup has never been laid out at its real width, so the dots
+		// start at the first character and the whole string reads as "..." --
+		// which matches nothing, and the heading stays in the old language.
 		//
-		// Changing the long mode is what puts the characters back
-		// (lv_label_set_long_mode calls lv_label_revert_dots), so the mode is
-		// stepped aside and restored around the read.
-		lv_label_long_mode_t mode = lv_label_get_long_mode(obj);
-		bool dotted = (mode == LV_LABEL_LONG_DOT);
-		if (dotted) {
-			lv_label_set_long_mode(obj, LV_LABEL_LONG_CLIP);
+		// lv_label_set_text(obj, NULL) is LVGL's own "put the characters back
+		// and refresh": it reverts the dots in place and leaves the text
+		// alone. Changing the long mode does not, whatever it once did --
+		// lv_label_set_long_mode() only marks the label for a refresh that has
+		// not happened yet by the time the text is read back.
+		//
+		// Asked only of the labels that can carry dots at all: this walk sees
+		// every label on every page, and the call reallocates the string.
+		if (lv_label_get_long_mode(obj) == LV_LABEL_LONG_DOT) {
+			lv_label_set_text(obj, NULL);
 		}
 
 		const char *text = lv_label_get_text(obj);
@@ -308,10 +327,6 @@ static void relabel_tree(lv_obj_t *obj) {
 			if (strcmp(now, text) != 0) {
 				lv_label_set_text(obj, now);
 			}
-		}
-
-		if (dotted) {
-			lv_label_set_long_mode(obj, mode);
 		}
 	}
 	uint32_t n = lv_obj_get_child_count(obj);
@@ -568,7 +583,10 @@ bool lang_set(const char *name) {
 		return true;
 	}
 
-	table_t next;
+	// Static rather than on the stack: the table carries two indexes now and is
+	// forty kilobytes, which is more than a page's worth of stack to take for
+	// the length of one call.
+	static table_t next;
 	memset(&next, 0, sizeof(next));
 	table_reset(&next);
 

@@ -36,6 +36,26 @@ static void action_cb(lv_event_t *e) {
 	action();
 }
 
+// The two children add_tile() puts on every tile, in the order it makes them.
+#define TILE_ICON_CHILD 0
+#define TILE_LABEL_CHILD 1
+
+void gridpage_set_tile(lv_obj_t *grid, int index, const lv_image_dsc_t *icon, const char *label) {
+	if (!grid || index < 0 || index >= (int)lv_obj_get_child_count(grid)) {
+		return;
+	}
+	lv_obj_t *tile = lv_obj_get_child(grid, index);
+	if (!tile) {
+		return;
+	}
+	if (icon) {
+		lv_image_set_src(lv_obj_get_child(tile, TILE_ICON_CHILD), icon);
+	}
+	if (label) {
+		lv_label_set_text(lv_obj_get_child(tile, TILE_LABEL_CHILD), tr(label));
+	}
+}
+
 static void add_tile(lv_obj_t *grid, const grid_entry_t *entry, int width, int height) {
 	lv_obj_t *tile = lv_btn_create(grid);
 	lv_obj_set_size(tile, width, height);

@@ -424,15 +424,6 @@ struct decoder {
 	uint64_t cue_read;   // frames handed out since the window opened
 };
 
-// Which route a DSD file takes. It is a setting rather than an argument
-// because decoder_open() is reached from several places and none of them has
-// any business knowing about DoP; audio.c sets it once when the setting
-// changes. DoP is the default -- it is what this hardware is built for.
-static dsd_output_t dsd_mode = DSD_OUT_DOP;
-
-void decode_set_dsd_output(int pcm) { dsd_mode = pcm ? DSD_OUT_PCM : DSD_OUT_DOP; }
-int decode_get_dsd_output(void) { return dsd_mode == DSD_OUT_PCM; }
-
 // ".alac" is a label, not a container.
 //
 // Whoever writes it means "there is ALAC in here", which names a codec and not
@@ -1298,7 +1289,7 @@ static decoder_t *decoder_open_file(const char *filepath, decode_format_t format
 		break;
 
 	case DECODE_FORMAT_DSD: {
-		dec->impl.dsd = dsd_open(filepath, dsd_mode);
+		dec->impl.dsd = dsd_open(filepath);
 		if (!dec->impl.dsd) {
 			free(dec);
 			return NULL;
@@ -1459,9 +1450,8 @@ int decoder_source_bits(const decoder_t *dec) {
 	if (dec->format == DECODE_FORMAT_FLAC && dec->impl.flac) {
 		return (int)dec->impl.flac->bitsPerSample;
 	}
-	// DSD goes out as 24-bit words in a 32-bit stream either way: DoP needs
-	// exactly 24 (16 bits of stream plus the marker byte) and the converted
-	// route is hi-res by definition.
+	// DSD goes out as 24-bit words in a 32-bit stream: DoP needs exactly 24,
+	// sixteen bits of stream plus the marker byte.
 	if (dec->format == DECODE_FORMAT_DSD) {
 		return 24;
 	}
@@ -1526,9 +1516,7 @@ const char *decoder_codec_name(const decoder_t *dec) {
 	}
 }
 
-bool decoder_passthrough(const decoder_t *dec) {
-	return dec && dec->format == DECODE_FORMAT_DSD && dsd_is_dop(dec->impl.dsd);
-}
+bool decoder_passthrough(const decoder_t *dec) { return dec && dec->format == DECODE_FORMAT_DSD; }
 
 int decoder_dsd_multiple(const decoder_t *dec) {
 	return (dec && dec->format == DECODE_FORMAT_DSD) ? dsd_multiple(dec->impl.dsd) : 0;

@@ -59,6 +59,49 @@ static int rx_count;
 // "stopped", or empty when nothing has said. Written both by the signal and by
 // the worker's own reading of the property.
 static char media_status[32];
+static btstack_track_t media_track;
+static unsigned media_track_serial;
+
+// One a{sv} of AVRCP track metadata into `out`. Every key the player does not
+// use is stepped over by signature, the way the device properties are read.
+static void read_track_props(dbus_reader_t *r, btstack_track_t *out) {
+	dbus_array_iter_t props;
+	if (!dbus_r_array_begin(r, "{sv}", &props)) {
+		return;
+	}
+	while (dbus_r_array_more(r, &props)) {
+		char key[64], sig[16];
+		if (!dbus_r_string(r, key, sizeof(key)) || !dbus_r_signature(r, sig, sizeof(sig))) {
+			return;
+		}
+
+		if (strcmp(key, "Title") == 0 && strcmp(sig, "s") == 0) {
+			dbus_r_string(r, out->title, sizeof(out->title));
+		} else if (strcmp(key, "Artist") == 0 && strcmp(sig, "s") == 0) {
+			dbus_r_string(r, out->artist, sizeof(out->artist));
+		} else if (strcmp(key, "Album") == 0 && strcmp(sig, "s") == 0) {
+			dbus_r_string(r, out->album, sizeof(out->album));
+		} else if (strcmp(key, "Duration") == 0 && strcmp(sig, "u") == 0) {
+			uint32_t ms = 0;
+			dbus_r_u32(r, &ms);
+			out->duration_ms = (unsigned)ms;
+		} else if (!dbus_r_skip(r, sig)) {
+			return;
+		}
+	}
+}
+
+// Replaces the cache and bumps the serial only when something really moved: the
+// sender repeats the same metadata on every status change, and a serial that
+// moved every time would have the page redrawing for nothing.
+static void store_track(const btstack_track_t *fresh) {
+	pthread_mutex_lock(&lock);
+	if (memcmp(&media_track, fresh, sizeof(media_track)) != 0) {
+		media_track = *fresh;
+		media_track_serial++;
+	}
+	pthread_mutex_unlock(&lock);
+}
 
 static void sleep_ms(int ms) {
 	struct timespec ts = {.tv_sec = ms / 1000, .tv_nsec = (long)(ms % 1000) * 1000000L};
@@ -397,6 +440,14 @@ static void on_signal(dbus_conn_t *c, const dbus_msg_t *m, void *user) {
 							pthread_mutex_unlock(&lock);
 							fprintf(stderr, "btstack: the remote player is %s\n", status);
 						}
+					} else if (strcmp(key, "Track") == 0 && strcmp(sig, "a{sv}") == 0) {
+						// The sender announces the new track before the audio
+						// changes over, so the page is right by the time the
+						// first frame of it arrives.
+						btstack_track_t fresh;
+						memset(&fresh, 0, sizeof(fresh));
+						read_track_props(&r, &fresh);
+						store_track(&fresh);
 					} else if (!dbus_r_skip(&r, sig)) {
 						break;
 					}
@@ -942,7 +993,8 @@ void btstack_refresh_audio(void) {
 	pthread_mutex_unlock(&lock);
 }
 
-int btstack_codecs(const char *address, char out[][BT_CODEC_NAME_MAX], int max, char *selected, size_t selected_size) {
+int btstack_codecs_dir(const char *address, bool receiving, char out[][BT_CODEC_NAME_MAX], int max, char *selected,
+					   size_t selected_size) {
 	if (selected && selected_size) {
 		selected[0] = '\0';
 	}
@@ -951,7 +1003,7 @@ int btstack_codecs(const char *address, char out[][BT_CODEC_NAME_MAX], int max, 
 	pthread_mutex_unlock(&lock);
 
 	char path[OBJECT_PATH_MAX];
-	if (!c || !pcm_path(address, path, sizeof(path))) {
+	if (!c || !pcm_path_dir(address, receiving, path, sizeof(path))) {
 		return 0;
 	}
 
@@ -1196,6 +1248,23 @@ static bool remote_player_path(dbus_conn_t *c, const char *address, char *out, s
 	return false;
 }
 
+bool btstack_media_track(btstack_track_t *out) {
+	if (!out) {
+		return false;
+	}
+	pthread_mutex_lock(&lock);
+	*out = media_track;
+	pthread_mutex_unlock(&lock);
+	return out->title[0] != '\0' || out->artist[0] != '\0';
+}
+
+unsigned btstack_media_serial(void) {
+	pthread_mutex_lock(&lock);
+	unsigned now = media_track_serial;
+	pthread_mutex_unlock(&lock);
+	return now;
+}
+
 bool btstack_media_status(char *out, size_t size) {
 	if (!out || !size) {
 		return false;
@@ -1206,34 +1275,97 @@ bool btstack_media_status(char *out, size_t size) {
 	return out[0] != '\0';
 }
 
+// The player object of the device that is streaming, remembered between polls.
+// Looking it up costs a GetManagedObjects -- every object bluez has, with every
+// property of each -- and this is asked once a second while a device is
+// streaming. The path is only worth what the Get on it answers, so a Get that
+// fails throws it away and the next poll looks it up again.
+static char media_player_path[OBJECT_PATH_MAX];
+static char media_player_address[BT_ADDR_MAX];
+
+static bool player_property(dbus_conn_t *c, const char *path, const char *name, const char *expect,
+							dbus_reader_t *out) {
+	dbus_writer_t *w = dbus_call_begin(c, BLUEZ_SERVICE, path, PROPS_IFACE, "Get", "ss");
+	dbus_w_string(w, BLUEZ_MEDIA_PLAYER_IFACE);
+	dbus_w_string(w, name);
+	if (!dbus_call_send(c, CALL_MS, NULL, 0)) {
+		return false;
+	}
+
+	dbus_reply_reader(c, out);
+	char sig[16];
+	return dbus_r_signature(out, sig, sizeof(sig)) && strcmp(sig, expect) == 0;
+}
+
 void btstack_refresh_media_status(const char *address) {
 	pthread_mutex_lock(&lock);
 	dbus_conn_t *c = conn;
 	pthread_mutex_unlock(&lock);
-	if (!c) {
+	if (!c || !address || !address[0]) {
 		return;
 	}
 
 	char path[OBJECT_PATH_MAX];
-	char status[32] = "";
-	if (remote_player_path(c, address, path, sizeof(path))) {
-		dbus_writer_t *w = dbus_call_begin(c, BLUEZ_SERVICE, path, PROPS_IFACE, "Get", "ss");
-		dbus_w_string(w, BLUEZ_MEDIA_PLAYER_IFACE);
-		dbus_w_string(w, "Status");
-		if (dbus_call_send(c, CALL_MS, NULL, 0)) {
-			dbus_reader_t r;
-			dbus_reply_reader(c, &r);
-			char sig[16];
-			if (dbus_r_signature(&r, sig, sizeof(sig)) && strcmp(sig, "s") == 0) {
-				dbus_r_string(&r, status, sizeof(status));
-			}
-		}
+	if (strcmp(media_player_address, address) == 0 && media_player_path[0]) {
+		snprintf(path, sizeof(path), "%s", media_player_path);
+	} else if (remote_player_path(c, address, path, sizeof(path))) {
+		snprintf(media_player_path, sizeof(media_player_path), "%s", path);
+		snprintf(media_player_address, sizeof(media_player_address), "%s", address);
+	} else {
+		media_player_path[0] = '\0';
+		return;
 	}
 
-	// An empty answer is written through on purpose: a device with no player
-	// object at all must not leave the last one's status standing.
+	char status[32] = "";
+	btstack_track_t track;
+	bool answered_status = false;
+	bool answered_track = false;
+	memset(&track, 0, sizeof(track));
+
+	dbus_reader_t r;
+	if (player_property(c, path, "Status", "s", &r)) {
+		answered_status = dbus_r_string(&r, status, sizeof(status));
+	}
+
+	// And what it is playing. Read here as well as caught on the signal:
+	// connecting to a device that is already playing brings no announcement
+	// with it, and the page would sit empty until the next track.
+	if (player_property(c, path, "Track", "a{sv}", &r)) {
+		read_track_props(&r, &track);
+		answered_track = true;
+	}
+
+	if (!answered_status && !answered_track) {
+		media_player_path[0] = '\0'; // the object went away or was renumbered
+		return;
+	}
+
+	// Only an answer replaces a cache. A Get can be refused while the link is
+	// renegotiating, and that says nothing about what the device is playing;
+	// writing an empty track through on it wipes what the announcement delivered
+	// a moment earlier. What empties the caches is the sender going away, which
+	// btstack_forget_media() is for.
+	if (answered_track) {
+		store_track(&track);
+	}
+
+	if (answered_status) {
+		pthread_mutex_lock(&lock);
+		snprintf(media_status, sizeof(media_status), "%s", status);
+		pthread_mutex_unlock(&lock);
+	}
+}
+
+void btstack_forget_media(void) {
+	media_player_path[0] = '\0';
+	media_player_address[0] = '\0';
+
+	btstack_track_t empty;
+	memset(&empty, 0, sizeof(empty));
+	store_track(&empty);
+
 	pthread_mutex_lock(&lock);
-	snprintf(media_status, sizeof(media_status), "%s", status);
+	media_status[0] = '\0';
 	pthread_mutex_unlock(&lock);
 }
 
@@ -1400,13 +1532,13 @@ bool btstack_bluealsa_version(char *out, size_t size) {
 	return out[0] != '\0';
 }
 
-bool btstack_select_codec(const char *address, const char *codec) {
+bool btstack_select_codec_dir(const char *address, bool receiving, const char *codec) {
 	pthread_mutex_lock(&lock);
 	dbus_conn_t *c = conn;
 	pthread_mutex_unlock(&lock);
 
 	char path[OBJECT_PATH_MAX];
-	if (!c || !codec || !codec[0] || !pcm_path(address, path, sizeof(path))) {
+	if (!c || !codec || !codec[0] || !pcm_path_dir(address, receiving, path, sizeof(path))) {
 		return false;
 	}
 
@@ -1420,6 +1552,80 @@ bool btstack_select_codec(const char *address, const char *codec) {
 	// Renegotiating the codec tears the stream down and builds it again, which
 	// the headphones take a moment to follow.
 	bool ok = dbus_call_send(c, 15000, err, sizeof(err));
-	fprintf(stderr, "btstack: codec %s on %s -> %s\n", codec, address, ok ? "ok" : (err[0] ? err : "no reply"));
+	fprintf(stderr, "btstack: codec %s on %s (%s) -> %s\n", codec, address, receiving ? "sink" : "source",
+			ok ? "ok" : (err[0] ? err : "no reply"));
 	return ok;
+}
+
+// The PCM's own volume, on either direction's stream.
+//
+// On the receiving side this is the level the sending phone sets over AVRCP and
+// bluealsa applies to the decoded stream. Renegotiating the codec builds a new
+// PCM, and the new one starts at bluealsa's default: the phone does not resend
+// what it had already set, so without carrying the level across, the phone's
+// volume keys appear to stop working after a codec change.
+bool btstack_pcm_volume_get(const char *address, bool receiving, int *out) {
+	pthread_mutex_lock(&lock);
+	dbus_conn_t *c = conn;
+	pthread_mutex_unlock(&lock);
+
+	char path[OBJECT_PATH_MAX];
+	if (!c || !out || !pcm_path_dir(address, receiving, path, sizeof(path))) {
+		return false;
+	}
+
+	dbus_writer_t *w = dbus_call_begin(c, BALSA_SERVICE, path, PROPS_IFACE, "Get", "ss");
+	dbus_w_string(w, BALSA_PCM_IFACE);
+	dbus_w_string(w, "Volume");
+
+	char err[DBUS_NAME_MAX];
+	if (!dbus_call_send(c, CALL_MS, err, sizeof(err))) {
+		return false;
+	}
+
+	dbus_reader_t r;
+	dbus_reply_reader(c, &r);
+	char sig[16];
+	uint16_t both = 0;
+	if (!dbus_r_signature(&r, sig, sizeof(sig)) || sig[0] != 'q' || !dbus_r_u16(&r, &both)) {
+		return false;
+	}
+	// Two channels in one word, and the top bit of each byte is its mute
+	// switch. The word is carried whole rather than taken apart: writing back
+	// exactly what was read cannot get the mute or the balance wrong.
+	*out = (int)both;
+	return true;
+}
+
+bool btstack_pcm_volume_set(const char *address, bool receiving, int volume) {
+	pthread_mutex_lock(&lock);
+	dbus_conn_t *c = conn;
+	pthread_mutex_unlock(&lock);
+
+	char path[OBJECT_PATH_MAX];
+	if (!c || volume < 0 || !pcm_path_dir(address, receiving, path, sizeof(path))) {
+		return false;
+	}
+
+	dbus_writer_t *w = dbus_call_begin(c, BALSA_SERVICE, path, PROPS_IFACE, "Set", "ssv");
+	dbus_w_string(w, BALSA_PCM_IFACE);
+	dbus_w_string(w, "Volume");
+	dbus_w_variant_u16(w, (uint16_t)volume);
+
+	char err[DBUS_NAME_MAX];
+	bool ok = dbus_call_send(c, CALL_MS, err, sizeof(err));
+	if (!ok) {
+		fprintf(stderr, "btstack: volume not restored on %s: %s\n", path, err[0] ? err : "no reply");
+	}
+	return ok;
+}
+
+// The headphone direction, which is what everything but the receiver page asks
+// about.
+int btstack_codecs(const char *address, char out[][BT_CODEC_NAME_MAX], int max, char *selected, size_t selected_size) {
+	return btstack_codecs_dir(address, false, out, max, selected, selected_size);
+}
+
+bool btstack_select_codec(const char *address, const char *codec) {
+	return btstack_select_codec_dir(address, false, codec);
 }

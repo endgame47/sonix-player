@@ -257,38 +257,38 @@ static bool g_screen_on_hold;
 // ---------------------------------------------------------------------------
 // charge limit
 //
-// The mp2731 driver publishes its charge current as a module parameter and a
-// couple of control nodes; which of them exists differs between firmware
-// builds, so the first writable one wins. If none of them is there the setting
-// is remembered but cannot be enforced, and the settings page says so rather
-// than pretending.
+// Holding the battery below full, and doing it in a way that cannot leave the
+// player unable to charge. The node is not on every firmware build, so when it
+// is missing the setting is remembered but cannot be enforced, and the settings
+// page says so rather than pretending.
 // ---------------------------------------------------------------------------
 
-// The nodes the stock player itself writes, in the order it writes them. Its
-// three settings are (MaxPower, charge_control_limit_max, current_max):
-//   fast charge  (2000, 0, 2000)
-//   slow charge  ( 500, 500, 500)
-//   no charge    (  10, 100, 0)
-// So zero in constant_charge_current_max is how the firmware stops charging,
-// and the values are in mA on this driver, not the microamps the kernel's
-// power_supply class normally uses.
+// How charging is stopped: one node on the charger driver.
 //
-// One more write matters (stock FUN_00481740 does it unconditionally, last):
-// the charger's *input* current limit, in microamps -- MaxPower * 1000, so 10
-// mA on a stop and 2 A on full speed. Without it the MP2731 clamps the charge
-// current to its minimum instead of zero and keeps trickling, so the battery
-// creeps past the limit.
-#define CHARGE_CURRENT_NODE "/sys/class/power_supply/usb/constant_charge_current_max"
-#define CHARGE_LIMIT_NODE "/sys/class/power_supply/usb/charge_control_limit_max"
-#define INPUT_CURRENT_NODE "/sys/class/power_supply/mp2731-charger/input_current_limited"
-
-// What to restore when charging is allowed again, if the node read zero the
-// first time (which it does when the device booted on the charger and the stock
-// player had already stopped it).
-#define CHARGE_CURRENT_DEFAULT 2000
+// Despite its name -- the driver's own property is its step-charging algorithm,
+// which is what the bit belongs to -- writing 0 here clears CHG_CONFIG in the
+// MP2731's REG04h, and that disables charging while LEAVING THE INPUT PATH
+// ACTIVE. The distinction is the whole point:
+//
+//   * the input current limit (input_current_limited) starves the system as
+//     well as the battery. A flat battery behind a throttled input cannot
+//     charge AND cannot boot the player that would release it -- which is the
+//     soft-brick this replaces;
+//   * CHG_CONFIG stops only what goes into the cell. The converter keeps
+//     supplying the system from the cable, so the player always starts and
+//     mp2731_hw_init resets the charger at every boot.
+//
+// Measured both ways on the device: with charging disabled the input still
+// carried the system (250 mA in, 0 mA into the battery, the system rail held
+// 200 mV above the cell), and with the battery physically removed the player
+// powered on from the charger alone.
+//
+// The two nodes under /sys/class/power_supply/usb/ the stock player writes are
+// not used at all: that supply is the AXP2101 PMIC, not the charger, and
+// writing them does nothing to charging.
+#define STEP_CHARGING_NODE "/sys/class/power_supply/mp2731-charger/step_charging_enabled"
 
 static const char *g_charge_node;	 // the writable node, NULL if there is none
-static long g_charge_node_default;	 // what it read before anything was written
 static int g_charge_limit = 100;	 // 100 = charge to full
 static bool g_charging_suspended;
 
@@ -306,21 +306,13 @@ static void find_charge_node(void) {
 	}
 	searched = true;
 
-	if (access(CHARGE_CURRENT_NODE, W_OK) != 0) {
-		printf("power: %s is not writable; the charge limit cannot be enforced\n", CHARGE_CURRENT_NODE);
+	if (access(STEP_CHARGING_NODE, W_OK) != 0) {
+		printf("power: %s is not writable; the charge limit cannot be enforced\n", STEP_CHARGING_NODE);
 		return;
 	}
 
-	g_charge_node = CHARGE_CURRENT_NODE;
-	g_charge_node_default = read_long_from_file(g_charge_node);
-
-	// A zero here means charging is already stopped, which is not a sensible
-	// thing to restore to.
-	if (g_charge_node_default <= 0) {
-		g_charge_node_default = CHARGE_CURRENT_DEFAULT;
-	}
-
-	printf("power: charge limit will use %s (restore value %ld mA)\n", g_charge_node, g_charge_node_default);
+	g_charge_node = STEP_CHARGING_NODE;
+	printf("power: charge limit will use %s\n", g_charge_node);
 }
 
 bool power_charge_limit_supported(void) {
@@ -329,6 +321,19 @@ bool power_charge_limit_supported(void) {
 }
 
 int power_get_charge_limit(void) { return g_charge_limit; }
+
+bool power_charging_held(void) { return g_charging_suspended; }
+
+static void charger_run(bool run);
+
+void power_charging_release(void) {
+	find_charge_node();
+	if (!g_charge_node) {
+		return;
+	}
+	charger_run(true);
+	g_charging_suspended = false;
+}
 
 void power_set_charge_limit(int percent) {
 	if (percent < 80) {
@@ -340,73 +345,63 @@ void power_set_charge_limit(int percent) {
 	g_charge_limit = percent;
 }
 
-// Starts or stops the charger with the full set of writes the stock player
-// makes -- see the node comments above. `input_current_limited` may not exist
-// on every firmware revision, so it is skipped silently when it is missing.
 static void charger_run(bool run) {
-	if (run) {
-		write_long_to_file(CHARGE_LIMIT_NODE, 0);
-		write_long_to_file(g_charge_node, g_charge_node_default);
-		if (access(INPUT_CURRENT_NODE, W_OK) == 0) {
-			write_long_to_file(INPUT_CURRENT_NODE, g_charge_node_default * 1000); // mA -> uA
-		}
-	} else {
-		write_long_to_file(g_charge_node, 0);
-		write_long_to_file(CHARGE_LIMIT_NODE, 100); // what the stock player pairs with a stop
-		if (access(INPUT_CURRENT_NODE, W_OK) == 0) {
-			write_long_to_file(INPUT_CURRENT_NODE, 10 * 1000); // stock's stop value: 10 mA
-		}
+	if (g_charge_node) {
+		write_long_to_file(g_charge_node, run ? 1 : 0);
 	}
 }
 
-// Called from the tick. Stops the charger above the limit and starts it again
-// three percent below, so it does not chatter on and off at the boundary.
+// Called from the tick, and from anything that changes one of the inputs.
+//
+// One place decides, and it decides from scratch every time rather than from
+// what the last decision was: the charger is written only when the answer has
+// changed, so this can be called as often as anything likes.
 static void apply_charge_limit(void) {
 	find_charge_node();
+	if (!g_charge_node) {
+		return;
+	}
 
-	// A deliberate block outranks the percentage limit, and outlasts it: the
-	// tick would otherwise restore the charger a second after the user turned
-	// it off.
-	if (g_charging_blocked) {
-		if (g_charge_node && !g_charging_suspended) {
-			charger_run(false);
-			g_charging_suspended = true;
+	bool allow;
+	if (!usb_vbus_present()) {
+		// No cable, nothing to hold off -- and this is the case that must not
+		// be got wrong. The bit survives the charger being unplugged, so a
+		// player that left it off would meet the next cable with a charger that
+		// does nothing, until the next reboot reset it.
+		allow = true;
+	} else if (g_charging_blocked) {
+		// DAC mode with charging switched off. Outranks the percentage limit
+		// and outlasts it: the tick must not undo a choice the user made.
+		allow = false;
+	} else if (g_charge_limit >= 100) {
+		allow = true;
+	} else {
+		const char *level = read_battery_percent();
+		if (!level || level[0] < '0' || level[0] > '9') {
+			return; // no reading to judge by; leave the charger as it is
 		}
-		return;
+		int percent = atoi(level);
+		// Three percent of hysteresis, so it does not chatter at the boundary.
+		allow = g_charging_suspended ? percent <= g_charge_limit - 3 : percent < g_charge_limit;
 	}
 
-	if (!g_charge_node || g_charge_limit >= 100) {
-		if (g_charging_suspended) {
-			charger_run(true);
-			g_charging_suspended = false;
-		}
-		return;
+	// Written once at startup whatever the answer, so the player's idea of the
+	// charger and the charger agree from the first tick rather than from the
+	// first change.
+	static bool ever_written;
+	if (ever_written && !allow == g_charging_suspended) {
+		return; // already where it should be
 	}
+	ever_written = true;
 
-	const char *level = read_battery_percent();
-	if (!level || level[0] < '0' || level[0] > '9') {
-		return;
-	}
-
-	int percent = atoi(level);
-
-	if (!g_charging_suspended && percent >= g_charge_limit) {
-		printf("power: battery at %d%%, stopping the charger at the %d%% limit\n", percent, g_charge_limit);
-		charger_run(false);
-		g_charging_suspended = true;
-	} else if (g_charging_suspended && percent <= g_charge_limit - 3) {
-		printf("power: battery back to %d%%, charging again\n", percent);
-		charger_run(true);
-		g_charging_suspended = false;
-	}
+	charger_run(allow);
+	g_charging_suspended = !allow;
+	printf("power: charging %s\n", allow ? "on" : "held off at the limit");
 }
 
 // Forbids or allows charging outright, on top of whatever the percentage limit
-// is doing. This is the one place that knows the full sequence the charger
-// needs -- three nodes, in order, with the stock player's own values -- and
-// callers have no business rediscovering it: writing charge_control_limit_max
-// alone does nothing useful, and writing 0 into it means *fast charge*, not
-// stop.
+// is doing. DAC mode is the one caller: the choice is the user's and the
+// percentage limit must not undo it.
 void power_set_charging_allowed(bool allowed) {
 	find_charge_node();
 	g_charging_blocked = !allowed;
@@ -416,16 +411,9 @@ void power_set_charging_allowed(bool allowed) {
 		return;
 	}
 
-	if (!allowed) {
-		charger_run(false);
-		g_charging_suspended = true;
-		printf("power: charging forbidden\n");
-	} else {
-		charger_run(true);
-		g_charging_suspended = false;
-		printf("power: charging allowed again\n");
-		apply_charge_limit(); // and let the percentage limit have its say
-	}
+	printf("power: charging %s\n", allowed ? "allowed again" : "forbidden");
+	apply_charge_limit(); // one place decides, including this
+
 }
 
 // ---------------------------------------------------------------------------
@@ -768,9 +756,11 @@ static void unpark_radios(void) {
 //   * Wi-Fi parked first (an associated chip is 20-40 mA and the network would
 //     die in the suspend anyway); with Bluetooth on it does not suspend at all,
 //     because its resident daemons have no clean suspend path.
-//   * not while the cable is carrying something: the card exported to a host,
-//     a computer feeding the DAC, or an ADB session. A cable that is only
-//     charging is not a reason to stay awake.
+//   * not while a cable is in at all. What it is carrying is reason enough on
+//     its own -- the card exported to a host, a computer feeding the DAC, an
+//     ADB session -- and a cable that is only charging is reason too: the
+//     charge limit is enforced by this file's tick, and the tick does not run
+//     while the SoC is suspended.
 //   * sync() first: the removable microSD loses power in the suspend
 //     (keep_power_in_suspend=0 in the driver's script), so anything bound for it
 //     must already have got there.
@@ -926,6 +916,11 @@ static void rtc_alarm_arm_for_auto_off(void) {
 static void power_auto_off_now(const char *why) {
 	printf("power: automatic shutdown: %s\n", why);
 	fflush(stdout);
+	// The charger goes back on before the power goes off. The driver keeps this
+	// bit across a shutdown -- mp2731_shutdown writes it from the property it
+	// has stored -- so a player that switched it off at the limit would leave a
+	// device that will not charge until it is booted again.
+	power_charging_release();
 	// Where the music had got to: this path never goes through the interface,
 	// which is what normally writes it.
 	device_state_remember_flush();
@@ -1132,9 +1127,24 @@ static void suspend_if_idle(uint32_t now, bool playing) {
 		mem_skip("Bluetooth just switched off: mem starts on the next round");
 		return;
 	}
-	// The cable itself is not a reason -- a device on a desk charger should
-	// still sleep -- but what the cable is carrying is: the card exported over
-	// USB, or a computer feeding the DAC, both of which the suspend would cut.
+	// The cable is a reason on its own: a player on the charger stays awake
+	// until it comes out.
+	//
+	// The charge limit is what the tick at the bottom of this file enforces, and
+	// nothing runs while the SoC is suspended -- a player asleep on the charger
+	// charges straight past the limit, and the release point three percent below
+	// it is never seen either. Reaching the limit does not lift this: the level
+	// falls again on its own, and only something still awake notices.
+	//
+	// With no limit set there is nothing to enforce, but the answer is the same,
+	// because a cable is the one case where sleeping saves nothing that matters.
+	if (usb_vbus_present()) {
+		mem_skip("the charger is plugged in");
+		return;
+	}
+	// And what the cable is carrying: the card exported over USB, or a computer
+	// feeding the DAC, both of which the suspend would cut. Below the cable
+	// itself now, and kept because a host can hold the port without VBUS.
 	if (usb_storage_active() || usbdac_is_active()) {
 		mem_skip("the USB cable is transferring something");
 		return;

@@ -81,6 +81,16 @@ bool audio_device_is_open(void);
 // the track is logged, and nothing plays". The watchdog reports it.
 long audio_play_request_age_ms(void);
 
+// A counter the decode loop steps once per turn. It wraps, and its value on its
+// own means nothing: what it is for is the difference between two readings a
+// second apart. The playback thread is real-time and the device has one core,
+// so a turn that never blocks takes the whole machine with it -- the interface
+// freezes and the log goes quiet, because nothing else is scheduled to write to
+// it. A thread in state R does not say whether it is getting anywhere; this
+// does. Tens of thousands a second beside a stalled interface is a spin;
+// standing still is a call that never came back.
+unsigned audio_loop_turns(void);
+
 // Gapless: the PCM stays open between one track and the next, so there is no
 // instant in which the card has nothing to play.
 //
@@ -137,9 +147,9 @@ bool audio_stream_is_lossy(void);
 // container's, that is, the extension.
 void audio_get_stream_codec(char *out, size_t size);
 
-// 64/128/256 while a DSD track is playing, 0 otherwise. *dop says whether it
-// is going to the DAC untouched or being converted here.
-int audio_get_dsd_multiple(bool *dop);
+// 64/128/256 while a DSD track is playing, 0 otherwise. It is always going to
+// the DAC untouched over DoP; see dsd.h.
+int audio_get_dsd_multiple(void);
 
 void audio_seek(double seconds);
 

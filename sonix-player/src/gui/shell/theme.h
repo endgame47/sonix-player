@@ -59,6 +59,11 @@ void theme_apply_slider_knob(lv_obj_t *slider);
 // Builds the shared styles. Call once, before any screen is created.
 void theme_init(void);
 
+// Call with the page about to be put on screen. A theme, accent or tint change
+// walks only the page the user is looking at; this is what walks a page that
+// was hidden when the palette moved, and does nothing when it was not.
+void theme_notify_screen_shown(lv_obj_t *screen);
+
 const theme_palette_t *theme(void);
 bool theme_is_dark(void);
 

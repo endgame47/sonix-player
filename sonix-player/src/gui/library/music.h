@@ -12,4 +12,9 @@ extern lv_obj_t *music_screen;
 
 void music_init(gui_config_t *cfg);
 
+// Puts Browse and Playlists where the "playlists first" option says they go:
+// the sixth tile and the second corner button swap picture, caption and
+// destination. Called at startup and whenever the option changes.
+void music_refresh_layout(void);
+
 #endif /* MUSIC_H */

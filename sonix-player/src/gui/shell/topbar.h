@@ -42,10 +42,12 @@ void topbar_bring_to_front(void);
 // it is what says how much is left at a glance.
 void topbar_set_battery_percent(bool shown);
 
-// Where the clock sits in the bar (config "screen"/"clock_pos").
+// Where the clock sits in the bar, or that it is not shown at all (config
+// "screen"/"clock_pos").
 #define TOPBAR_CLOCK_LEFT 0
 #define TOPBAR_CLOCK_CENTER 1
 #define TOPBAR_CLOCK_RIGHT 2
+#define TOPBAR_CLOCK_HIDDEN 3
 void topbar_set_clock_position(int pos);
 
 #endif // TOPBAR_H

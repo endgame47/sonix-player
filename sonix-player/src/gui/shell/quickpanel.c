@@ -149,6 +149,17 @@ static int panel_h;
 // Interactive drag state: where the sheet was when the finger went down.
 static bool drag_active;
 static int drag_from_y;
+static uint32_t drag_begin_ms;
+
+// A gesture this fast decides by its direction rather than by how far it got.
+//
+// A flick is short: the finger goes down, snaps a hundred pixels and is gone,
+// and that never reaches the quarter of a screen a deliberate drag is measured
+// against -- so the sheet followed the finger and then snapped back, which from
+// the outside is a control centre that ignores a quick swipe. The floor keeps
+// the wobble of a tap out of it.
+#define FLICK_MIN_PX 40
+#define FLICK_SPEED_PX_S 500
 
 // The now-playing card's widgets.
 static lv_obj_t *np_title;
@@ -475,7 +486,11 @@ static void panel_prepare(void) {
 // stay in front, so the control centre would show transport buttons for a
 // transport that is not running. It refuses to open instead.
 bool quickpanel_blocked(void) {
-	return usbdac_is_active() || wifitransfer_running() || btreceiver_is_active();
+	// The transfer answers with the switch rather than with the server: killing
+	// thttpd takes a moment and the answer about the process is cached on top of
+	// that, so asking the process left the control centre refusing to open for
+	// seconds after the page said the transfer was off.
+	return usbdac_is_active() || wifitransfer_get_enabled() || btreceiver_is_active();
 }
 
 void quickpanel_open(void) {
@@ -509,6 +524,7 @@ void quickpanel_drag_begin(void) {
 	lv_anim_delete(panel, anim_y_cb);
 	drag_active = true;
 	drag_from_y = panel_open ? 0 : -panel_h;
+	drag_begin_ms = lv_tick_get();
 
 	if (!panel_open) {
 		panel_prepare();
@@ -542,6 +558,14 @@ void quickpanel_drag_end(void) {
 	int y = lv_obj_get_y(panel);
 	int travel = y - drag_from_y;
 	bool open = drag_from_y == 0 ? travel > -panel_h / 4 : travel > panel_h / 4;
+
+	// Unless it was a flick, which is over long before it has covered that much.
+	// Then only the direction counts.
+	uint32_t elapsed = lv_tick_elaps(drag_begin_ms);
+	int distance = travel > 0 ? travel : -travel;
+	if (elapsed > 0 && distance >= FLICK_MIN_PX && (distance * 1000) / (int)elapsed >= FLICK_SPEED_PX_S) {
+		open = travel > 0;
+	}
 
 	panel_open = open;
 	if (open) {

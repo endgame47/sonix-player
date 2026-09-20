@@ -31,9 +31,11 @@ static const char *const WELCOME_WORDS[] = {
 	"Willkommen", // German
 	"Bienvenue",  // French
 	"Bienvenido", // Spanish
-	// The default face draws Cyrillic, as the whole interface does in Russian,
-	// so this needs no font of its own.
+	// The default face draws Cyrillic and the CJK block, as the whole interface
+	// does in Russian and in Chinese, so neither of these needs a font of its
+	// own.
 	"Добро пожаловать",
+	"欢迎",
 };
 
 #define WELCOME_COUNT ((int)(sizeof(WELCOME_WORDS) / sizeof(WELCOME_WORDS[0])))

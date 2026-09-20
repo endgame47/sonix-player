@@ -1312,8 +1312,9 @@ static bool resolve_playlist(char *url, size_t url_size, char *why, size_t why_s
 // in it" check below never fires.
 #define RADIO_SILENCE_TIMEOUT 12
 
-// How much undecoded MP3 to hold. Two frames' worth would do; this leaves room
-// for a station that sends in bursts.
+// The decoder's window on the stream, taken from the network buffer above a
+// piece at a time. Two frames' worth would do; this is what one turn round the
+// loop works through.
 #define RADIO_IN_BUFFER 32768
 
 // The decoder's working set, shared by the two ways a station can arrive.
@@ -1368,6 +1369,261 @@ static void now_touch(void) { now_serial++; }
 // reading a shared flag: it is true only while this thread is still the one
 // the rest of the program thinks is playing.
 static bool still_mine(unsigned mine) { return play_generation == mine; }
+
+// ---------------------------------------------------------------------------
+// The network buffer
+//
+// A station sends at the speed its music plays, so nothing is ever spare: a
+// pause in the delivery is a pause at the sound card. This holds seconds of the
+// undecoded stream between the two.
+//
+// The thread is what makes it a buffer rather than a bigger array. The decode
+// loop is paced by a blocking write to the card, so a read on that thread
+// happens only between two writes and stops everything for as long as the
+// network takes to answer. A thread with nothing else to do keeps pulling while
+// the frames already decoded are still playing.
+//
+// What is being avoided is not a click: the card is opened with a start
+// threshold of a full buffer (see open_pcm_device), so a stream that starves
+// goes quiet for the whole 750 ms before the next sample is heard.
+// ---------------------------------------------------------------------------
+
+// Six seconds at 320 kbps, sixteen at the 128 kbps most stations send.
+#define RADIO_BUFFER_BYTES (256 * 1024)
+
+// What is gathered before the first frame is decoded, and how long the filling
+// thread is given to gather it. Six seconds of a 128 kbps station, three of a
+// 256 kbps one.
+//
+// This is the reserve the station then plays from for as long as it is on: a
+// server sends at the speed its music plays, so what is not taken in front of
+// the first frame is never offered again. Most open with a burst of several
+// seconds and reach the target at once; one that sends strictly in real time
+// hands over what it can in the time allowed, and the wait is the price of the
+// station not breaking up afterwards.
+#define RADIO_PREFILL_BYTES (96 * 1024)
+#define RADIO_PREFILL_MS 3000
+
+// A station announces a song ahead of the audio it belongs to, by however much
+// of the stream is being held here. Each announcement is kept with the position
+// it arrived at and goes on screen when the decoder reaches it.
+#define RADIO_TITLE_MARKS 4
+
+typedef struct {
+	long long at; // bytes taken by the decoder when this becomes the current one
+	char title[256];
+} radio_title_mark_t;
+
+typedef struct {
+	unsigned char data[RADIO_BUFFER_BYTES];
+	int head;  // where the decoder reads
+	int level; // bytes held
+
+	// Positions in the stream as a whole, which is what the titles are placed
+	// against. They do not wrap, and that is why they are counted apart from
+	// `head`.
+	long long written;
+	long long taken;
+
+	bool ended; // the source has nothing more to give
+	bool stop;  // the decode loop is finished with it
+
+	// Exactly one of the two: a plain connection, or a list of segments.
+	http_stream_t *stream;
+	hls_t *hls;
+
+	radio_title_mark_t marks[RADIO_TITLE_MARKS];
+	int mark_count;
+
+	pthread_mutex_t lock;
+	pthread_cond_t filled;
+	pthread_cond_t drained;
+	pthread_t thread;
+	bool thread_valid;
+} radio_buffer_t;
+
+// One station plays at a time and both transports run on the same thread, so
+// one of these does for both. Static for the same reason as the decoder's
+// buffers below: a quarter of a megabyte does not go on a stack.
+static radio_buffer_t radio_buffer = {
+	.lock = PTHREAD_MUTEX_INITIALIZER,
+	.filled = PTHREAD_COND_INITIALIZER,
+	.drained = PTHREAD_COND_INITIALIZER,
+};
+
+// Under the lock. Places what the station has just announced at the position
+// the bytes carrying it arrived at.
+static void radio_buffer_note_title(radio_buffer_t *b) {
+	if (!b->stream || !b->stream->title_changed) {
+		return;
+	}
+	b->stream->title_changed = false;
+
+	// A full queue means announcements are arriving faster than they are being
+	// reached, and the newest is the one that will still be right.
+	int slot = b->mark_count < RADIO_TITLE_MARKS ? b->mark_count++ : RADIO_TITLE_MARKS - 1;
+	b->marks[slot].at = b->written;
+	snprintf(b->marks[slot].title, sizeof(b->marks[slot].title), "%s", b->stream->stream_title);
+}
+
+static void *radio_buffer_main(void *arg) {
+	radio_buffer_t *b = (radio_buffer_t *)arg;
+
+	for (;;) {
+		pthread_mutex_lock(&b->lock);
+		while (!b->stop && b->level >= RADIO_BUFFER_BYTES) {
+			pthread_cond_wait(&b->drained, &b->lock);
+		}
+		bool stop = b->stop;
+		int tail = (b->head + b->level) % RADIO_BUFFER_BYTES;
+		int room = RADIO_BUFFER_BYTES - b->level;
+		pthread_mutex_unlock(&b->lock);
+
+		if (stop) {
+			break;
+		}
+
+		// Filled up to the end of the array and no further; the wrap is the
+		// next turn's business. The read is outside the lock, and can be: this
+		// is the only thread that writes, and it writes into space the decoder
+		// has already passed.
+		int to_end = RADIO_BUFFER_BYTES - tail;
+		int want = room < to_end ? room : to_end;
+		int got = b->stream ? http_stream_read(b->stream, b->data + tail, want)
+							: hls_read(b->hls, b->data + tail, want);
+
+		pthread_mutex_lock(&b->lock);
+		if (got > 0) {
+			b->level += got;
+			b->written += got;
+			radio_buffer_note_title(b);
+			pthread_cond_signal(&b->filled);
+			pthread_mutex_unlock(&b->lock);
+			continue;
+		}
+		b->ended = true;
+		pthread_cond_broadcast(&b->filled);
+		pthread_mutex_unlock(&b->lock);
+		break;
+	}
+	return NULL;
+}
+
+// Starts filling from a source that is already open. False when the thread
+// cannot be created, which leaves the caller with nothing to read from.
+static bool radio_buffer_start(radio_buffer_t *b, http_stream_t *stream, hls_t *hls) {
+	pthread_mutex_lock(&b->lock);
+	b->head = 0;
+	b->level = 0;
+	b->written = 0;
+	b->taken = 0;
+	b->ended = false;
+	b->stop = false;
+	b->stream = stream;
+	b->hls = hls;
+	b->mark_count = 0;
+	pthread_mutex_unlock(&b->lock);
+
+	if (pthread_create(&b->thread, NULL, radio_buffer_main, b) != 0) {
+		fprintf(stderr, "radio: no thread for the buffer\n");
+		b->stream = NULL;
+		b->hls = NULL;
+		return false;
+	}
+	b->thread_valid = true;
+	return true;
+}
+
+// Brings the filling thread down and waits for it to be gone, which is what
+// makes it safe to close the source afterwards. The nudge comes first: the
+// thread is normally sitting in a read, and a station that has gone quiet would
+// otherwise hold it for the whole receive timeout.
+static void radio_buffer_stop(radio_buffer_t *b) {
+	if (!b->thread_valid) {
+		return;
+	}
+
+	pthread_mutex_lock(&b->lock);
+	b->stop = true;
+	pthread_cond_broadcast(&b->filled);
+	pthread_cond_broadcast(&b->drained);
+	pthread_mutex_unlock(&b->lock);
+
+	if (b->stream) {
+		http_stream_wake(b->stream);
+	} else if (b->hls) {
+		hls_abort(b->hls);
+	}
+
+	pthread_join(b->thread, NULL);
+	b->thread_valid = false;
+	b->stream = NULL;
+	b->hls = NULL;
+}
+
+// Hands the decoder what has been gathered, and takes the place of reading the
+// source directly. It blocks only when there is nothing at all, which is the
+// one case where there would have been nothing to play from either. Returns 0
+// when the source has ended and the last byte has been taken.
+static int radio_buffer_read(radio_buffer_t *b, unsigned char *dst, int max) {
+	pthread_mutex_lock(&b->lock);
+	while (b->level == 0 && !b->ended && !b->stop) {
+		pthread_cond_wait(&b->filled, &b->lock);
+	}
+
+	int n = b->level < max ? b->level : max;
+	if (n > 0) {
+		int to_end = RADIO_BUFFER_BYTES - b->head;
+		int first = n < to_end ? n : to_end;
+		memcpy(dst, b->data + b->head, (size_t)first);
+		if (n > first) {
+			memcpy(dst + first, b->data, (size_t)(n - first));
+		}
+		b->head = (b->head + n) % RADIO_BUFFER_BYTES;
+		b->level -= n;
+		b->taken += n;
+		pthread_cond_signal(&b->drained);
+	}
+	pthread_mutex_unlock(&b->lock);
+	return n;
+}
+
+// The announcement the decoder has now reached, if it has reached one.
+static bool radio_buffer_take_title(radio_buffer_t *b, char *out, size_t size) {
+	bool got = false;
+
+	pthread_mutex_lock(&b->lock);
+	if (b->mark_count > 0 && b->taken >= b->marks[0].at) {
+		snprintf(out, size, "%s", b->marks[0].title);
+		b->mark_count--;
+		memmove(b->marks, b->marks + 1, (size_t)b->mark_count * sizeof(b->marks[0]));
+		got = true;
+	}
+	pthread_mutex_unlock(&b->lock);
+	return got;
+}
+
+// Waits for the buffer to fill before the first frame is decoded: this is the
+// reserve the station plays from for as long as it is on.
+static void radio_buffer_prefill(radio_buffer_t *b, unsigned mine) {
+	int waited = 0;
+	int level = 0;
+
+	for (;;) {
+		pthread_mutex_lock(&b->lock);
+		level = b->level;
+		bool ended = b->ended;
+		pthread_mutex_unlock(&b->lock);
+
+		if (ended || level >= RADIO_PREFILL_BYTES || waited >= RADIO_PREFILL_MS || !still_mine(mine)) {
+			break;
+		}
+		usleep(50 * 1000);
+		waited += 50;
+	}
+
+	printf("radio: %d KB buffered before the first frame\n", level / 1024);
+}
 
 // Pulls the station's icon down so the player has something to show. Best
 // effort in every sense: no icon, an icon that is not an image, a server that
@@ -1454,9 +1710,9 @@ typedef struct {
 // `frames` is sample frames, one per channel -- what both decoders return and
 // what audio_external_write() takes -- not total samples.
 //
-// The write is blocking, and that is the point: it is what paces the whole loop
-// to real time. Without it the reader would pull the stream as fast as the
-// network allows and the buffer would never drain.
+// The write is blocking, and that is the point: it is what paces the decode
+// loop to real time. The stream is pulled in ahead of it by the filling thread,
+// which is why a pause on the network no longer stops the loop here.
 static bool radio_push_pcm(radio_out_t *out, short *pcm, short *stereo, int frames, int rate, int channels,
 						   int bitrate_kbps, const char *codec_name) {
 	if (frames <= 0 || rate <= 0 || channels <= 0) {
@@ -1707,9 +1963,14 @@ static bool play_hls(const char *url, unsigned mine) {
 		}
 	}
 
+	if (!radio_buffer_start(&radio_buffer, NULL, h)) {
+		goto done_hls;
+	}
+	radio_buffer_prefill(&radio_buffer, mine);
+
 	while (still_mine(mine)) {
 		if (have < RADIO_IN_BUFFER) {
-			int got = hls_read(h, input + have, RADIO_IN_BUFFER - have);
+			int got = radio_buffer_read(&radio_buffer, input + have, RADIO_IN_BUFFER - have);
 			if (got <= 0) {
 				break; // ended, or aborted
 			}
@@ -1789,6 +2050,8 @@ done_hls:
 	pthread_mutex_lock(&stream_lock);
 	live_hls = NULL;
 	pthread_mutex_unlock(&stream_lock);
+
+	radio_buffer_stop(&radio_buffer); // before the source it is reading closes
 
 	if (out.open) {
 		audio_external_end();
@@ -1913,6 +2176,11 @@ static bool play_one_connection(const char *url, unsigned mine, char *redirect, 
 	bool codec_settled = false;
 	aacdec_t *aac = NULL;
 
+	if (!radio_buffer_start(&radio_buffer, &stream, NULL)) {
+		goto done;
+	}
+	radio_buffer_prefill(&radio_buffer, mine);
+
 	while (still_mine(mine)) {
 		// Connected, receiving, and nothing has come out of the decoder for
 		// RADIO_SILENCE_TIMEOUT seconds. Stop and say so rather than reconnect,
@@ -1938,7 +2206,7 @@ static bool play_one_connection(const char *url, unsigned mine, char *redirect, 
 		}
 
 		if (!ended && have < RADIO_IN_BUFFER) {
-			int got = http_stream_read(&stream, input + have, RADIO_IN_BUFFER - have);
+			int got = radio_buffer_read(&radio_buffer, input + have, RADIO_IN_BUFFER - have);
 			if (got <= 0) {
 				ended = true; // the station closed, or went quiet past the timeout
 			} else {
@@ -1946,10 +2214,10 @@ static bool play_one_connection(const char *url, unsigned mine, char *redirect, 
 			}
 		}
 
-		if (stream.title_changed) {
-			stream.title_changed = false;
+		char announced[sizeof(stream.stream_title)];
+		if (radio_buffer_take_title(&radio_buffer, announced, sizeof(announced))) {
 			pthread_mutex_lock(&now_lock);
-			snprintf(now_state.title, sizeof(now_state.title), "%s", stream.stream_title);
+			snprintf(now_state.title, sizeof(now_state.title), "%s", announced);
 			now_touch();
 			pthread_mutex_unlock(&now_lock);
 		}
@@ -2085,6 +2353,8 @@ done:
 		live_stream = NULL;
 	}
 	pthread_mutex_unlock(&stream_lock);
+
+	radio_buffer_stop(&radio_buffer); // before the source it is reading closes
 
 	if (out.open) {
 		audio_external_end();

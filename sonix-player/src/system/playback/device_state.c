@@ -420,9 +420,35 @@ void device_state_add_prepare_cb(device_state_prepare_cb cb) {
 // Defined with the rest of the scrub state further down.
 static void scrub_cancel(void);
 
+// Where playback was when the storage under it went away: the card pulled out,
+// or the card exported to a computer. Both stop the engine, and from the
+// outside a stop is a stop -- pressing play afterwards started the track again
+// from zero, whatever it had been paused at. See device_state_note_storage_gone().
+static char interrupted_file[512];
+static double interrupted_pos = -1.0;
+
+void device_state_note_storage_gone(void) {
+	interrupted_file[0] = '\0';
+	interrupted_pos = -1.0;
+
+	device_state_t state;
+	device_state_get(&state);
+	// A second in is not a position worth coming back to, and a live stream has
+	// none at all.
+	if (state.live || !state.current_file[0] || state.progress_current_secs <= 1.0) {
+		return;
+	}
+
+	snprintf(interrupted_file, sizeof(interrupted_file), "%s", state.current_file);
+	interrupted_pos = state.progress_current_secs;
+}
+
 // Loads metadata for `filepath` and starts playback, without touching the
 // folder queue. Shared by fresh selections, queue advances, and replays.
-static void load_and_play(const char *filepath) {
+//
+// `position` is where to start; below zero means the beginning, which is what
+// every caller but the resume below wants.
+static void load_and_play_at(const char *filepath, double position) {
 	// A position picked on the outgoing track means nothing on this one, and
 	// the track can change under a held button -- the queue advances on its
 	// own when the outgoing one ends.
@@ -464,10 +490,21 @@ static void load_and_play(const char *filepath) {
 		}
 	}
 
-	audio_play(current_metadata_file);
+	if (position > 0) {
+		audio_play_at(current_metadata_file, position);
+	} else {
+		audio_play(current_metadata_file);
+	}
+
+	// Any track load supersedes the note: it belongs to the one press that
+	// follows the storage coming back.
+	interrupted_file[0] = '\0';
+	interrupted_pos = -1.0;
 
 	queue_persist();
 }
+
+static void load_and_play(const char *filepath) { load_and_play_at(filepath, -1.0); }
 
 // The boot-time "remember track" restore: the same folder queue and metadata a
 // tap on the file would build, but the track comes up paused at `position`
@@ -1147,9 +1184,16 @@ audio_status_t device_state_toggle_play_pause(void) {
 	case AUDIO_STATUS_STOPPED:
 	default:
 		// Playback ended (or was stopped): restart the currently-loaded track
-		// from the beginning so pressing play always plays the shown song.
+		// from the beginning so pressing play always plays the shown song --
+		// unless the engine was stopped by the storage going away rather than
+		// by the track ending, in which case play means carry on from where the
+		// card was pulled.
 		if (current_metadata_file[0]) {
-			load_and_play(current_metadata_file);
+			double resume = -1.0;
+			if (interrupted_pos > 0 && strcmp(interrupted_file, current_metadata_file) == 0) {
+				resume = interrupted_pos;
+			}
+			load_and_play_at(current_metadata_file, resume);
 			return AUDIO_STATUS_PLAYING;
 		}
 		return AUDIO_STATUS_STOPPED;

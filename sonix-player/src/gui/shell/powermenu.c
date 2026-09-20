@@ -129,6 +129,11 @@ static void do_power_off(void) {
 	// frozen on-screen until init gets around to cutting power.
 	power_screen_off();
 
+	// The charger back on before the power goes: the driver keeps that bit
+	// across a shutdown, and a device put away at its charge limit would meet
+	// the next cable with a charger that does nothing.
+	power_charging_release();
+
 	sync();
 
 	int rc = system("poweroff");

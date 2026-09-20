@@ -105,6 +105,14 @@ void cover_free(cover_image_t *img);
 // Takes effect the next time a backdrop is built.
 void cover_set_backdrop_light(bool light);
 
+// Whether the blurred backdrop is built the right way up.
+//
+// Behind the controls it is turned over: it stands below the sleeve and reads
+// as its reflection. Filling the screen with the sleeve shown on top of it, it
+// has to face the same way the sleeve does. Takes effect the next time a
+// backdrop is built; the screensaver's bottom band is never flipped either way.
+void cover_set_backdrop_upright(bool upright);
+
 // ---------------------------------------------------------------------------
 // Browser thumbnails
 //

@@ -35,11 +35,17 @@ static bool chevron_over_cover;
 static int8_t back_btn_padding;
 static int8_t back_btn_top_bar_height;
 
+// On the player the status bar is hidden, so there is no row of its own for the
+// chevron to line up with and it would sit against the top edge. This is the
+// air it keeps instead, and what the player's own header row is aligned to.
+#define BACK_BTN_PLAYER_TOP 14
+
 static void place_back_btn(bool below_top_bar) {
 	// Same offsets as the corner buttons on the right (playlists, settings,
 	// options): the whole header row of round buttons sits on one line. On
-	// the player (below_top_bar false) the chevron moves up to the top edge.
-	int y = back_btn_padding + (below_top_bar ? back_btn_top_bar_height : 0);
+	// the player (below_top_bar false) the status bar is not there to sit
+	// under, so the chevron takes the offset above.
+	int y = back_btn_padding + (below_top_bar ? back_btn_top_bar_height : BACK_BTN_PLAYER_TOP);
 	lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, back_btn_padding, y);
 }
 
@@ -141,6 +147,13 @@ static void back_btn_set_drag_offset(int32_t x) {
 // sheet while it is dragged or animated in and out.
 void back_btn_translate(int32_t x) { back_btn_set_drag_offset(x); }
 
+int back_btn_centre_y(void) {
+	if (!back_btn) {
+		return back_btn_padding + BACK_BTN_PLAYER_TOP;
+	}
+	return back_btn_padding + BACK_BTN_PLAYER_TOP + lv_obj_get_height(back_btn) / 2;
+}
+
 static void back_underlay_destroy(void) {
 	if (back_underlay) {
 		lv_obj_delete(back_underlay);
@@ -217,9 +230,9 @@ static void back_underlay_build(void) {
 	if (target != main_menu_screen) {
 		lv_obj_t *chevron = lv_image_create(back_underlay);
 		lv_image_set_src(chevron, &icon_chevron_left);
-		// On the player it sits up at the top edge (no title row); on normal
-		// pages it is centred on the heading below the status bar.
-		int y = back_btn_padding + (going_to_player ? 0 : back_btn_top_bar_height);
+		// The same two placements as place_back_btn(): the player's own offset
+		// where there is no status bar, the status bar's height everywhere else.
+		int y = back_btn_padding + (going_to_player ? BACK_BTN_PLAYER_TOP : back_btn_top_bar_height);
 		lv_obj_set_pos(chevron, back_btn_padding + 10, y + 10);
 		if (going_to_player && chevron_over_cover) {
 			lv_obj_set_style_image_recolor(chevron, lv_color_white(), 0);
@@ -264,7 +277,20 @@ static void back_anim_cancel_done_cb(lv_anim_t *a) {
 	back_btn_sync_visibility();
 }
 
+static bool back_gesture_off;
+
+void back_gesture_blocked(bool blocked) {
+	back_gesture_off = blocked;
+	if (blocked) {
+		back_dragging = false;
+	}
+}
+
 static void back_drag_cb(lv_event_t *e) {
+	if (back_gesture_off) {
+		return;
+	}
+
 	lv_event_code_t code = lv_event_get_code(e);
 
 	lv_indev_t *indev = lv_indev_active();
@@ -441,6 +467,11 @@ static void load_screen(lv_obj_t *target_screen) {
 	if (target_screen == libraryscan_screen) {
 		libraryscan_begin();
 	}
+
+	// A page hidden through a theme, accent or tint change carries the palette
+	// it was last walked for; this is where it catches up, one page at a time
+	// instead of all of them at the moment of the change.
+	theme_notify_screen_shown(target_screen);
 
 	lv_screen_load(target_screen);
 }

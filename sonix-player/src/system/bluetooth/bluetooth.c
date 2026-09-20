@@ -113,9 +113,13 @@ typedef enum {
 	JOB_CODECS,		  // re-read what the connected sink offers
 	JOB_LDAC_QUALITY, // restart bluealsa so it reads the new --ldac-quality
 	JOB_DISCOVERABLE, // arg_int: 1 visible to everyone, 0 not
+	// The name the adapter answers with. Carried in g_local_name rather than in
+	// the job: a name is longer than `text` holds.
+	JOB_SET_NAME,
 	JOB_SET_CODEC, // text: the codec to switch to
 	JOB_VOLUME,	   // arg_int: percent, for AVRCP absolute volume
 	JOB_RX_INFO,   // re-read what a device streaming to this one is sending
+	JOB_RX_CODEC,  // text: the codec to move the incoming stream onto
 	JOB_MEDIA,	   // text: an AVRCP member to send to that device
 } job_type_t;
 
@@ -1168,6 +1172,16 @@ static bool ensure_bluealsa(void) {
 }
 
 static void read_local_name(void) {
+	// What the user chose wins over the firmware's file, which is on a
+	// read-only filesystem and is the factory name.
+	const char *chosen = config_get("wireless", "bt_name", "");
+	if (chosen && chosen[0]) {
+		pthread_mutex_lock(&lock);
+		snprintf(g_local_name, sizeof(g_local_name), "%s", chosen);
+		pthread_mutex_unlock(&lock);
+		return;
+	}
+
 	char buf[BT_NAME_MAX];
 	if (!slurp(BT_NAME_FILE, buf, sizeof(buf))) {
 		return;
@@ -2021,6 +2035,20 @@ static void do_power(bool on, bool deliberate) {
 		pthread_mutex_unlock(&lock);
 
 		refresh_devices();
+
+		// The radio is up and the list on screen is real, so the page stops
+		// saying "turning on" here rather than at the end.
+		//
+		// What follows is going back to the last device, which is a different
+		// thing with its own feedback on the row it concerns: a grace period
+		// for headphones that reconnect by themselves, then up to three
+		// attempts. Ten seconds on a bad day, and a device list sitting under a
+		// "turning on" line for all of it reads as a radio that never finished
+		// starting.
+		pthread_mutex_lock(&lock);
+		g_busy = false;
+		pthread_mutex_unlock(&lock);
+
 		reconnect_last();
 		return;
 	}
@@ -2236,16 +2264,59 @@ bool bluetooth_receiver_device(char *mac_out, int mac_size, char *name_out, int 
 	return true;
 }
 
+// Renegotiating on the sink side tears the incoming stream down and builds it
+// again, exactly as it does for headphones, so the page is told to read the new
+// state once bluealsa has settled.
+static void do_read_receiver(void);
+
+static void do_set_receiver_codec(const char *codec) {
+	char mac[BT_MAC_MAX];
+	if (!codec || !codec[0] || !btstack_audio_source(mac, sizeof(mac))) {
+		set_op(BT_OP_FAILED, NULL);
+		return;
+	}
+
+	// The level the sending device had set, carried over by hand: the PCM the
+	// renegotiation builds is a new object at bluealsa's default volume, and the
+	// phone does not send its level again, so without this its volume keys stop
+	// reaching the player after a codec change.
+	int volume = -1;
+	if (!btstack_pcm_volume_get(mac, true, &volume)) {
+		volume = -1;
+	}
+
+	bool done = btstack_select_codec_dir(mac, true, codec);
+	sleep_ms(600);
+
+	if (done && volume >= 0) {
+		// The PCM comes back a moment after the transport does, so one retry
+		// covers the case where it is not there yet on the first try.
+		if (!btstack_pcm_volume_set(mac, true, volume)) {
+			sleep_ms(400);
+			btstack_pcm_volume_set(mac, true, volume);
+		}
+	}
+
+	do_read_receiver();
+	set_op(done ? BT_OP_OK : BT_OP_FAILED, codec);
+}
+
 static void do_read_receiver(void) {
 	char mac[BT_MAC_MAX];
 	btstack_stream_t info;
-	bool have = btstack_audio_source(mac, sizeof(mac)) && btstack_stream_info(mac, true, &info);
+	bool sending = btstack_audio_source(mac, sizeof(mac));
+	bool have = sending && btstack_stream_info(mac, true, &info);
 
 	// What the sender is doing, read outright: bluez announces every later
 	// change, but nothing has been announced yet at the moment the link comes
 	// up, and that is exactly when the first key can arrive.
-	if (have) {
+	//
+	// Asked of the device rather than of the stream: a transport that is
+	// momentarily unreadable is not a device that stopped playing.
+	if (sending) {
 		btstack_refresh_media_status(mac);
+	} else {
+		btstack_forget_media();
 	}
 
 	pthread_mutex_lock(&lock);
@@ -2296,11 +2367,54 @@ bool bluetooth_receiver_stream(bt_stream_t *out) {
 	return out->codec[0] != '\0';
 }
 
+// What the phone offered on the link that is up, and which of them it is using.
+// Unlike the headphone direction this is read on the spot rather than cached:
+// the list is only ever wanted while the receiver page is open, and a poll for
+// it would be a D-Bus round trip every half second for nothing.
+int bluetooth_receiver_codecs(char out[][BT_CODEC_MAX], int max, char *selected, int selected_size) {
+	if (selected && selected_size) {
+		selected[0] = '\0';
+	}
+	if (!out || max <= 0) {
+		return 0;
+	}
+
+	char mac[BT_MAC_MAX];
+	if (!btstack_audio_source(mac, sizeof(mac))) {
+		return 0;
+	}
+	return btstack_codecs_dir(mac, true, out, max, selected, selected_size ? (size_t)selected_size : 0);
+}
+
+bool bluetooth_receiver_track(bt_track_t *out) {
+	if (!out) {
+		return false;
+	}
+	btstack_track_t track;
+	bool have = btstack_media_track(&track);
+	snprintf(out->title, sizeof(out->title), "%s", track.title);
+	snprintf(out->artist, sizeof(out->artist), "%s", track.artist);
+	snprintf(out->album, sizeof(out->album), "%s", track.album);
+	out->duration_ms = track.duration_ms;
+	return have;
+}
+
+void bluetooth_receiver_set_codec(const char *codec) {
+	if (!codec || !codec[0]) {
+		return;
+	}
+	job_t job = {.type = JOB_RX_CODEC};
+	snprintf(job.text, sizeof(job.text), "%s", codec);
+	post_job(&job);
+}
+
 unsigned bluetooth_receiver_stream_serial(void) {
 	pthread_mutex_lock(&lock);
 	unsigned now = g_rx_serial;
 	pthread_mutex_unlock(&lock);
-	return now;
+	// The metadata moves on its own, announced by the sender rather than
+	// noticed here, so it carries its own counter into this one.
+	return now + btstack_media_serial();
 }
 
 void bluetooth_refresh_receiver(void) {
@@ -2558,6 +2672,15 @@ static void *bluetooth_worker(void *arg) {
 				btstack_set_discoverable(job.arg_int != 0);
 				break;
 
+			case JOB_SET_NAME: {
+				pthread_mutex_lock(&lock);
+				char alias[BT_NAME_MAX];
+				snprintf(alias, sizeof(alias), "%s", g_local_name);
+				pthread_mutex_unlock(&lock);
+				btstack_set_alias(alias);
+				break;
+			}
+
 			case JOB_SET_CODEC:
 				do_set_codec(job.text);
 				break;
@@ -2578,6 +2701,10 @@ static void *bluetooth_worker(void *arg) {
 
 			case JOB_RX_INFO:
 				do_read_receiver();
+				break;
+
+			case JOB_RX_CODEC:
+				do_set_receiver_codec(job.text);
 				break;
 
 			case JOB_MEDIA:
@@ -2623,6 +2750,11 @@ void bluetooth_init(void) {
 
 	g_enabled = config_get_int("wireless", "bluetooth", 0) != 0;
 	g_volume_sync = config_get_int("wireless", "bt_volume_sync", 1) != 0;
+
+	// Before anything asks for it. Bring-up reads it too, but the settings page
+	// shows the name with the radio off, and until this the answer was the
+	// built-in fallback rather than what the firmware's file says.
+	read_local_name();
 
 	btvolume_init();
 	btvolume_set_sync(g_volume_sync);
@@ -2730,6 +2862,42 @@ bt_state_t bluetooth_get_state(void) {
 }
 
 const char *bluetooth_local_name(void) { return g_local_name; }
+
+bool bluetooth_set_local_name(const char *name) {
+	if (!name) {
+		return false;
+	}
+
+	char wanted[BT_NAME_MAX];
+	snprintf(wanted, sizeof(wanted), "%s", name);
+
+	size_t length = strlen(wanted);
+	while (length > 0 && (wanted[length - 1] == ' ' || wanted[length - 1] == '\t')) {
+		wanted[--length] = '\0';
+	}
+	const char *start = wanted;
+	while (*start == ' ' || *start == '\t') {
+		start++;
+	}
+	if (!*start) {
+		return false;
+	}
+
+	pthread_mutex_lock(&lock);
+	snprintf(g_local_name, sizeof(g_local_name), "%s", start);
+	bool enabled = g_enabled;
+	pthread_mutex_unlock(&lock);
+
+	config_set("wireless", "bt_name", start);
+	config_save();
+
+	// A radio that is off has nothing to tell: bring-up reads the name itself.
+	if (enabled) {
+		job_t job = {.type = JOB_SET_NAME};
+		post_job(&job);
+	}
+	return true;
+}
 
 uint32_t bluetooth_devices_serial(void) {
 	pthread_mutex_lock(&lock);

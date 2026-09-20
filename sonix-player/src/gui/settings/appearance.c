@@ -17,7 +17,7 @@ lv_obj_t *appearance_screen;
 
 static lv_obj_t *btn_dark;
 static lv_obj_t *btn_light;
-static lv_obj_t *btn_clock[3]; // left / centre / right
+static lv_obj_t *btn_clock[4]; // left / centre / right / hidden
 static lv_obj_t *btn_accent[THEME_ACCENT_COUNT]; // the coloured circles
 static lv_obj_t *tint_toggle;
 static lv_obj_t *battery_percent_toggle;
@@ -88,10 +88,10 @@ static lv_obj_t *make_accent_circle(lv_obj_t *parent, int index) {
 	return btn;
 }
 
-// Paints the clock-position trio the same way: accent on the active one.
+// Paints the clock-position pills the same way: accent on the active one.
 static void refresh_clock_buttons(void) {
 	int active = (int)config_get_int("screen", "clock_pos", TOPBAR_CLOCK_CENTER);
-	for (int i = 0; i < 3; i++) {
+	for (int i = 0; i < 4; i++) {
 		if (!btn_clock[i]) {
 			continue;
 		}
@@ -116,9 +116,7 @@ static void clock_pos_cb(lv_event_t *e) {
 static lv_obj_t *make_clock_choice(lv_obj_t *parent, const char *text, int pos) {
 	lv_obj_t *btn = lv_btn_create(parent);
 	lv_obj_set_size(btn, LV_SIZE_CONTENT, 64);
-	// Tight enough that left+centre+right fit the card without the last pill
-	// running off its right edge.
-	lv_obj_set_style_pad_hor(btn, 16, 0);
+	lv_obj_set_style_pad_hor(btn, 14, 0);
 	lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0); // Adwaita pill button
 	lv_obj_set_style_shadow_width(btn, 0, 0);
 	lv_obj_set_style_border_width(btn, 0, 0);
@@ -217,12 +215,16 @@ void appearance_init(gui_config_t *cfg) {
 	lv_obj_set_style_pad_all(clock_row, 0, 0);
 	lv_obj_set_style_pad_gap(clock_row, 10, 0);
 	lv_obj_remove_flag(clock_row, LV_OBJ_FLAG_SCROLLABLE);
-	lv_obj_set_flex_flow(clock_row, LV_FLEX_FLOW_ROW);
-	lv_obj_set_flex_align(clock_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+	// Wrapped, not a single line: four pills of translated words do not fit
+	// across 480 pixels in every language, and one that does not fit is drawn
+	// off the card rather than shrunk.
+	lv_obj_set_flex_flow(clock_row, LV_FLEX_FLOW_ROW_WRAP);
+	lv_obj_set_flex_align(clock_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
 
 	btn_clock[TOPBAR_CLOCK_LEFT] = make_clock_choice(clock_row, "left", TOPBAR_CLOCK_LEFT);
 	btn_clock[TOPBAR_CLOCK_CENTER] = make_clock_choice(clock_row, "centre", TOPBAR_CLOCK_CENTER);
 	btn_clock[TOPBAR_CLOCK_RIGHT] = make_clock_choice(clock_row, "right", TOPBAR_CLOCK_RIGHT);
+	btn_clock[TOPBAR_CLOCK_HIDDEN] = make_clock_choice(clock_row, "hide", TOPBAR_CLOCK_HIDDEN);
 
 	// A third card: the accent colour, as a row of coloured circles.
 	lv_obj_t *accent_card = lv_obj_create(container);

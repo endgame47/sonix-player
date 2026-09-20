@@ -31,6 +31,11 @@ typedef struct {
 // the tiles themselves.
 // `clear_corner_buttons` starts the grid below the floating back button and
 // any icon in the opposite corner, so the cards never sit under them.
+// Repaints one tile in place: its picture and its caption. For the page whose
+// tiles are not fixed -- Music, where Browse and Playlists trade places -- so
+// the grid does not have to be built again to swap two of them.
+void gridpage_set_tile(lv_obj_t *grid, int index, const lv_image_dsc_t *icon, const char *label);
+
 lv_obj_t *gridpage_build(lv_obj_t *screen, gui_config_t *cfg, const grid_entry_t *entries, int count, int columns, int rows,
 					bool clear_corner_buttons);
 

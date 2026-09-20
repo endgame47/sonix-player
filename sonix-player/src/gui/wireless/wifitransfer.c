@@ -18,6 +18,7 @@
 #include "src/system/audio/audio.h"
 #include "src/system/core/lang.h"
 #include "src/system/net/wifi.h"
+#include "src/system/device/led.h"
 #include "src/system/net/wifitransfer.h"
 
 lv_obj_t *wifitransfer_screen;
@@ -247,6 +248,11 @@ static void set_transfer(bool on) {
 	wifitransfer_set_enabled(on);
 	watchdog_ticks = 0;
 
+	// The light follows the switch straight away. Left to the status bar's own
+	// poll it would be up to five seconds behind, which on a toggle reads as the
+	// toggle not having worked.
+	led_set_wifi_transfer(on);
+
 	// While the server is up the radio is carrying files, and every status poll
 	// is a fork of the whole player. The bars can lag.
 	wifi_set_status_poll_slow(on);
@@ -380,6 +386,7 @@ static void screen_unloaded_cb(lv_event_t *e) {
 	// something to leave behind by accident.
 	if (wifitransfer_get_enabled()) {
 		wifitransfer_set_enabled(false);
+		led_set_wifi_transfer(false);
 	}
 	wifi_set_status_poll_slow(false);
 }

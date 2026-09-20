@@ -1,125 +1,28 @@
 #include "dsd.h"
 
 #include <fcntl.h>
-#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
-// See dsd.h for the two routes out. This file does the container, the bit
-// order, and either the DoP packing or the filter.
+// See dsd.h for why DoP is the only route out. This file does the container,
+// the bit order and the packing.
 
 #define MAX_CHANNELS 2
 #define DSD64_RATE 2822400u
 
-// How much of the bitstream is pulled in at a time, per channel.
-#define READ_BYTES 16384
-
-// ---------------------------------------------------------------------------
-// The filter, for the conversion route
-// ---------------------------------------------------------------------------
+// How much of one channel's bitstream a read pulls in.
 //
-// Two stages, because one filter long enough to go from 2.8 MHz to 176.4 kHz
-// in a single step would be hundreds of taps and this is a 1 GHz MIPS.
-//
-//   1. eight-to-one, done a byte at a time through a lookup table -- the
-//      dsd2pcm trick: a byte of the stream is eight taps of the filter, so the
-//      256 possible bytes are pre-summed for each byte position and the inner
-//      loop becomes six table reads and five adds instead of forty-eight
-//      multiplies;
-//   2. two-to-one as many times as needed, with a short symmetric filter.
-//
-// DSD64 goes 2822400 -> 352800 -> 176400 (one halving), DSD128 takes two and
-// DSD256 three.
-
-#define STAGE1_BYTES 6 // 48 taps
-#define STAGE1_TAPS (STAGE1_BYTES * 8)
-#define HALF_TAPS 23
-#define MAX_HALVINGS 3
-
-static int32_t stage1_table[STAGE1_BYTES][256];
-static int32_t half_coef[HALF_TAPS];
-static bool tables_ready;
-
-// Half-band: sinc(n/2) windowed, so every even tap but the centre is zero and
-// the multiplies are half what the length suggests. It runs at the decimated
-// rate, which is why it can afford to be longer than the first stage.
-static void build_halfband(void) {
-	double taps[HALF_TAPS];
-	double sum = 0;
-	int mid = (HALF_TAPS - 1) / 2;
-	for (int i = 0; i < HALF_TAPS; i++) {
-		int n = i - mid;
-		double w = 0.42 - 0.5 * cos(2 * M_PI * i / (HALF_TAPS - 1)) + 0.08 * cos(4 * M_PI * i / (HALF_TAPS - 1));
-		if (n == 0) {
-			taps[i] = 1.0;
-		} else if (n % 2 == 0) {
-			taps[i] = 0.0; // the half-band's own zeros
-		} else {
-			taps[i] = sin(M_PI * n / 2.0) / (M_PI * n / 2.0) * w;
-		}
-		sum += taps[i];
-	}
-
-	int32_t total = 0;
-	for (int i = 0; i < HALF_TAPS; i++) {
-		half_coef[i] = (int32_t)lrint(taps[i] / sum * 32768.0);
-		total += half_coef[i];
-	}
-	// Forced to exactly unity at DC: rounding leaves the sum a few counts out,
-	// and DSD256 runs three of these in series, so a per-stage gain error
-	// compounds.
-	half_coef[mid] += 32768 - total;
-}
-
-// A windowed sinc with its corner at a sixteenth of the DSD rate, which is the
-// Nyquist of what comes out of this stage.
-static void build_tables(void) {
-	if (tables_ready) {
-		return;
-	}
-
-	build_halfband();
-
-	double taps[STAGE1_TAPS];
-	double sum = 0;
-	for (int i = 0; i < STAGE1_TAPS; i++) {
-		double x = i - (STAGE1_TAPS - 1) / 2.0;
-		double sinc = (fabs(x) < 1e-9) ? 1.0 : sin(M_PI * x / 8.0) / (M_PI * x / 8.0);
-		// Blackman window: simple, and its stopband is deep enough that the
-		// DSD hiss that survives is far below anything audible.
-		double w = 0.42 - 0.5 * cos(2 * M_PI * i / (STAGE1_TAPS - 1)) + 0.08 * cos(4 * M_PI * i / (STAGE1_TAPS - 1));
-		taps[i] = sinc * w;
-		sum += taps[i];
-	}
-	for (int i = 0; i < STAGE1_TAPS; i++) {
-		taps[i] /= sum; // unity at DC
-	}
-
-	// Each entry is the filter's answer to one byte in one position, with a
-	// bit worth +1 and a clear bit -1, in Q24.
-	for (int b = 0; b < STAGE1_BYTES; b++) {
-		for (int v = 0; v < 256; v++) {
-			double acc = 0;
-			for (int k = 0; k < 8; k++) {
-				double bit = (v & (0x80 >> k)) ? 1.0 : -1.0;
-				// Bit 7 is the earliest of the eight in time and bit 0 the
-				// latest, while hist[0] is the newest byte and hist[5] the
-				// oldest -- so the tap index runs backwards inside a byte
-				// and forwards between them. Reversing it reverses the
-				// filter in groups of eight, which is not a filter at all.
-				acc += bit * taps[b * 8 + (7 - k)];
-			}
-			stage1_table[b][v] = (int32_t)lrint(acc * 16777216.0);
-		}
-	}
-	tables_ready = true;
-}
+// At DSD256 the stream is 2.8 MB a second off the card, and a .dsf keeps each
+// channel's blocks separately: asking for one block at a time is two reads at
+// two places in the file for every four kilobytes, several hundred times a
+// second, which is the worst shape a card can be asked for. This much per
+// channel is one sequential read covering every channel's block at once.
+#define READ_BYTES 32768
 
 struct dsd_file {
 	int fd;
-	dsd_output_t mode;
 
 	int channels;
 	uint32_t rate;	 // the DSD rate
@@ -133,30 +36,13 @@ struct dsd_file {
 
 	uint64_t pos_bytes; // per channel, where the next read starts
 	int out_rate;
-	int halvings;
 	uint64_t total_out;
 
 	// The bitstream, de-interleaved into one buffer per channel.
 	unsigned char *chan[MAX_CHANNELS];
-	unsigned char *raw; // .dff only: the interleaved slab before splitting
+	unsigned char *raw; // the slab as it comes off the card, before splitting
 	int chan_len;
 	int chan_read;
-
-	// Filter state, per channel.
-	//
-	// Neither delay line is an array that gets shifted: at DSD256 the chain
-	// runs 2.8 million first-stage evaluations and 2.5 million half-band ones
-	// every second, and a memmove inside each of those dominates the cost on
-	// a 1 GHz MIPS. So:
-	//
-	//   * the first stage keeps its six bytes in one 64-bit word and shifts it,
-	//   * the half-band writes each sample twice into a buffer of twice the
-	//     length, so the taps it needs are always contiguous from `half_pos`
-	//     and nothing ever has to be moved.
-	uint64_t hist[MAX_CHANNELS];
-	int32_t half_hist[MAX_CHANNELS][MAX_HALVINGS][HALF_TAPS * 2];
-	int half_pos[MAX_CHANNELS][MAX_HALVINGS];
-	int half_phase[MAX_CHANNELS][MAX_HALVINGS];
 
 	// Finished output frames waiting to be handed over.
 	int32_t *pcm;
@@ -309,82 +195,6 @@ static bool parse_dff(dsd_file_t *d) {
 }
 
 // ---------------------------------------------------------------------------
-// filtering
-// ---------------------------------------------------------------------------
-
-static int32_t half_step(dsd_file_t *d, int ch, int stage, int32_t in, bool *have_out) {
-	int32_t *h = d->half_hist[ch][stage];
-
-	// Walk the write position backwards and store the sample in both halves;
-	// the taps then read forwards from it without a wrap test.
-	int pos = d->half_pos[ch][stage] - 1;
-	if (pos < 0) {
-		pos = HALF_TAPS - 1;
-	}
-	d->half_pos[ch][stage] = pos;
-	h[pos] = in;
-	h[pos + HALF_TAPS] = in;
-
-	d->half_phase[ch][stage] ^= 1;
-	if (d->half_phase[ch][stage] == 0) {
-		*have_out = false;
-		return 0; // every other input produces an output
-	}
-
-	const int32_t *x = h + pos;
-	int64_t acc = 0;
-	// HALF_TAPS is odd, so the centre sits at an odd index while every other
-	// non-zero tap sits at an even one: the loop steps over the even indices
-	// and the centre is added on its own.
-	//
-	// The parity matters: stepping over the odd indices instead would leave
-	// nothing but the centre tap, counted twice. That is still exactly unity
-	// at DC, so a tone comes out at the right level while the filter has
-	// silently stopped filtering.
-	for (int i = 0; i < HALF_TAPS; i += 2) {
-		acc += (int64_t)x[i] * half_coef[i];
-	}
-	acc += (int64_t)x[HALF_TAPS / 2] * half_coef[HALF_TAPS / 2];
-	*have_out = true;
-	return (int32_t)(acc >> 15);
-}
-
-// Turns one byte of one channel's bitstream into however many output frames it
-// produced (0 or 1 at these ratios), writing into `sample`.
-static bool feed_byte(dsd_file_t *d, int ch, unsigned char byte, int32_t *sample) {
-	// Stage one: shift the byte into the low end of the register -- byte b of
-	// the old history is now at bit 8*b -- and take one 8:1 output.
-	uint64_t hist = (d->hist[ch] << 8) | byte;
-	d->hist[ch] = hist;
-
-	int32_t acc = 0;
-	for (int b = 0; b < STAGE1_BYTES; b++) {
-		acc += stage1_table[b][(hist >> (8 * b)) & 0xFF];
-	}
-	int32_t value = acc; // Q24: full scale is 1<<24
-
-	for (int s = 0; s < d->halvings; s++) {
-		bool have = false;
-		value = half_step(d, ch, s, value, &have);
-		if (!have) {
-			return false;
-		}
-	}
-
-	// Q24 up to left-justified 32-bit, which is what every other decoder hands
-	// out. Saturating rather than wrapping: the filter's own overshoot can push
-	// a loud passage past full scale, and a wrap there is a crack, not a hiss.
-	int64_t wide = (int64_t)value << 7;
-	if (wide > INT32_MAX) {
-		wide = INT32_MAX;
-	} else if (wide < INT32_MIN) {
-		wide = INT32_MIN;
-	}
-	*sample = (int32_t)wide;
-	return true;
-}
-
-// ---------------------------------------------------------------------------
 // reading
 // ---------------------------------------------------------------------------
 
@@ -401,19 +211,38 @@ static bool fill_channels(dsd_file_t *d) {
 	int want = (int)(left < READ_BYTES ? left : READ_BYTES);
 
 	if (d->planar) {
-		// .dsf: whole blocks per channel, one channel after another. Read only
-		// as far as the block boundary so the de-interleave stays simple.
+		// .dsf: whole blocks, one channel's after another's. A group of them
+		// starting on a block boundary is contiguous on disk across every
+		// channel, so it comes in with one read and is split afterwards;
+		// anything short of that (the first read after a seek, the tail of the
+		// file) falls back to a read per channel.
 		uint64_t in_block = d->pos_bytes % d->block;
-		uint64_t to_edge = d->block - in_block;
-		if ((uint64_t)want > to_edge) {
-			want = (int)to_edge;
-		}
-
 		uint64_t block_index = d->pos_bytes / d->block;
-		for (int c = 0; c < d->channels; c++) {
-			uint64_t off = d->data_offset + (block_index * d->channels + c) * (uint64_t)d->block + in_block;
-			if (!read_at(d->fd, off, d->chan[c], (size_t)want)) {
+		int blocks = (in_block == 0) ? want / (int)d->block : 0;
+
+		if (blocks > 0) {
+			size_t span = (size_t)blocks * d->block;
+			uint64_t off = d->data_offset + block_index * d->channels * (uint64_t)d->block;
+			if (!read_at(d->fd, off, d->raw, span * d->channels)) {
 				return false;
+			}
+			for (int b = 0; b < blocks; b++) {
+				for (int c = 0; c < d->channels; c++) {
+					memcpy(d->chan[c] + (size_t)b * d->block,
+						   d->raw + ((size_t)b * d->channels + c) * d->block, d->block);
+				}
+			}
+			want = (int)span;
+		} else {
+			uint64_t to_edge = d->block - in_block;
+			if ((uint64_t)want > to_edge) {
+				want = (int)to_edge;
+			}
+			for (int c = 0; c < d->channels; c++) {
+				uint64_t off = d->data_offset + (block_index * d->channels + c) * (uint64_t)d->block + in_block;
+				if (!read_at(d->fd, off, d->chan[c], (size_t)want)) {
+					return false;
+				}
 			}
 		}
 	} else {
@@ -459,49 +288,26 @@ static bool produce(dsd_file_t *d) {
 
 		int available = d->chan_len - d->chan_read;
 
-		if (d->mode == DSD_OUT_DOP) {
-			// Two bytes of stream per frame, sixteen bits, with the marker on
-			// top and the two bytes below it -- the earliest bit first.
-			int pairs = available / 2;
-			if (pairs > d->pcm_capacity) {
-				pairs = d->pcm_capacity;
-			}
-			for (int i = 0; i < pairs; i++) {
-				uint32_t marker = d->dop_phase ? 0xFA : 0x05;
-				d->dop_phase ^= 1;
-				for (int c = 0; c < d->channels; c++) {
-					unsigned char hi = to_msb_first(d->chan[c][d->chan_read + i * 2], d->lsb_first);
-					unsigned char lo = to_msb_first(d->chan[c][d->chan_read + i * 2 + 1], d->lsb_first);
-					uint32_t word = (marker << 16) | ((uint32_t)hi << 8) | lo;
-					// Left-justified in 32 bits, which is how every other
-					// 24-bit source reaches the output.
-					d->pcm[i * d->channels + c] = (int32_t)(word << 8);
-				}
-			}
-			d->chan_read += pairs * 2;
-			d->pcm_frames = pairs;
-		} else {
-			// One byte in is one stage-one output, and each halving keeps every
-			// other one: so capacity << halvings bytes is exactly the buffer.
-			// Getting this wrong does not overflow -- it silently throws
-			// samples away, which is worse, because it sounds like a fast tape.
-			int max_bytes = d->pcm_capacity << d->halvings;
-			int count = available > max_bytes ? max_bytes : available;
-			for (int i = 0; i < count; i++) {
-				int32_t sample[MAX_CHANNELS];
-				bool got = false;
-				for (int c = 0; c < d->channels; c++) {
-					got = feed_byte(d, c, to_msb_first(d->chan[c][d->chan_read + i], d->lsb_first), &sample[c]);
-				}
-				if (got) {
-					for (int c = 0; c < d->channels; c++) {
-						d->pcm[d->pcm_frames * d->channels + c] = sample[c];
-					}
-					d->pcm_frames++;
-				}
-			}
-			d->chan_read += count;
+		// Two bytes of stream per frame, sixteen bits, with the marker on top
+		// and the two bytes below it -- the earliest bit first.
+		int pairs = available / 2;
+		if (pairs > d->pcm_capacity) {
+			pairs = d->pcm_capacity;
 		}
+		for (int i = 0; i < pairs; i++) {
+			uint32_t marker = d->dop_phase ? 0xFA : 0x05;
+			d->dop_phase ^= 1;
+			for (int c = 0; c < d->channels; c++) {
+				unsigned char hi = to_msb_first(d->chan[c][d->chan_read + i * 2], d->lsb_first);
+				unsigned char lo = to_msb_first(d->chan[c][d->chan_read + i * 2 + 1], d->lsb_first);
+				uint32_t word = (marker << 16) | ((uint32_t)hi << 8) | lo;
+				// Left-justified in 32 bits, which is how every other 24-bit
+				// source reaches the output.
+				d->pcm[i * d->channels + c] = (int32_t)(word << 8);
+			}
+		}
+		d->chan_read += pairs * 2;
+		d->pcm_frames = pairs;
 	}
 	return true;
 }
@@ -510,14 +316,11 @@ static bool produce(dsd_file_t *d) {
 // public
 // ---------------------------------------------------------------------------
 
-dsd_file_t *dsd_open(const char *path, dsd_output_t mode) {
-	build_tables();
-
+dsd_file_t *dsd_open(const char *path) {
 	dsd_file_t *d = calloc(1, sizeof(*d));
 	if (!d) {
 		return NULL;
 	}
-	d->mode = mode;
 	d->fd = open(path, O_RDONLY);
 	if (d->fd < 0) {
 		free(d);
@@ -542,20 +345,7 @@ dsd_file_t *dsd_open(const char *path, dsd_output_t mode) {
 		return NULL;
 	}
 
-	if (mode == DSD_OUT_DOP) {
-		d->out_rate = (int)(d->rate / 16);
-		d->halvings = 0;
-	} else {
-		d->out_rate = DSD_PCM_RATE;
-		// /8 in the first stage, then halve until the rate is reached: one
-		// halving for DSD64, two for DSD128, three for DSD256.
-		int factor = (int)(d->rate / 8) / DSD_PCM_RATE;
-		d->halvings = 0;
-		while (factor > 1 && d->halvings < MAX_HALVINGS) {
-			factor /= 2;
-			d->halvings++;
-		}
-	}
+	d->out_rate = (int)(d->rate / 16);
 
 	d->total_out = (d->bytes_per_ch * 8ull) / (uint64_t)(d->rate / (uint32_t)d->out_rate);
 
@@ -568,20 +358,20 @@ dsd_file_t *dsd_open(const char *path, dsd_output_t mode) {
 			return NULL;
 		}
 	}
-	if (!d->planar) {
-		d->raw = malloc((size_t)READ_BYTES * d->channels);
-		if (!d->raw) {
-			dsd_close(d);
-			return NULL;
-		}
+	// Both containers need it now: .dff to split the round-robin bytes, .dsf to
+	// hold the block group before it is split.
+	d->raw = malloc((size_t)READ_BYTES * d->channels);
+	if (!d->raw) {
+		dsd_close(d);
+		return NULL;
 	}
 	if (!d->pcm) {
 		dsd_close(d);
 		return NULL;
 	}
 
-	printf("dsd: %s DSD%d %u Hz %d ch -> %s %d Hz\n", d->planar ? "dsf" : "dff", d->multiple, d->rate, d->channels,
-		   mode == DSD_OUT_DOP ? "DoP" : "PCM", d->out_rate);
+	printf("dsd: %s DSD%d %u Hz %d ch -> DoP %d Hz\n", d->planar ? "dsf" : "dff", d->multiple, d->rate,
+		   d->channels, d->out_rate);
 	return d;
 }
 
@@ -604,7 +394,6 @@ int dsd_channels(const dsd_file_t *d) { return d ? d->channels : 0; }
 uint32_t dsd_rate(const dsd_file_t *d) { return d ? d->rate : 0; }
 int dsd_multiple(const dsd_file_t *d) { return d ? d->multiple : 0; }
 int dsd_output_rate(const dsd_file_t *d) { return d ? d->out_rate : 0; }
-bool dsd_is_dop(const dsd_file_t *d) { return d && d->mode == DSD_OUT_DOP; }
 uint64_t dsd_total_frames(const dsd_file_t *d) { return d ? d->total_out : 0; }
 
 uint64_t dsd_read(dsd_file_t *d, uint64_t frames, int32_t *out) {
@@ -638,17 +427,13 @@ bool dsd_seek(dsd_file_t *d, uint64_t frame) {
 		frame = d->total_out;
 	}
 
-	uint64_t bytes_per_frame = (uint64_t)(d->rate / (uint32_t)d->out_rate) / 8;
-	uint64_t target = frame * bytes_per_frame;
+	// A frame is exactly two bytes, so landing on an odd one would swap the
+	// halves of every word from here on.
+	uint64_t target = frame * 2;
 	if (target > d->bytes_per_ch) {
 		target = d->bytes_per_ch;
 	}
-
-	// On the DoP route a frame is exactly two bytes, so landing on an odd byte
-	// would swap the halves of every word from here on.
-	if (d->mode == DSD_OUT_DOP) {
-		target &= ~1ull;
-	}
+	target &= ~1ull;
 
 	d->pos_bytes = target;
 	d->chan_len = 0;
@@ -656,10 +441,5 @@ bool dsd_seek(dsd_file_t *d, uint64_t frame) {
 	d->pcm_frames = 0;
 	d->pcm_read = 0;
 	d->dop_phase = 0;
-
-	memset(d->hist, 0, sizeof(d->hist));
-	memset(d->half_hist, 0, sizeof(d->half_hist));
-	memset(d->half_pos, 0, sizeof(d->half_pos));
-	memset(d->half_phase, 0, sizeof(d->half_phase));
 	return true;
 }

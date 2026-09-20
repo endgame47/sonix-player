@@ -64,6 +64,19 @@ static void host_pace(snd_pcm_sframes_t frames, int rate) {
 // The cost of dropping is that whatever the DAC had buffered (up to ~0.7 s with
 // the deep buffer here) is discarded unheard, so the caller winds its source
 // back by the returned amount.
+// One per turn of a decode loop, for the watchdog.
+//
+// The playback thread runs SCHED_RR, and this device has one core: a turn that
+// never blocks starves everything else, the interface included, and the log
+// stops because nothing else is scheduled to write to it. From outside that is
+// a frozen player with nothing in the log -- and from the watchdog's side a
+// thread in state R says only "running", not whether it is making progress.
+// This number says which: racing away while the interface is stalled is a spin,
+// standing still is a thread stuck in a call that never came back.
+static volatile unsigned loop_turns;
+
+unsigned audio_loop_turns(void) { return loop_turns; }
+
 static int64_t pause_stop_stream(snd_pcm_t *pcm, int frame_bytes) {
 	// No stream is a fair answer, not a fault: the device is handed back after
 	// a few seconds of pause and this is called on the way into pause. Alsa
@@ -350,6 +363,20 @@ static void mark_stopped_unless_replaced(void) {
 
 static double progress_current_secs = 0.0;
 
+// Where the bar was when the track was paused.
+//
+// Pausing winds the decoder back over the frames that were queued but never
+// heard, so resuming carries on from the sound and not from the file. That is
+// right for the audio and wrong for the display: the position on screen jumps
+// backwards by however deep the output buffer is, which on this player is most
+// of a second.
+//
+// So the reported position has a floor while the rewind is in effect. The bar
+// stays where the music stopped, resuming replays the buffered moment behind
+// it, and the floor lifts by itself as soon as real progress passes it. -1
+// means no floor.
+static double progress_floor_secs = -1.0;
+
 // Playback speed, for audiobooks. It lives here rather than being handed in
 // with the track because it can be changed while one is playing, from the
 // player's own pop-over. 1.0 is untouched and costs nothing: speed.c bypasses
@@ -374,7 +401,6 @@ static int stream_bits = 0; // source bit depth (16/24/32), for the format line
 // track's real identity is its multiple, not "24 bit at 176.4 kHz" -- that is
 // only what the carrier looks like.
 static int stream_dsd_multiple = 0;
-static bool stream_dsd_dop = false;
 // Also for the format line and the details page: what is inside the file and
 // at how many kbps. A lossy format has no bit depth of its own -- see
 // decoder_is_lossy() -- and is described by bitrate instead.
@@ -548,6 +574,39 @@ bool audio_get_gapless(void) { return gapless_enabled; }
 // finished. The buffer going down slowly is a stream still playing out; the
 // buffer not going down is one nobody is reading.
 #define DRAIN_STALL_MS 200
+
+// How long a period should last above 192 kHz, and how large one is ever
+// allowed to get. The length is what 4096 frames last at 44.1 kHz, which is the
+// sizing every rate below has been using all along; the cap is there because
+// the frames are what the driver has to find DMA memory for, and a request it
+// cannot meet is settled downwards rather than refused.
+#define PERIOD_TARGET_MS 90
+#define PERIOD_FRAMES_MAX 32768
+
+// How much audio one turn of the decode loop handles.
+//
+// Not the same question as how deep the card's buffer is, and it has to be
+// asked separately: the driver settles the period wherever its DMA memory runs
+// out, so a long one asked for at 705.6 kHz can still come back short. The loop
+// would then turn a hundred and seventy times a second whatever was requested,
+// and the thread doing the turning is real-time on the one core the interface
+// also wants. It is not the work that hurts there, it is being interrupted that
+// often to do it.
+//
+// So a turn reads and writes whole periods until it has about this much, and
+// blocks once instead of eight times. snd_pcm_writei takes any number of
+// frames; more than a period is queued and waited on, which is the same waiting
+// done in one piece.
+#define CHUNK_TARGET_MS 90
+
+static snd_pcm_uframes_t chunk_for(snd_pcm_uframes_t period, int sample_rate) {
+	snd_pcm_uframes_t want = (snd_pcm_uframes_t)(((long)sample_rate * CHUNK_TARGET_MS) / 1000);
+	snd_pcm_uframes_t chunk = period;
+	while (chunk < want && chunk + period > chunk) {
+		chunk += period;
+	}
+	return chunk;
+}
 
 // How long the end of a track waits after closing a bluealsa PCM, before the
 // next track opens one. See the call site.
@@ -941,6 +1000,28 @@ static snd_pcm_t *open_pcm_device(int channels, int sample_rate, int bits_per_sa
 	unsigned int periods = 8;
 	snd_pcm_uframes_t period_size = 4096;
 
+	// ...as long as 4096 frames are still a period. Past 96 kHz they stop being
+	// one and become a fragment, and the reserve goes with them: 4096 frames are
+	// 93 ms at 44.1 kHz, 23 ms at 176.4 kHz, and 5.8 ms at 705.6 kHz, where
+	// DSD256 goes over DoP. The whole eight-period buffer at 705.6 kHz was
+	// 46 ms, and the stream starts on a full buffer, so that was also all it
+	// ever had in hand against an interface sharing the one core. The first
+	// thing that takes the core for longer than that is an underrun, a prepare
+	// and a rewrite.
+	//
+	// So above 96 kHz the period is chosen by how long it lasts instead, and the
+	// reserve comes out where it is at 44.1 kHz. Everything at or below keeps
+	// exactly the sizing it has always had.
+	if (sample_rate > 96000) {
+		// Doubled while the next step is still near the target rather than past
+		// it: a period is a power of two here, and always taking the first one
+		// longer than the target would ask for 170 ms at 192 kHz to hit 90.
+		snd_pcm_uframes_t want = (snd_pcm_uframes_t)(((long)sample_rate * PERIOD_TARGET_MS) / 1000);
+		while (period_size * 2 <= want + want / 2 && period_size * 2 <= PERIOD_FRAMES_MAX) {
+			period_size *= 2;
+		}
+	}
+
 	// Two ways of asking for a buffer, selected by a config key. The default is
 	// the frame-based sizing above.
 	//
@@ -998,12 +1079,22 @@ static snd_pcm_t *open_pcm_device(int channels, int sample_rate, int bits_per_sa
 		log_bluealsa_plugin();
 	}
 
-	// With time-based sizing the frames were ALSA's choice, so ask what it
-	// settled on -- the write loop is driven by this number.
-	if (buffer_time_ms > 0) {
+	// What ALSA settled on, whichever way it was asked: with time-based sizing
+	// the frames were its choice from the start, and with frame-based sizing a
+	// long period can be more than the driver will allocate, so "near" is not
+	// "what was asked for". The write loop is driven by this number and the
+	// buffer it writes from is allocated to it.
+	{
 		snd_pcm_uframes_t actual_period = 0;
 		if (snd_pcm_hw_params_get_period_size(hw_params, &actual_period, &dir) >= 0 && actual_period > 0) {
 			period_size = actual_period;
+		}
+		snd_pcm_uframes_t actual_buffer = 0;
+		if (snd_pcm_hw_params_get_buffer_size(hw_params, &actual_buffer) >= 0 && actual_buffer > 0) {
+			unsigned int rate = val ? val : (unsigned int)sample_rate;
+			fprintf(stderr, "audio: buffer %lu frames (%u ms), period %lu frames (%u ms)\n",
+					(unsigned long)actual_buffer, (unsigned int)((actual_buffer * 1000u) / rate),
+					(unsigned long)period_size, (unsigned int)((period_size * 1000u) / rate));
 		}
 	}
 
@@ -1556,6 +1647,7 @@ static void play_wav_file(const char *filepath) {
 	pthread_mutex_lock(&audio_mutex);
 	progress_total_secs = (double)info.data_size / bytes_per_sec;
 	progress_current_secs = 0.0;
+	progress_floor_secs = -1.0;
 	stream_sample_rate = info.sample_rate;
 	stream_channels = info.channels;
 	stream_bits = info.bits_per_sample;
@@ -1606,6 +1698,7 @@ static void play_wav_file(const char *filepath) {
 	int track_route = alsa_output_key(); // the output auto_set_output just applied
 
 	while (1) {
+		loop_turns++;
 		pthread_mutex_lock(&audio_mutex);
 		if (audio_command == AUDIO_CMD_STOP || play_request) {
 			pthread_mutex_unlock(&audio_mutex);
@@ -1668,6 +1761,7 @@ static void play_wav_file(const char *filepath) {
 					}
 					fseek(f, info.data_offset + bytes_played, SEEK_SET);
 					pthread_mutex_lock(&audio_mutex);
+					progress_floor_secs = progress_current_secs; // the bar stays put
 					progress_current_secs = (double)bytes_played / bytes_per_sec;
 					pthread_mutex_unlock(&audio_mutex);
 				}
@@ -2008,11 +2102,11 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 	pthread_mutex_lock(&audio_mutex);
 	progress_total_secs = (double)total_frames / sample_rate;
 	progress_current_secs = 0.0;
+	progress_floor_secs = -1.0;
 	stream_sample_rate = sample_rate;
 	stream_channels = channels;
 	stream_bits = source_bits;
 	stream_dsd_multiple = dsd_multiple;
-	stream_dsd_dop = passthrough;
 	stream_bitrate_kbps = decoder_bitrate_kbps(dec);
 	stream_lossy = decoder_is_lossy(dec);
 	snprintf(stream_codec, sizeof(stream_codec), "%s", decoder_codec_name(dec));
@@ -2059,29 +2153,12 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 		pcm_handle = open_pcm_device(channels, sample_rate, out_bits, &period_size);
 	}
 	if (!pcm_handle && passthrough) {
-		// DSD256 asks the card for 705.6 kHz, which it may simply refuse. Rather
-		// than dropping the track, reopen the file on the conversion route --
-		// which is exactly the fallback the setting describes.
-		fprintf(stderr, "audio: DoP at %d Hz refused, falling back to PCM conversion\n", sample_rate);
-		set_dac_dop(0);
-		decoder_close(dec);
-		decode_set_dsd_output(1);
-		dec = decoder_open(filepath, format);
-		decode_set_dsd_output(0);
-		if (dec) {
-			passthrough = false;
-			stream_dsd_dop = false;
-			channels = decoder_channels(dec);
-			sample_rate = decoder_sample_rate(dec);
-			total_frames = decoder_total_pcm_frames(dec);
-			out_bits = 32;
-			pthread_mutex_lock(&audio_mutex);
-			progress_total_secs = (double)total_frames / sample_rate;
-			stream_sample_rate = sample_rate;
-			stream_channels = channels;
-			pthread_mutex_unlock(&audio_mutex);
-			pcm_handle = open_pcm_device(channels, sample_rate, out_bits, &period_size);
-		}
+		// DSD256 asks the card for 705.6 kHz, which an output that is not this
+		// device's own DAC may simply refuse. There is nowhere to fall back to:
+		// filtering the stream down to PCM here costs more than the whole core
+		// at DSD256, so the track does not play and the log says why rather
+		// than leaving a silent stop to be guessed at.
+		fprintf(stderr, "audio: DoP at %d Hz refused by this output; the track cannot play\n", sample_rate);
 	}
 	if (!pcm_handle) {
 		set_dac_dop(0);
@@ -2099,7 +2176,8 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 	double bytes_per_sec = (double)sample_rate * channels * (out_bits / 8);
 	int frame_bytes = channels * (out_bits / 8);
 	long paused_at_ms = 0; // when the current pause began (device power-down clock)
-	void *buffer = malloc(period_size * frame_bytes);
+	snd_pcm_uframes_t chunk_frames = chunk_for(period_size, sample_rate);
+	void *buffer = malloc(chunk_frames * frame_bytes);
 	if (!buffer) {
 		fprintf(stderr, "Audio: Out of memory for period buffer\n");
 		snd_pcm_close(pcm_handle);
@@ -2133,6 +2211,7 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 	decoder_fill_t fill_ctx = {dec};
 
 	while (1) {
+		loop_turns++;
 		pthread_mutex_lock(&audio_mutex);
 		if (audio_command == AUDIO_CMD_STOP || play_request) {
 			pthread_mutex_unlock(&audio_mutex);
@@ -2255,6 +2334,7 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 					if (decoder_seek_to_frame(dec, resume_frame)) {
 						bytes_played = (int64_t)(resume_frame * frame_bytes);
 						pthread_mutex_lock(&audio_mutex);
+						progress_floor_secs = progress_current_secs; // the bar stays put
 						progress_current_secs = (double)bytes_played / bytes_per_sec;
 						pthread_mutex_unlock(&audio_mutex);
 					}
@@ -2327,8 +2407,9 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 						pthread_mutex_unlock(&audio_mutex);
 						break;
 					}
-					if (new_period > period_size) {
-						void *bigger = realloc(buffer, new_period * frame_bytes);
+					snd_pcm_uframes_t new_chunk = chunk_for(new_period, sample_rate);
+					if (new_chunk > chunk_frames) {
+						void *bigger = realloc(buffer, new_chunk * frame_bytes);
 						if (!bigger) {
 							snd_pcm_close(pcm_handle);
 							pcm_handle = NULL;
@@ -2340,6 +2421,7 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 						}
 						buffer = bigger;
 					}
+					chunk_frames = new_chunk;
 					period_size = new_period;
 					fprintf(stderr, "audio[%ld]: device taken back for the unpause\n", log_ms());
 					// A reopen is a fresh start for the sink as much as a new
@@ -2392,7 +2474,7 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 		uint64_t frames_read;
 		uint64_t input_frames;
 		if (out_bits == 32) {
-			frames_read = decoder_read_pcm_frames_s32(dec, period_size, (int32_t *)buffer);
+			frames_read = decoder_read_pcm_frames_s32(dec, chunk_frames, (int32_t *)buffer);
 			input_frames = frames_read;
 			if (frames_read != 0 && !passthrough) {
 				// ReplayGain first: it is a correction to the source level, so
@@ -2414,10 +2496,10 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 
 			if (stretch) {
 				speed_set_factor(stretch, want_speed);
-				frames_read = (uint64_t)speed_pull(stretch, (short *)buffer, (int)period_size, decoder_fill, &fill_ctx,
+				frames_read = (uint64_t)speed_pull(stretch, (short *)buffer, (int)chunk_frames, decoder_fill, &fill_ctx,
 												   &input_frames);
 			} else {
-				frames_read = decoder_read_pcm_frames_s16(dec, period_size, (short *)buffer);
+				frames_read = decoder_read_pcm_frames_s16(dec, chunk_frames, (short *)buffer);
 				input_frames = frames_read;
 			}
 			if (frames_read != 0) {
@@ -2446,7 +2528,7 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 		// Either way, do not trickle onwards: stop and refill, like any
 		// streaming app. (What the read already produced is still played below:
 		// the gap starts after the last good sample.)
-		if (decoder_is_growing(dec) && (frames_read < period_size || decoder_take_starved(dec))) {
+		if (decoder_is_growing(dec) && (frames_read < chunk_frames || decoder_take_starved(dec))) {
 			rebuffer_after_short_read(dec, sample_rate, (uint64_t)(bytes_played / frame_bytes));
 			if (frames_read == 0) {
 				// Nothing at all came out: retry after refilling. Falling
@@ -2662,7 +2744,6 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 	pcm_device_open = keep_open;
 	pthread_mutex_lock(&audio_mutex);
 	stream_dsd_multiple = 0;
-	stream_dsd_dop = false;
 	pthread_mutex_unlock(&audio_mutex);
 	// Off again with the stream. A DAC left in DSD mode reads the next
 	// ordinary track's words as bits and plays noise at full level, so this
@@ -2864,6 +2945,7 @@ int audio_play(const char *filepath) {
 	// moment, and stale values make the bar jump back to where the previous
 	// track was before snapping to the new one.
 	progress_current_secs = 0.0;
+	progress_floor_secs = -1.0;
 	progress_total_secs = 0.0;
 	stream_sample_rate = 0;
 	stream_channels = 0;
@@ -2904,6 +2986,7 @@ int audio_play_at(const char *filepath, double start_secs) {
 		seek_target_secs = start_secs;
 	}
 	progress_current_secs = start_secs > 0 ? start_secs : 0;
+	progress_floor_secs = -1.0;
 	progress_total_secs = 0;
 	pthread_mutex_unlock(&audio_mutex);
 
@@ -2928,6 +3011,7 @@ int audio_play_paused(const char *filepath, double start_secs) {
 		seek_target_secs = start_secs;
 	}
 	progress_current_secs = start_secs > 0 ? start_secs : 0;
+	progress_floor_secs = -1.0;
 	progress_total_secs = 0;
 	pthread_mutex_unlock(&audio_mutex);
 
@@ -3133,8 +3217,16 @@ void audio_get_current_file(char *out, size_t out_size) {
 
 void audio_get_progress(double *current_secs, double *total_secs) {
 	pthread_mutex_lock(&audio_mutex);
+	double current = progress_current_secs;
+	if (progress_floor_secs >= 0.0) {
+		if (current >= progress_floor_secs) {
+			progress_floor_secs = -1.0; // playback has caught up
+		} else {
+			current = progress_floor_secs;
+		}
+	}
 	if (current_secs)
-		*current_secs = progress_current_secs;
+		*current_secs = current;
 	if (total_secs)
 		*total_secs = progress_total_secs;
 	pthread_mutex_unlock(&audio_mutex);
@@ -3179,12 +3271,9 @@ void audio_get_stream_codec(char *out, size_t size) {
 	pthread_mutex_unlock(&audio_mutex);
 }
 
-int audio_get_dsd_multiple(bool *dop) {
+int audio_get_dsd_multiple(void) {
 	pthread_mutex_lock(&audio_mutex);
 	int m = stream_dsd_multiple;
-	if (dop) {
-		*dop = stream_dsd_dop;
-	}
 	pthread_mutex_unlock(&audio_mutex);
 	return m;
 }
@@ -3209,6 +3298,7 @@ void audio_seek(double seconds) {
 
 	pthread_mutex_lock(&audio_mutex);
 	progress_current_secs = seconds; // the bar follows the finger, not the decoder
+	progress_floor_secs = -1.0;		// and a deliberate jump outranks the pause floor
 	seek_target_secs = seconds;
 	seek_request = true;
 	pthread_mutex_unlock(&audio_mutex);

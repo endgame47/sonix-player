@@ -69,6 +69,12 @@ bool storage_sd_writable(void);
 // or NULL when no card was found. Used by the USB mass-storage export.
 const char *storage_sd_device(void);
 
+// Whether the card is in the slot and everything that lives on it is open.
+// False from the moment a removal is seen until a card is mounted again, which
+// is what anything asking "is there a card" wants -- the block device name
+// outlives the card that was pulled out.
+bool storage_card_attached(void);
+
 // Looks at the card and puts it back if it has gone missing: a mount that has
 // died under it -- the card was pulled, or a USB export unmounted it and the
 // remount did not take -- is cleared, the card is mounted again, and

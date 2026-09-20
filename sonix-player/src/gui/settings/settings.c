@@ -143,6 +143,47 @@ static void rotate_toggle_cb(lv_event_t *e) {
 }
 
 // The lowest level offered. The stock player never writes below 5 of its
+// Blanking this panel powers its touch controller down with it, so the only
+// way back is the power key. Thirty seconds is the default; "never" is there
+// for anyone who would rather not be caught out by it.
+//
+// The setting is written under [power], where it has always lived: it is read
+// by power.c, and moving the key would lose everybody's choice.
+static const struct {
+	int seconds;
+	const char *label;
+} SCREEN_OFF[] = {
+	{0, "power_never"},		 {15, "power_15_seconds"}, {30, "power_30_seconds"},
+	{60, "power_1_minute"},	 {120, "power_2_minutes"}, {300, "power_5_minutes"},
+};
+#define SCREEN_OFF_COUNT ((int)(sizeof(SCREEN_OFF) / sizeof(SCREEN_OFF[0])))
+#define SCREEN_OFF_DEFAULT 30
+
+static int screen_off_index(void) {
+	int seconds = (int)config_get_int("power", "screen_off_seconds", SCREEN_OFF_DEFAULT);
+	for (int i = 0; i < SCREEN_OFF_COUNT; i++) {
+		if (SCREEN_OFF[i].seconds == seconds) {
+			return i;
+		}
+	}
+	return 2; // the 30 second default
+}
+
+void settings_apply_screen_off(void) {
+	int seconds = SCREEN_OFF[screen_off_index()].seconds;
+	power_set_screen_off_timeout((uint32_t)seconds * 1000);
+	power_set_screen_off_enabled(seconds > 0);
+}
+
+static void screen_off_changed_cb(lv_event_t *e) {
+	(void)e;
+	int index = (int)lv_slider_get_value(screen_off_slider);
+	config_set_int("power", "screen_off_seconds", SCREEN_OFF[index].seconds);
+	config_save();
+	settings_apply_screen_off();
+	lv_label_set_text(screen_off_value, tr(SCREEN_OFF[index].label));
+}
+
 // 0..100 scale -- anything under that is indistinguishable from off.
 static long brightness_floor(long max) {
 	long floor = max / 20;

@@ -16,6 +16,7 @@
 #include "src/gui/audio/peqpage.h"
 #include "src/gui/nowplaying/coverflow.h"
 #include "src/gui/library/medialist.h"
+#include "src/gui/library/music.h"
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/switcher.h"
 #include "src/gui/shell/theme.h"
@@ -605,32 +606,6 @@ static void rg_pick_cb(lv_event_t *e) {
 	config_save();
 	rg_apply_to_loaded_track();
 	rg_refresh();
-}
-
-// ---------------------------------------------------------------------------
-// DSD output
-// ---------------------------------------------------------------------------
-
-static lv_obj_t *dsd_pills, *dsd_dop_pill, *dsd_pcm_pill;
-
-static void dsd_refresh(void) {
-	if (!dsd_dop_pill) {
-		return;
-	}
-	bool pcm = decode_get_dsd_output() != 0;
-	settingsrow_pill_active(dsd_dop_pill, !pcm);
-	settingsrow_pill_active(dsd_pcm_pill, pcm);
-}
-
-static void dsd_pick_cb(lv_event_t *e) {
-	if (player_sheet_drag_active() || switcher_back_drag_active()) {
-		return;
-	}
-	int pcm = (int)(intptr_t)lv_event_get_user_data(e);
-	decode_set_dsd_output(pcm);
-	config_set_int("audio", "dsd_output_pcm", pcm);
-	config_save();
-	dsd_refresh();
 }
 
 // ---------------------------------------------------------------------------
@@ -1226,6 +1201,19 @@ static void album_view_cb(lv_event_t *e) {
 	medialist_set_album_view(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
 }
 
+// Which of Browse and Playlists the Music page puts on its sixth tile. Kept
+// here with the rest of the display options; the Music page reads it and paints
+// itself.
+static lv_obj_t *playlists_first_switch;
+
+bool musicsettings_playlists_first(void) { return config_get_bool("music", "playlists_first", false); }
+
+static void playlists_first_cb(lv_event_t *e) {
+	config_set_bool("music", "playlists_first", lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+	config_save();
+	music_refresh_layout();
+}
+
 static void quality_badges_cb(lv_event_t *e) {
 	medialist_set_quality_badges(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
 }
@@ -1248,22 +1236,23 @@ static void coverflow_cb(lv_event_t *e) {
 
 static lv_obj_t *layout_standard_pill;
 static lv_obj_t *layout_alternative_pill;
+static lv_obj_t *layout_studio_pill;
 
 static void layout_refresh(void) {
 	if (!layout_standard_pill) {
 		return;
 	}
-	bool alternative = player_layout_is_alternative();
-	settingsrow_pill_active(layout_standard_pill, !alternative);
-	settingsrow_pill_active(layout_alternative_pill, alternative);
+	player_layout_t chosen = player_layout_get();
+	settingsrow_pill_active(layout_standard_pill, chosen == PLAYER_LAYOUT_STANDARD);
+	settingsrow_pill_active(layout_alternative_pill, chosen == PLAYER_LAYOUT_ALTERNATIVE);
+	settingsrow_pill_active(layout_studio_pill, chosen == PLAYER_LAYOUT_STUDIO);
 }
 
 static void layout_pick_cb(lv_event_t *e) {
 	if (player_sheet_drag_active() || switcher_back_drag_active()) {
 		return;
 	}
-	int alternative = (int)(intptr_t)lv_event_get_user_data(e);
-	player_set_layout_alternative(alternative != 0);
+	player_layout_set((player_layout_t)(intptr_t)lv_event_get_user_data(e));
 	layout_refresh();
 }
 
@@ -1302,17 +1291,30 @@ static void build_display_page(gui_config_t *cfg) {
 	// How the now-playing page is arranged.
 	lv_obj_t *layout_pills = NULL;
 	settingsrow_pills(container, "musicsettings_player_layout", &layout_pills);
-	layout_standard_pill = settingsrow_pill(layout_pills, "musicsettings_layout_standard", 0, layout_pick_cb);
-	layout_alternative_pill = settingsrow_pill(layout_pills, "musicsettings_layout_alternative", 1, layout_pick_cb);
+	layout_standard_pill =
+		settingsrow_pill(layout_pills, "musicsettings_layout_standard", PLAYER_LAYOUT_STANDARD, layout_pick_cb);
+	layout_alternative_pill =
+		settingsrow_pill(layout_pills, "musicsettings_layout_alternative", PLAYER_LAYOUT_ALTERNATIVE, layout_pick_cb);
+	layout_studio_pill =
+		settingsrow_pill(layout_pills, "musicsettings_layout_studio", PLAYER_LAYOUT_STUDIO, layout_pick_cb);
+
 	layout_refresh();
 	theme_register_refresh(layout_refresh);
 
-	// Said here rather than left to be discovered: the alternative arrangement
-	// is built out of a file on the card -- the shape of the track, the sleeve
-	// it takes its colour from, the tags in the pill -- so a radio station, a
+	// Said here rather than left to be discovered: the Waveform arrangement is
+	// built out of a file on the card -- the shape of the track, the sleeve it
+	// takes its colour from, the tags in the pill -- so a radio station, a
 	// stream from a phone and an audiobook all get the standard one whatever
-	// this says.
+	// this says. Studio asks for less and takes all of them.
 	option_note(container, "musicsettings_local_only_note");
+
+	// Under the layout, because it is the other thing on this page about where
+	// something is rather than about what it says.
+	settingsrow_toggle(container, "musicsettings_playlists_first", &playlists_first_switch, playlists_first_cb);
+	option_note(container, "musicsettings_playlists_first_note");
+	if (musicsettings_playlists_first()) {
+		lv_obj_add_state(playlists_first_switch, LV_STATE_CHECKED);
+	}
 
 	switcher_attach_back_gesture(display_screen);
 }
@@ -1424,7 +1426,6 @@ static void build_playback_page(gui_config_t *cfg) {
 static void musicsettings_loaded_cb(lv_event_t *e) {
 	(void)e;
 	rg_refresh();
-	dsd_refresh();
 }
 
 void musicsettings_init(gui_config_t *cfg) {
@@ -1472,17 +1473,8 @@ void musicsettings_init(gui_config_t *cfg) {
 		lv_obj_add_state(gain_switch, LV_STATE_CHECKED);
 	}
 
-	// DSD: straight to the DAC, or filtered down here. DoP is the default --
-	// it is what this hardware is built for -- and falls back to conversion on
-	// its own when the card will not take the rate.
-	settingsrow_pills(container, "musicsettings_dsd_output", &dsd_pills);
-	dsd_dop_pill = settingsrow_pill(dsd_pills, "musicsettings_dop", 0, dsd_pick_cb);
-	dsd_pcm_pill = settingsrow_pill(dsd_pills, "musicsettings_pcm", 1, dsd_pick_cb);
-	dsd_refresh();
-
-	// Right under it, because it is the same subject: how loud that DSD comes
-	// out. Only the DAC path is touched, so it says nothing for a DSD file that
-	// is being converted to PCM.
+	// How loud DSD comes out. The DAC is the only thing that plays it here, so
+	// this is the only place its level can be touched at all.
 	//
 	// What was chosen last time is loaded before the row rather than with the
 	// other settings at the end of this function: the row paints itself from
@@ -1522,7 +1514,6 @@ void musicsettings_init(gui_config_t *cfg) {
 	#endif
 
 	theme_register_refresh(rg_refresh);
-	theme_register_refresh(dsd_refresh);
 	theme_register_refresh(dsd_gain_refresh);
 	lv_obj_add_event_cb(musicsettings_screen, musicsettings_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
 
@@ -1536,7 +1527,6 @@ void musicsettings_init(gui_config_t *cfg) {
 	set_dac_nos((int)config_get_int("audio", "dac_nos", 0));
 	set_high_gain((int)config_get_int("audio", "high_gain", 0));
 
-	decode_set_dsd_output((int)config_get_int("audio", "dsd_output_pcm", 0));
 
 	lv_obj_add_event_cb(musicsettings_screen, screen_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
 }

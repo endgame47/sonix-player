@@ -33,6 +33,10 @@ void musicsettings_set_fade_enabled(bool enabled);
 // Which of the two shuffles "Play in random order" starts: with this on it is
 // the one that comes round again instead of stopping at the end of the deal.
 // Only that action reads it; the player's mode button still reaches both.
+// Whether the Music page puts Playlists on its sixth tile and Browse on the
+// corner button, rather than the other way round.
+bool musicsettings_playlists_first(void);
+
 bool musicsettings_endless_shuffle(void);
 
 bool musicsettings_high_gain(void);

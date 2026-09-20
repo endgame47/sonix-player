@@ -680,8 +680,13 @@ static void *apply_thread(void *arg) {
 
 bool wifitransfer_available(void) { return exists(THTTPD_BIN) && (exists(WEB_DIR) || exists(WEB_SRC)); }
 
+// Bumped by every change of intent, so the cached answer below is thrown away
+// rather than outliving the toggle by up to a second.
+static uint32_t running_cache_generation;
+
 void wifitransfer_set_enabled(bool on) {
 	g_enabled = on;
+	running_cache_generation++;
 
 	if (!wifitransfer_available()) {
 		return;
@@ -710,14 +715,16 @@ bool wifitransfer_running(void) {
 	static bool cached;
 	static uint32_t cached_at;
 	static bool have;
+	static uint32_t cached_generation;
 
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	uint32_t now = (uint32_t)(ts.tv_sec * 1000u + ts.tv_nsec / 1000000u);
 
-	if (have && (uint32_t)(now - cached_at) < WT_RUNNING_CACHE_MS) {
+	if (have && cached_generation == running_cache_generation && (uint32_t)(now - cached_at) < WT_RUNNING_CACHE_MS) {
 		return cached;
 	}
+	cached_generation = running_cache_generation;
 	cached = process_running("thttpd");
 	cached_at = now;
 	have = true;

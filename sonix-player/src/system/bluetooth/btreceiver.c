@@ -35,10 +35,38 @@
 // `running` between reads -- and large enough that the syscall is not the work.
 #define CHUNK_FRAMES 512
 
-// The capture side's own buffer. Deeper than one chunk so a late turn of this
-// thread does not cost an overrun, and shallower than the output's 750 ms so
-// the delay between the phone and the ear stays somewhere near reasonable.
-#define CAPTURE_LATENCY_US 200000
+// The two buffers between the phone and the ear, and together they are most of
+// the delay: bluealsa decodes into the first, this thread reads from it and
+// writes into the second, which is the DAC's.
+//
+// Both are deliberately short. The player's own playback opens a deep output
+// buffer because nothing is waiting on it; here something is -- a video on the
+// phone whose picture is not going through the player -- and a delay that does
+// not matter for music is plainly wrong against moving lips.
+//
+// Short buffers are also where dropouts come from, so both are settings. Raise
+// them if the audio breaks up:
+//
+//   [bluetooth]
+//   receiver_capture_ms = 80    bluealsa's side
+//   receiver_output_ms  = 120   the DAC's side
+#define CAPTURE_MS_DEFAULT 80
+#define OUTPUT_MS_DEFAULT 120
+
+// Below this neither side has room for a late turn of this thread, whatever the
+// config says.
+#define BUFFER_MS_MIN 30
+#define BUFFER_MS_MAX 750
+
+static int capture_ms(void) {
+	int ms = (int)config_get_int("bluetooth", "receiver_capture_ms", CAPTURE_MS_DEFAULT);
+	return ms < BUFFER_MS_MIN ? BUFFER_MS_MIN : (ms > BUFFER_MS_MAX ? BUFFER_MS_MAX : ms);
+}
+
+static int output_ms(void) {
+	int ms = (int)config_get_int("bluetooth", "receiver_output_ms", OUTPUT_MS_DEFAULT);
+	return ms < BUFFER_MS_MIN ? BUFFER_MS_MIN : (ms > BUFFER_MS_MAX ? BUFFER_MS_MAX : ms);
+}
 
 // How long after the last frame the stream still counts as live. A sender that
 // pauses simply stops sending: nothing fails, and snd_pcm_readi waits. So
@@ -49,7 +77,15 @@
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t thread;
 static bool running;
-static bool thread_alive;
+
+// How many capture threads are alive, not whether one is. Leaving the mode
+// tells the thread to stop but does not wait for it -- the wait would be a read
+// long, on the interface thread -- so entering again a moment later finds the
+// previous one still winding down. It is allowed to: the new session takes a
+// number of its own, and the old thread finds its number is no longer the
+// current one and leaves without touching anything.
+static int threads_alive;
+static unsigned session_id;
 static btreceiver_state_t state;
 static unsigned serial;
 static uint32_t last_frame_ms;
@@ -180,7 +216,7 @@ static snd_pcm_t *open_capture(const char *mac, unsigned rate, unsigned channels
 	snd_pcm_format_t format = (bits == 32) ? SND_PCM_FORMAT_S32_LE : SND_PCM_FORMAT_S16_LE;
 	err = snd_pcm_set_params(pcm, format, SND_PCM_ACCESS_RW_INTERLEAVED, (unsigned)channels, (unsigned)rate,
 							 0, // no resampling: the rate is the sender's and has to stay it
-							 CAPTURE_LATENCY_US);
+							 (unsigned)capture_ms() * 1000u);
 	if (err < 0) {
 		fprintf(stderr, "btreceiver: %u Hz %u ch %u bit refused: %s\n", rate, channels, bits, snd_strerror(err));
 		snd_pcm_close(pcm);
@@ -219,7 +255,7 @@ typedef enum {
 // have opened and stayed silent, so a sender that is simply not playing -- or
 // one whose AVRCP status lies -- does not get the PCM pulled out from under it
 // every three seconds for ever.
-static session_t capture_session(const char *mac, const char *name, bool may_guess, bool watchdog,
+static session_t capture_session(const char *mac, const char *name, bool may_guess, bool watchdog, unsigned session,
 								 bool *heard_out) {
 	*heard_out = false;
 
@@ -245,12 +281,13 @@ static session_t capture_session(const char *mac, const char *name, bool may_gue
 	// 32 is the path the hardware is known to take.
 	bool widen = false;
 	bool opened = false;
+	int buffer_ms = output_ms();
 	if (in_bits == 16) {
-		opened = audio_external_begin((int)rate, (int)channels, 32);
+		opened = audio_external_begin_latency((int)rate, (int)channels, 32, buffer_ms);
 		widen = opened;
 	}
 	if (!opened) {
-		opened = audio_external_begin((int)rate, (int)channels, (int)in_bits);
+		opened = audio_external_begin_latency((int)rate, (int)channels, (int)in_bits, buffer_ms);
 	}
 	if (!opened) {
 		fprintf(stderr, "btreceiver: the output would not take %u Hz %u bit\n", rate, in_bits);
@@ -285,7 +322,7 @@ static session_t capture_session(const char *mac, const char *name, bool may_gue
 
 	for (;;) {
 		pthread_mutex_lock(&lock);
-		bool go = running;
+		bool go = running && session == session_id;
 		pthread_mutex_unlock(&lock);
 		if (!go) {
 			break;
@@ -431,7 +468,9 @@ static bool still_there(char *mac, size_t mac_size, char *name, size_t name_size
 }
 
 static void *capture_worker(void *arg) {
-	(void)arg;
+	// The number this visit to the mode was given. Anything this thread does to
+	// the shared state is conditional on it still being the current one.
+	const unsigned session = (unsigned)(uintptr_t)arg;
 	// Not background: this thread IS the playback path while the mode is on, and
 	// a capture PCM that is not drained on time overruns, which is heard as
 	// stuttering rather than as a delay. SCHED_IDLE yields to anything else on
@@ -489,7 +528,7 @@ static void *capture_worker(void *arg) {
 		// the PCM every three seconds would only keep it silent.
 		bool heard = false;
 		bool watchdog = silent_runs < SILENT_RUNS_MAX;
-		session_t result = capture_session(mac, name, what == REOPEN_GUESS, watchdog, &heard);
+		session_t result = capture_session(mac, name, what == REOPEN_GUESS, watchdog, session, &heard);
 		if (heard) {
 			silent_runs = 0;
 		} else if (watchdog) {
@@ -504,7 +543,7 @@ static void *capture_worker(void *arg) {
 		}
 
 		pthread_mutex_lock(&lock);
-		bool go = running;
+		bool go = running && session == session_id;
 		last_frame_ms = 0;
 		touch();
 		pthread_mutex_unlock(&lock);
@@ -529,14 +568,18 @@ static void *capture_worker(void *arg) {
 
 done:
 	pthread_mutex_lock(&lock);
-	last_frame_ms = 0;
-	// A loop that ended on its own -- the sender went away, the stream would
-	// not open -- takes the mode down with it, so the page does not show a
-	// receiver that is not receiving.
-	state.active = false;
-	running = false;
-	thread_alive = false;
-	touch();
+	threads_alive--;
+	// Only the thread that is still the current session speaks for the mode. An
+	// older one finishing must not take down the session that replaced it.
+	if (session == session_id) {
+		last_frame_ms = 0;
+		// A loop that ended on its own -- the sender went away, the stream would
+		// not open -- takes the mode down with it, so the page does not show a
+		// receiver that is not receiving.
+		state.active = false;
+		running = false;
+		touch();
+	}
 	pthread_mutex_unlock(&lock);
 	fprintf(stderr, "btreceiver: the capture thread has finished\n");
 	return NULL;
@@ -544,7 +587,10 @@ done:
 
 bool btreceiver_start(void) {
 	pthread_mutex_lock(&lock);
-	if (state.active || thread_alive) {
+	// A session that is up, rather than a thread that exists: a thread still
+	// closing its handles from the previous visit is not a running receiver,
+	// and treating it as one is what left the mode dead on a quick re-entry.
+	if (state.active && running) {
 		pthread_mutex_unlock(&lock);
 		return true;
 	}
@@ -562,15 +608,16 @@ bool btreceiver_start(void) {
 	memset(&state, 0, sizeof(state));
 	state.active = true;
 	running = true;
-	thread_alive = true;
+	unsigned mine = ++session_id;
+	threads_alive++;
 	touch();
 	pthread_mutex_unlock(&lock);
 
-	if (pthread_create(&thread, NULL, capture_worker, NULL) != 0) {
+	if (pthread_create(&thread, NULL, capture_worker, (void *)(uintptr_t)mine) != 0) {
 		pthread_mutex_lock(&lock);
 		state.active = false;
 		running = false;
-		thread_alive = false;
+		threads_alive--;
 		snprintf(state.error, sizeof(state.error), "%s", tr("btreceiver_not_enough_memory"));
 		touch();
 		pthread_mutex_unlock(&lock);
@@ -582,7 +629,7 @@ bool btreceiver_start(void) {
 
 void btreceiver_stop(void) {
 	pthread_mutex_lock(&lock);
-	bool was = state.active || thread_alive;
+	bool was = state.active || threads_alive > 0;
 	running = false;
 	state.active = false;
 	// Nothing of the sender survives the mode: what is left here is read by the

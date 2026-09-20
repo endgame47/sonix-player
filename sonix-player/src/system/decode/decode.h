@@ -50,12 +50,6 @@ typedef struct decoder decoder_t;
 // Determine which decoder (if any) handles this file, based on its extension.
 decode_format_t decode_detect_format(const char *filepath);
 
-// Which route a DSD file takes: 0 = DoP (the DAC does the work, bit-exact),
-// 1 = converted to PCM here. Applies to files opened after the call, so
-// changing it mid-track does nothing until the next one.
-void decode_set_dsd_output(int pcm);
-int decode_get_dsd_output(void);
-
 // Opens a decoder for the given file/format. Returns NULL on failure.
 decoder_t *decoder_open(const char *filepath, decode_format_t format);
 

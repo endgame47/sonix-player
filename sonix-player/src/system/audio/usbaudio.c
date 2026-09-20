@@ -32,6 +32,7 @@ static int active_card = -1;			// the USB card in use, -1 when none
 static char active_name[64];			// its id, for the interface
 static char volume_control[64];			// the control the level is written to
 static long volume_min, volume_max;
+static unsigned int volume_count = 1; // how many channels that control carries
 
 // Whether the port is set to dual role right now. The attribute lists the types
 // it supports and brackets the one in force, so "[dual] source sink" is dual and
@@ -214,9 +215,13 @@ static void read_card_id(int card, char *out, size_t out_size) {
 // USB audio devices name it themselves -- "PCM Playback Volume" is the usual
 // one, but headsets ship "Speaker Playback Volume" and "Headphone Playback
 // Volume" too -- so the control is found by shape rather than by name: the
-// first integer control whose name ends in "Playback Volume". Its range comes
-// with it, because a USB device's range is its own and nothing like the
-// CS43198's 0..255.
+// first integer control whose name ends in "Playback Volume". Its range and
+// its channel count come with it, because a USB device's are its own and
+// nothing like the CS43198's.
+//
+// Writable is part of the shape. A control that only reports a level is not a
+// volume control for this purpose, and taking it for one would stand the
+// software attenuation down in favour of something that cannot move.
 static void find_volume_control(int card) {
 	snd_ctl_t *ctl;
 	snd_ctl_elem_list_t *list;
@@ -224,6 +229,7 @@ static void find_volume_control(int card) {
 
 	volume_control[0] = '\0';
 	volume_min = volume_max = 0;
+	volume_count = 1;
 
 	snprintf(name, sizeof(name), "hw:%d", card);
 	if (snd_ctl_open(&ctl, name, 0) < 0) {
@@ -251,7 +257,8 @@ static void find_volume_control(int card) {
 		snd_ctl_elem_list_get_id(list, i, id);
 		snd_ctl_elem_info_set_id(info, id);
 		if (snd_ctl_elem_info(ctl, info) < 0 ||
-			snd_ctl_elem_info_get_type(info) != SND_CTL_ELEM_TYPE_INTEGER) {
+			snd_ctl_elem_info_get_type(info) != SND_CTL_ELEM_TYPE_INTEGER ||
+			!snd_ctl_elem_info_is_writable(info)) {
 			continue;
 		}
 
@@ -265,18 +272,38 @@ static void find_volume_control(int card) {
 		snprintf(volume_control, sizeof(volume_control), "%s", elem);
 		volume_min = snd_ctl_elem_info_get_min(info);
 		volume_max = snd_ctl_elem_info_get_max(info);
+		volume_count = snd_ctl_elem_info_get_count(info);
+		if (volume_count < 1 || volume_count > 8) {
+			volume_count = 1;
+		}
 	}
 
 	snd_ctl_elem_list_free_space(list);
 	snd_ctl_close(ctl);
 
 	if (volume_control[0]) {
-		fprintf(stderr, "usbaudio: volume goes to '%s' (%ld..%ld)\n", volume_control, volume_min, volume_max);
+		fprintf(stderr, "usbaudio: volume goes to '%s' (%ld..%ld, %u ch)\n", volume_control, volume_min,
+				volume_max, volume_count);
 	} else {
 		fprintf(stderr, "usbaudio: the device has no playback volume control\n");
 	}
 }
 
+// Hands the level to the device's own control, and checks that it landed.
+//
+// A dongle that publishes a Feature Unit it does not implement takes the write
+// and stays where it was, and there is nothing in the return code to say so.
+// Left unchecked that is the worst failure this player has: the software
+// attenuation stands down for a control that does nothing, and the stream
+// reaches a pair of headphones at full scale with the volume keys moving a
+// number on the screen and nothing else.
+//
+// So the value is read back. A driver is allowed to round it -- a control with
+// eight steps will -- and that is not a failure; sitting at the top of its
+// range after being asked for the bottom half is. When that happens the
+// control is given up and swvolume.c takes the level over from the next block
+// of samples, which is a degree of attenuation in software rather than none at
+// all in hardware.
 void usbaudio_apply_volume(int percent) {
 	if (active_card < 0 || !volume_control[0] || volume_max <= volume_min) {
 		return;
@@ -306,12 +333,40 @@ void usbaudio_apply_volume(int percent) {
 	snd_ctl_elem_id_set_interface(id, SND_CTL_ELEM_IFACE_MIXER);
 	snd_ctl_elem_id_set_name(id, volume_control);
 	snd_ctl_elem_value_set_id(elem, id);
-	// Both channels: a stereo control takes two values and writing only the
-	// first leaves the right ear where it was.
-	snd_ctl_elem_value_set_integer(elem, 0, value);
-	snd_ctl_elem_value_set_integer(elem, 1, value);
-	snd_ctl_elem_write(ctl, elem);
+	// Every channel the control carries, and no more: writing two values to a
+	// mono control is harmless but writing one to a stereo control leaves the
+	// right ear where it was.
+	for (unsigned int c = 0; c < volume_count; c++) {
+		snd_ctl_elem_value_set_integer(elem, c, value);
+	}
+
+	int wrote = snd_ctl_elem_write(ctl, elem);
+	long back = value;
+	if (wrote >= 0) {
+		snd_ctl_elem_value_t *check;
+		snd_ctl_elem_value_alloca(&check);
+		snd_ctl_elem_value_set_id(check, id);
+		if (snd_ctl_elem_read(ctl, check) >= 0) {
+			back = snd_ctl_elem_value_get_integer(check, 0);
+		}
+	}
 	snd_ctl_close(ctl);
+
+	// Asked for something below the top and still sitting at the top. The slack
+	// is never zero: on a control with only a few steps, max - 0 would read as
+	// "stuck" the moment the level really is the maximum.
+	long slack = span / 20;
+	if (slack < 1) {
+		slack = 1;
+	}
+	bool stuck = value <= volume_max - slack && back >= volume_max - slack;
+	if (wrote < 0 || stuck) {
+		fprintf(stderr,
+				"usbaudio: '%s' did not take %d%% (asked %ld, reads %ld); the level goes to the samples "
+				"instead\n",
+				volume_control, percent, value, back);
+		volume_control[0] = '\0';
+	}
 }
 
 // Who the port belongs to.
@@ -395,9 +450,14 @@ void usbaudio_poll(void) {
 		card_device_path(card, where, sizeof(where));
 		fprintf(stderr, "usbaudio: card%d '%s' at %s; playback goes to %s\n", card, active_name, where, pcm);
 
+		// The level before the route, and not after it: between the two calls
+		// the sound is already leaving over the port, and a device fresh off
+		// the bus sits at whatever its own default is -- which for a dongle is
+		// the top of its range. The other order puts a full-scale burst into a
+		// pair of headphones somebody is wearing.
 		find_volume_control(card);
-		audio_set_output_device(pcm);
 		usbaudio_apply_volume(get_volume_percent());
+		audio_set_output_device(pcm);
 	} else {
 		active_name[0] = '\0';
 		volume_control[0] = '\0';

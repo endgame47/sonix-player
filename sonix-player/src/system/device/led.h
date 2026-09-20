@@ -43,10 +43,25 @@
 // released, power-on aqua (pattern 1).
 void led_init(void);
 
-// Red breathing while on the charger, overriding the playback colour like
-// the stock player does. Cheap to call repeatedly: it only writes when the
-// resolved pattern changes.
+// Red breathing while a charge is actually going in, overriding the playback
+// colour like the stock player does. Not "a cable is in": a battery at 100%%,
+// or held at the configured charge limit, has nothing left to indicate and the
+// LED goes back to whatever it would be showing with no cable -- the playback
+// colour, a mode's colour, or the idle aqua. The red is an override on top of
+// the rest, not a state of its own.
+//
+// Cheap to call repeatedly: it only writes when the resolved pattern changes.
+// But the caller must hand it a settled answer -- the pattern is a ramp
+// programmed into the LED controller, and rewriting it restarts the ramp, so a
+// reading that flaps comes out as a red that stutters.
 void led_set_charging(bool charging);
+
+// Whether a cable is supplying at all, charge finished or not. It does not
+// light anything by itself; what it does is keep the darken-in-standby option
+// off the LED. Without it a player left plugged in overnight answers the end of
+// its charge by going dark -- the red stops having anything to say and the
+// standby option, whose window ran out hours ago, takes the LED straight out.
+void led_set_on_charger(bool present);
 
 // Picks the pattern for what is playing (shown when not charging). `playing`
 // false or rate 0 falls back to the idle aqua. `podcast` true paints the
@@ -92,10 +107,5 @@ void led_set_idle_off(bool enabled);
 // Screen state, fed by power.c: the standby option only ever darkens the LED
 // while the screen is off. Waking restarts the idle window.
 void led_set_standby(bool standby);
-
-// Charge-complete, fed by the battery poll: battery at 100%% or at the
-// configured charge limit. Turns the charging red off -- the LED goes dark
-// on the charger once there is nothing left to indicate.
-void led_set_charge_full(bool full);
 
 #endif /* LED_H */

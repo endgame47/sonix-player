@@ -49,6 +49,11 @@ void back_btn_over_cover(bool over_cover);
 // own). 0 puts it back in place.
 void back_btn_translate(int32_t x);
 
+// Where the chevron's middle sits while the player is open, from the top of the
+// screen. For a page that wants to put something of its own on the same line as
+// the way back -- the player's Studio arrangement puts the ellipsis there.
+int back_btn_centre_y(void);
+
 // Re-asserts the chevron's visibility against the page actually on screen:
 // hidden on the main menu and the scan pages, shown everywhere else. Cheap and
 // idempotent, and called from every animation-completion path, since otherwise
@@ -59,6 +64,11 @@ void back_btn_sync_visibility(void);
 // does not belong to LVGL -- Gearboy while a game runs: the arrow would only be
 // drawn, since the screen belongs to the emulator at that moment.
 void back_btn_force_hidden(bool hidden);
+
+// Suspends the drag-to-go-back gesture. For a page that owns the whole panel
+// and needs horizontal touch for itself: a Lua app running full screen, where
+// a sideways drag is the app's input, not a request to leave.
+void back_gesture_blocked(bool blocked);
 
 // Marks `screen` as having been opened from the player's own menu: backing
 // out of it reopens the player instead of just popping the history. Cleared

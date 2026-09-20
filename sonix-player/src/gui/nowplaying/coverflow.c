@@ -1437,7 +1437,7 @@ static bool sheet_prepare(void) {
 		return true;
 	}
 	if (!library_is_open()) {
-		gui_notify_popup("usb_storage_shared");
+		gui_notify_no_card();
 		return false;
 	}
 	if (!buffers_alloc()) {

@@ -768,6 +768,8 @@ static void check_and_mount_existing_sd(storage_config_t *storage_cfg, const sys
 // the state the first had already cleared.
 static bool card_attached = true; // the card is mounted before this thread starts
 
+bool storage_card_attached(void) { return card_attached; }
+
 static void card_databases_detach(void) {
 	if (!card_attached) {
 		return;
@@ -779,6 +781,10 @@ static void card_databases_detach(void) {
 	// from boot -- so without this the card is busy essentially always, the
 	// unmount fails, and the dead mount blocks the next card. The USB export
 	// does the same (usb.c: storage_export).
+	//
+	// Where the track was, first of all: the stop below is what the next press
+	// of play would otherwise read as "the track ended, start it again".
+	device_state_note_storage_gone();
 	audio_stop();
 
 	logging_suspend_for_usb(); // closes the on-card log file
@@ -944,7 +950,7 @@ void *sd_hotplug_thread(void *arg) {
 				}
 
 				if (mounted) {
-					send_notification(runtime, "SD Card Inserted");
+					send_notification(runtime, "sd_card_inserted");
 					card_databases_attach(sd_root);
 				} else {
 					fprintf(stderr, "storage: the card would not mount after the insert\n");
@@ -960,7 +966,7 @@ void *sd_hotplug_thread(void *arg) {
 				unmount_sd(storage_cfg);
 				pthread_mutex_unlock(&card_lock);
 				if (was_attached) {
-					send_notification(runtime, "SD Card Removed");
+					send_notification(runtime, "sd_card_removed");
 				}
 			}
 		}

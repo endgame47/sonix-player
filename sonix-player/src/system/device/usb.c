@@ -24,6 +24,7 @@
 #include "src/gui/library/browser.h"
 #include "src/gui/shell/gui.h"
 #include "src/system/audio/audio.h"
+#include "src/system/playback/device_state.h"
 
 
 // The ADB init script (S440adb) builds its own gadget under this directory
@@ -581,6 +582,10 @@ static void storage_export(void) {
 	// Playback reads from the card; the library and the audiobook index hold
 	// open databases on it; the log usually *is* on it -- and an open
 	// descriptor makes the unmount fail. Release everything before trying.
+	//
+	// Where the track was, first of all: the stop below is what the next press
+	// of play would otherwise read as "the track ended, start it again".
+	device_state_note_storage_gone();
 	audio_stop();
 	library_close();
 	audiobookdb_close();

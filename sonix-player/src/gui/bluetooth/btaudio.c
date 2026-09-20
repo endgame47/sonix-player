@@ -8,6 +8,8 @@
 #include "src/gui/bluetooth/airpodspage.h"
 #include "src/gui/fonts/fonts.h"
 #include "src/gui/shell/gui.h"
+#include "src/gui/shell/icons.h"
+#include "src/gui/shell/keyboard.h"
 #include "src/gui/nowplaying/player.h"
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/switcher.h"
@@ -271,7 +273,13 @@ static void volume_toggle_cb(lv_event_t *e) {
 	bluetooth_set_volume_sync(lv_obj_has_state(volume_switch, LV_STATE_CHECKED));
 }
 
+static void refresh_name_row(void);
+
 static void refresh_page(void) {
+	// The name is read from the firmware's file at startup and can be changed
+	// from this page, so it is re-read here rather than written once.
+	refresh_name_row();
+
 	bt_device_t device;
 	bool connected = bluetooth_connected_device(&device);
 
@@ -375,9 +383,125 @@ static void screen_loaded_cb(lv_event_t *e) {
 	lv_timer_resume(poll_timer);
 }
 
+static void name_layer_hide(void);
+
 static void screen_unloaded_cb(lv_event_t *e) {
 	(void)e;
+	// Leaving the page puts the rename sheet away: coming back to a keyboard
+	// nobody asked for is a page that looks stuck.
+	name_layer_hide();
 	lv_timer_pause(poll_timer);
+}
+
+// The player's own Bluetooth name, and the sheet that changes it: a field and a
+// keyboard over the page, the same shape the preset and playlist names use.
+#define NAME_CANCEL_SIZE 56
+
+static lv_obj_t *name_row_value;
+static lv_obj_t *name_layer;
+static lv_obj_t *name_field;
+static keyboard_t *name_keyboard;
+
+// ---------------------------------------------------------------------------
+// the name
+// ---------------------------------------------------------------------------
+
+static void refresh_name_row(void) {
+	if (name_row_value) {
+		lv_label_set_text(name_row_value, bluetooth_local_name());
+	}
+}
+
+static void name_layer_hide(void) {
+	if (name_layer) {
+		lv_obj_add_flag(name_layer, LV_OBJ_FLAG_HIDDEN);
+	}
+	back_btn_force_hidden(false);
+}
+
+static void name_cancel_cb(lv_event_t *e) {
+	(void)e;
+	name_layer_hide();
+}
+
+static void name_accept_cb(lv_event_t *e) {
+	(void)e;
+
+	const char *typed = lv_textarea_get_text(name_field);
+	if (!bluetooth_set_local_name(typed ? typed : "")) {
+		gui_notify_popup("name_required");
+		return;
+	}
+
+	name_layer_hide();
+	refresh_name_row();
+	toast_success("bt_name_changed");
+}
+
+static void name_row_cb(lv_event_t *e) {
+	(void)e;
+	if (switcher_back_drag_active() || !name_layer) {
+		return;
+	}
+	lv_textarea_set_text(name_field, bluetooth_local_name());
+	keyboard_reset(name_keyboard);
+	lv_obj_remove_flag(name_layer, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_move_foreground(name_layer);
+	// The sheet has its own close in the corner, and the chevron under it would
+	// leave the page without putting the keyboard away.
+	back_btn_force_hidden(true);
+}
+
+static void build_name_layer(gui_config_t *cfg) {
+	name_layer = lv_obj_create(btaudio_screen);
+	lv_obj_set_size(name_layer, lv_pct(100), lv_pct(100));
+	lv_obj_align(name_layer, LV_ALIGN_TOP_LEFT, 0, 0);
+	lv_obj_add_style(name_layer, &theme_style_screen, 0);
+	lv_obj_set_style_bg_opa(name_layer, LV_OPA_COVER, 0);
+	lv_obj_set_style_border_width(name_layer, 0, 0);
+	lv_obj_set_style_radius(name_layer, 0, 0);
+	lv_obj_set_style_pad_all(name_layer, 0, 0);
+	lv_obj_remove_flag(name_layer, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_add_flag(name_layer, LV_OBJ_FLAG_HIDDEN);
+
+	lv_obj_t *heading = lv_label_create(name_layer);
+	lv_label_set_text(heading, tr("bt_rename"));
+	lv_obj_add_style(heading, &theme_style_text, 0);
+	lv_obj_set_style_text_font(heading, &font_ui_24, 0);
+	lv_obj_align(heading, LV_ALIGN_TOP_LEFT, cfg->padding, cfg->padding + cfg->top_bar_height + 10);
+
+	lv_obj_t *cancel = lv_btn_create(name_layer);
+	lv_obj_set_size(cancel, NAME_CANCEL_SIZE, NAME_CANCEL_SIZE);
+	lv_obj_align(cancel, LV_ALIGN_TOP_RIGHT, -cfg->padding, cfg->padding + cfg->top_bar_height);
+	lv_obj_set_style_bg_opa(cancel, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_border_width(cancel, 0, 0);
+	lv_obj_set_style_shadow_width(cancel, 0, 0);
+	lv_obj_set_style_pad_all(cancel, 0, 0);
+	lv_obj_add_event_cb(cancel, name_cancel_cb, LV_EVENT_CLICKED, NULL);
+
+	lv_obj_t *cancel_icon = lv_image_create(cancel);
+	lv_image_set_src(cancel_icon, &icon_close);
+	lv_obj_add_style(cancel_icon, &theme_style_icon, 0);
+	lv_obj_center(cancel_icon);
+
+	name_field = lv_textarea_create(name_layer);
+	lv_textarea_set_one_line(name_field, true);
+	// One under the adapter's own limit, so a name that fits the field is a
+	// name the adapter will take whole.
+	lv_textarea_set_max_length(name_field, BT_NAME_MAX - 1);
+	lv_textarea_set_placeholder_text(name_field, tr("name"));
+	lv_obj_set_size(name_field, cfg->screen_width - 2 * cfg->padding, 62);
+	lv_obj_set_scrollbar_mode(name_field, LV_SCROLLBAR_MODE_OFF);
+	lv_obj_align(name_field, LV_ALIGN_TOP_LEFT, cfg->padding, cfg->padding + cfg->top_bar_height + 60);
+	lv_obj_add_style(name_field, &theme_style_card, 0);
+	lv_obj_set_style_radius(name_field, 12, 0);
+	lv_obj_set_style_border_width(name_field, 0, 0);
+	lv_obj_set_style_shadow_width(name_field, 0, 0);
+	lv_obj_set_style_pad_all(name_field, 14, 0);
+	lv_obj_set_style_text_font(name_field, &font_ui_24, 0);
+	keyboard_style_caret(name_field);
+
+	name_keyboard = keyboard_create(name_layer, cfg->screen_width, 316, name_field, NULL, "ok", name_accept_cb, NULL);
 }
 
 void btaudio_init(gui_config_t *cfg) {
@@ -387,6 +511,10 @@ void btaudio_init(gui_config_t *cfg) {
 	// no "output" row: the stock player has none of the three. Connected
 	// headphones are the output, and which ones they are is written on the
 	// Bluetooth page itself.
+
+	// The player's own name, first: it is about this device rather than about
+	// whatever is connected to it.
+	settingsrow_add(container, "bt_rename", &name_row_value, name_row_cb, NULL);
 
 	// The AirPods row, above the codec: it is about the headphones themselves
 	// rather than about the link, and it is the one row here that is not
@@ -426,6 +554,8 @@ void btaudio_init(gui_config_t *cfg) {
 	lv_obj_add_event_cb(btaudio_screen, screen_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
 	lv_obj_add_event_cb(btaudio_screen, screen_unloaded_cb, LV_EVENT_SCREEN_UNLOADED, NULL);
 	switcher_attach_back_gesture(btaudio_screen);
+
+	build_name_layer(cfg);
 
 	refresh_page();
 }

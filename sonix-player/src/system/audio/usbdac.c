@@ -63,6 +63,29 @@ struct uac_format {
 // gap, far shorter than a person notices.
 #define IDLE_CLOSE_MS 1500
 
+// How deep the output buffer is, and therefore how far behind the computer the
+// socket runs.
+//
+// Left to itself audio.c opens eight periods of 4096 frames -- 32768 frames,
+// which is two thirds of a second at 48 kHz -- and the stream only starts once
+// the whole buffer is full, so that depth IS the delay, start to finish. That
+// sizing is for local playback, where the decoding thread can stall for most of
+// a second while a big cover is read off the card. Nothing here can: the samples
+// arrive from the host at the rate the host clocks them, ten milliseconds at a
+// time, and the only thing between the cable and the DAC is one read and one
+// write.
+//
+// Lower is tighter and closer to an underrun, which on this path is a click
+// rather than a stall. [usb] dac_output_ms moves it.
+#define OUTPUT_MS_DEFAULT 80
+#define OUTPUT_MS_MIN 20
+#define OUTPUT_MS_MAX 500
+
+static int output_ms(void) {
+	int ms = (int)config_get_int("usb", "dac_output_ms", OUTPUT_MS_DEFAULT);
+	return ms < OUTPUT_MS_MIN ? OUTPUT_MS_MIN : (ms > OUTPUT_MS_MAX ? OUTPUT_MS_MAX : ms);
+}
+
 // Ten milliseconds of audio, sized the way the stock player sizes it:
 // rate * 8 / 100 bytes, eight bytes per frame -- stereo, 32 bits a sample --
 // rounded up to a multiple of eight so a frame is never split.
@@ -388,10 +411,10 @@ static void gadget_teardown(void) {
 static void apply_charging(void) {
 	bool on = usbdac_charging_enabled();
 
-	// power.c owns the charger, and holding it off takes three writes in order
-	// (constant_charge_current_max, charge_control_limit_max,
-	// input_current_limited). On this driver a 0 in charge_control_limit_max
-	// means fast charge, not no charge, so that node alone will not do it.
+	// power.c owns the charger. It stops charging through the driver's
+	// step-charging bit, which leaves the input path feeding the system -- so
+	// the player carries on running from the cable with the battery untouched,
+	// which is the whole point here.
 	power_set_charging_allowed(on);
 
 	// Say so where the user looks: with the charger off the battery icon and
@@ -519,7 +542,7 @@ static void *audio_main(void *arg) {
 				output_open = false;
 			}
 			// DSD is handed to the DAC as it comes; the chip does the rest.
-			output_open = audio_external_begin(fmt.rate, 2, dsd ? 32 : bits);
+			output_open = audio_external_begin_latency(fmt.rate, 2, dsd ? 32 : bits, output_ms());
 			if (!output_open) {
 				// Say so, but keep reading: the gadget's OUT endpoint has to
 				// go on being drained or the host sees a device that stopped
@@ -535,8 +558,8 @@ static void *audio_main(void *arg) {
 			// 32-bit words -- that is why the page says 32 whatever the Mac is
 			// set to -- but if this number moves when the host setting changes,
 			// it is the one to map.
-			printf("usbdac: host is sending %d Hz, %s (format=%d flags=%d)\n", fmt.rate,
-				   dsd ? "DSD" : "32 bit PCM", fmt.format, fmt.flags);
+			printf("usbdac: host is sending %d Hz, %s (format=%d flags=%d), output buffer %d ms\n", fmt.rate,
+				   dsd ? "DSD" : "32 bit PCM", fmt.format, fmt.flags, output_ms());
 			pthread_mutex_lock(&lock);
 			state.streaming = true;
 			state.sample_rate = fmt.rate;

@@ -12,18 +12,6 @@
 
 lv_obj_t *powersettings_screen;
 
-// Blanking this panel powers its touch controller down with it, so the only
-// way back is the power key. Thirty seconds is the default; "never" is there
-// for anyone who would rather not be caught out by it.
-static const struct {
-	int seconds;
-	const char *label;
-} SCREEN_OFF[] = {
-	{0, "power_never"}, {30, "power_30_seconds"}, {60, "power_1_minute"}, {120, "power_2_minutes"}, {300, "power_5_minutes"},
-};
-#define SCREEN_OFF_COUNT ((int)(sizeof(SCREEN_OFF) / sizeof(SCREEN_OFF[0])))
-#define SCREEN_OFF_DEFAULT 30
-
 // 80 to 100 in fives. Stopping short of full is what keeps a lithium cell
 // healthy if the device mostly lives on the charger.
 #define CHARGE_LIMIT_MIN 80
@@ -38,7 +26,6 @@ static const struct {
 };
 #define AUTO_OFF_COUNT ((int)(sizeof(AUTO_OFF) / sizeof(AUTO_OFF[0])))
 
-static lv_obj_t *screen_off_value, *screen_off_slider;
 static lv_obj_t *charge_value, *charge_slider;
 static lv_obj_t *auto_off_switch, *auto_off_value, *auto_off_slider, *auto_off_card;
 static lv_obj_t *led_on_switch, *led_off_switch, *led_off_card;
@@ -46,16 +33,6 @@ static lv_obj_t *standby_switch;
 static lv_obj_t *charge_note;
 
 // --- reading the saved values ---
-
-static int screen_off_index(void) {
-	int seconds = (int)config_get_int("power", "screen_off_seconds", SCREEN_OFF_DEFAULT);
-	for (int i = 0; i < SCREEN_OFF_COUNT; i++) {
-		if (SCREEN_OFF[i].seconds == seconds) {
-			return i;
-		}
-	}
-	return 1; // the 30 second default
-}
 
 static int charge_index(void) {
 	int percent = (int)config_get_int("power", "charge_limit", 100);
@@ -82,10 +59,6 @@ static int auto_off_index(void) {
 // --- applying them ---
 
 void powersettings_apply(void) {
-	int seconds = SCREEN_OFF[screen_off_index()].seconds;
-	power_set_screen_off_timeout((uint32_t)seconds * 1000);
-	power_set_screen_off_enabled(seconds > 0);
-
 	power_set_charge_limit(CHARGE_LIMIT_MIN + (charge_index() * CHARGE_LIMIT_STEP));
 
 	power_set_auto_off(config_get_bool("power", "auto_off", false), (uint32_t)AUTO_OFF[auto_off_index()].minutes);
@@ -102,7 +75,6 @@ void powersettings_apply(void) {
 }
 
 static void refresh_labels(void) {
-	lv_label_set_text(screen_off_value, tr(SCREEN_OFF[screen_off_index()].label));
 	lv_label_set_text_fmt(charge_value, "%d%%", CHARGE_LIMIT_MIN + (charge_index() * CHARGE_LIMIT_STEP));
 	lv_label_set_text(auto_off_value, tr(AUTO_OFF[auto_off_index()].label));
 
@@ -144,15 +116,6 @@ static void refresh_labels(void) {
 		lv_obj_remove_state(auto_off_switch, LV_STATE_CHECKED);
 	}
 	settingsrow_toggle_slider_expanded(auto_off_card, auto_off);
-}
-
-static void screen_off_changed_cb(lv_event_t *e) {
-	(void)e;
-	int index = (int)lv_slider_get_value(screen_off_slider);
-	config_set_int("power", "screen_off_seconds", SCREEN_OFF[index].seconds);
-	config_save();
-	powersettings_apply();
-	refresh_labels();
 }
 
 static void charge_changed_cb(lv_event_t *e) {
@@ -211,13 +174,10 @@ static void standby_toggled_cb(lv_event_t *e) {
 void powersettings_init(gui_config_t *cfg) {
 	lv_obj_t *container = settingsrow_page(powersettings_screen, cfg, "power");
 
-	settingsrow_slider(container, "power_screen_off", SCREEN_OFF_COUNT, &screen_off_value, &screen_off_slider,
-					   screen_off_changed_cb);
-	lv_slider_set_value(screen_off_slider, screen_off_index(), LV_ANIM_OFF);
-
 	// Suspend-to-RAM standby: suspends the player shortly after the screen goes
-	// off to save battery, and playback resumes on wake. On by default. It sits
-	// right under the screen-off setting, which it depends on.
+	// off to save battery, and playback resumes on wake. On by default. What it
+	// waits for is the screen going dark, and that timeout lives on the Screen
+	// page, beside the brightness it belongs with.
 	settingsrow_toggle(container, "power_standby_mem", &standby_switch, standby_toggled_cb);
 	lv_obj_t *standby_note = lv_label_create(container);
 	lv_label_set_long_mode(standby_note, LV_LABEL_LONG_WRAP);

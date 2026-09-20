@@ -37,8 +37,11 @@
 #define BACKDROP_BRIGHTNESS_PCT 42
 
 static bool backdrop_light;
+static bool backdrop_upright;
 
 void cover_set_backdrop_light(bool light) { backdrop_light = light; }
+
+void cover_set_backdrop_upright(bool upright) { backdrop_upright = upright; }
 
 // ---------------------------------------------------------------------------
 // raw (decoded, RGB888) images
@@ -571,8 +574,12 @@ static bool make_backdrop(const raw_image_t *src, int box_w, int box_h, bool fro
 
 	// Flip while shrinking, so the stretch back up only has to interpolate and
 	// no separate flip pass is needed. Not for a bottom band: that one stands
-	// in for the pixels underneath it and has to face the same way.
-	uint8_t *small = resample_rgb(src, &crop, small_w, small_h, !from_bottom);
+	// in for the pixels underneath it and has to face the same way. Nor when
+	// the backdrop is the whole screen with the sleeve shown over it, where the
+	// two are plainly the same picture and one of them being upside down is the
+	// only thing anybody sees.
+	bool flip = !from_bottom && !backdrop_upright;
+	uint8_t *small = resample_rgb(src, &crop, small_w, small_h, flip);
 	if (!small)
 		return false;
 
