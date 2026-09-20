@@ -21,7 +21,11 @@
 // The card's own name for itself when the config carries no firmware_name.
 // The stock player reads it from key 7 ("device"); on this hardware that is
 // always R3PROII, so it is the fallback rather than a lookup.
-#define FIRMWARE_DEFAULT_DEVICE "R3PROII"
+#ifdef BOARD_R1
+	#define FIRMWARE_DEFAULT_DEVICE "R1"
+#else
+	#define FIRMWARE_DEFAULT_DEVICE "R3PROII"
+#endif
 
 // The card is scanned once and every name compared case-insensitively,
 // rather than guessing at spellings: FAT is case-insensitive but exFAT and
