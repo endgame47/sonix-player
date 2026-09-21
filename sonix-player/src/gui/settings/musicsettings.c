@@ -549,7 +549,7 @@ static void build_balance_page(gui_config_t *cfg) {
 
 static lv_obj_t *rg_switch;
 static lv_obj_t *rg_card, *rg_pills;
-static lv_obj_t *rg_track_pill, *rg_album_pill;
+static lv_obj_t *rg_track_pill, *rg_album_pill, *rg_track_when_shuffled_pill;
 
 static void rg_refresh(void) {
 	if (!rg_switch) {
@@ -567,6 +567,7 @@ static void rg_refresh(void) {
 	}
 	settingsrow_pill_active(rg_track_pill, mode == REPLAYGAIN_TRACK);
 	settingsrow_pill_active(rg_album_pill, mode == REPLAYGAIN_ALBUM);
+	settingsrow_pill_active(rg_track_when_shuffled_pill, mode == REPLAYGAIN_TRACK_WHEN_SHUFFLED);
 }
 
 // Whatever the setting becomes, the track already loaded has to be re-measured
@@ -1356,10 +1357,11 @@ static void build_playback_page(gui_config_t *cfg) {
 		lv_obj_add_state(gapless_switch, LV_STATE_CHECKED);
 	}
 
-	// ReplayGain: off, or corrected per track or per record.
+	// ReplayGain: off, corrected per track, corrected per album or corrected per track when shuffled.
 	rg_card = settingsrow_toggle_pills(container, "musicsettings_replay_gain", rg_toggle_cb, &rg_switch, &rg_pills);
 	rg_track_pill = settingsrow_pill(rg_pills, "track", REPLAYGAIN_TRACK, rg_pick_cb);
 	rg_album_pill = settingsrow_pill(rg_pills, "albums", REPLAYGAIN_ALBUM, rg_pick_cb);
+	rg_track_when_shuffled_pill = settingsrow_pill(rg_pills, "track_when_shuffled", REPLAYGAIN_TRACK_WHEN_SHUFFLED, rg_pick_cb);
 	rg_refresh();
 
 	// The fade at the two ends of a track: a page of its own because it carries

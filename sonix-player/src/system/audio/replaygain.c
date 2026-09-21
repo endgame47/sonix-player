@@ -1,6 +1,7 @@
 #include "replaygain.h"
 
 #include "src/system/core/config.h"
+#include "src/system/playback/playlist.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -22,7 +23,7 @@ static volatile double current_db;
 
 replaygain_mode_t replaygain_mode(void) {
 	long value = config_get_int("audio", "replaygain", REPLAYGAIN_OFF);
-	if (value != REPLAYGAIN_TRACK && value != REPLAYGAIN_ALBUM) {
+	if (value != REPLAYGAIN_TRACK && value != REPLAYGAIN_ALBUM && value != REPLAYGAIN_TRACK_WHEN_SHUFFLED) {
 		return REPLAYGAIN_OFF;
 	}
 	return (replaygain_mode_t)value;
@@ -42,6 +43,15 @@ void replaygain_load(const song_metadata_t *meta) {
 
 	if (!meta || mode == REPLAYGAIN_OFF) {
 		return;
+	}
+
+	if (mode == REPLAYGAIN_TRACK_WHEN_SHUFFLED) {
+		playback_mode_t playback_mode = (playback_mode_t)config_get_int("player", "playback_mode", 0);
+		if ( playback_mode == PLAYBACK_MODE_SHUFFLE || playback_mode == PLAYBACK_MODE_SHUFFLE_REPEAT ) {
+			mode = REPLAYGAIN_TRACK;
+		} else {
+			mode = REPLAYGAIN_ALBUM;
+		}
 	}
 
 	double db;
