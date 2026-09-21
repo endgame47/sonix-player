@@ -1,1 +1,17 @@
 .DS_Store
+
+sonix-player/rockbox-toolchain
+
+sonix-player/freetype*
+sonix-player/libogg*
+sonix-player/lvgl/
+sonix-player/opus*
+sonix-player/opusfile*
+sonix-player/tmp/
+sonix-player/wavpack*
+
+sonix-player/audio-target/
+sonix-player/build_target/
+
+sonix-player/compile_commands.json
+sonix-player/sonix_player

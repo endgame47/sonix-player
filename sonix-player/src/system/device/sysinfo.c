@@ -223,7 +223,11 @@ const char *sysinfo_serial_number(void) {
 	}
 	id[n] = '\0';
 	if (n == 8) {
-		snprintf(serial, sizeof(serial), "R3PII%s", id);
+		#ifdef BOARD_R1
+			snprintf(serial, sizeof(serial), "R1%s", id);
+		#else
+			snprintf(serial, sizeof(serial), "R3PII%s", id);
+		#endif
 	}
 	return serial;
 }
