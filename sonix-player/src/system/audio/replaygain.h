@@ -13,17 +13,20 @@
 // an analysis pass over a card of music is minutes of work this device should
 // not be doing.
 //
-// Three states, the same three the stock player offers
+// Four states, the same three the stock player offers and an extra option
 // (`settings_replaygain_vg_off` / `_track` / `_album` in its binary): off, per
-// track, per album. Track and album are not degrees of strictness: correcting
-// each track of a record separately flattens a movement the producer meant to
-// be quiet, so an album is corrected by one figure and a shuffle by each
-// track's own.
+// track, per album, track when shuffled. Track and album are not degrees of 
+// strictness: correcting each track of a record separately flattens a movement 
+// the producer meant to be quiet, so an album is corrected by one figure and a 
+// shuffle by each track's own.
+// 'Track when shuffled' uses track gain if shuffle mode is on, album gain 
+// otherwise.
 
 typedef enum {
 	REPLAYGAIN_OFF = 0,
 	REPLAYGAIN_TRACK = 1,
 	REPLAYGAIN_ALBUM = 2,
+	REPLAYGAIN_TRACK_WHEN_SHUFFLED = 3,
 } replaygain_mode_t;
 
 replaygain_mode_t replaygain_mode(void);

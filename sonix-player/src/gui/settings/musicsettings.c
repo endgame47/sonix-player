@@ -89,6 +89,14 @@ static void build_filter_page(gui_config_t *cfg) {
 	switcher_attach_back_gesture(dacfilter_screen);
 }
 
+// ---------------------------------------------------------------------------
+// DRE: the DAC's Dynamic Range Enhancement, the ALSA "DRE_EN" switch the
+// stock player writes (decompile FUN_00482120), applied at boot and on the
+// toggle.
+// ---------------------------------------------------------------------------
+
+static lv_obj_t *dre_switch;
+
 // Gapless: local music only. A stream (radio, Qobuz while downloading) has no
 // "next track" ready to hand, and the emulator has a PCM of its own. The
 // switch tells the audio engine how to behave at track boundaries; anything
@@ -103,41 +111,25 @@ static void gapless_toggle_cb(lv_event_t *e) {
 	audio_set_gapless(on);
 }
 
-// ---------------------------------------------------------------------------
-// DRE: the DAC's Dynamic Range Enhancement, the ALSA "DRE_EN" switch the
-// stock player writes (decompile FUN_00482120), applied at boot and on the
-// toggle.
-// ---------------------------------------------------------------------------
+static void dre_toggle_cb(lv_event_t *e) {
+	(void)e;
+	bool on = lv_obj_has_state(dre_switch, LV_STATE_CHECKED);
+	config_set_int("audio", "dac_dre", on ? 1 : 0);
+	config_save();
+	set_dac_dre(on ? 1 : 0);
+}
 
-#ifdef BOARD_R1
-	// R1 does not have the DRE_EN option in amixer
-#else
-	static lv_obj_t *dre_switch;
+// NOS: the DAC's non-oversampling mode, ALSA "NOS_EN" like the stock player
+// (decompile FUN_004820e0).
+static lv_obj_t *nos_switch;
 
-	static void dre_toggle_cb(lv_event_t *e) {
-		(void)e;
-		bool on = lv_obj_has_state(dre_switch, LV_STATE_CHECKED);
-		config_set_int("audio", "dac_dre", on ? 1 : 0);
-		config_save();
-		set_dac_dre(on ? 1 : 0);
-	}
-#endif
-
-#ifdef BOARD_R1
-	// R1 does not have the NOS_EN option in amixer
-#else
-	// NOS: the DAC's non-oversampling mode, ALSA "NOS_EN" like the stock player
-	// (decompile FUN_004820e0).
-	static lv_obj_t *nos_switch;
-
-	static void nos_toggle_cb(lv_event_t *e) {
-		(void)e;
-		bool on = lv_obj_has_state(nos_switch, LV_STATE_CHECKED);
-		config_set_int("audio", "dac_nos", on ? 1 : 0);
-		config_save();
-		set_dac_nos(on ? 1 : 0);
-	}
-#endif
+static void nos_toggle_cb(lv_event_t *e) {
+	(void)e;
+	bool on = lv_obj_has_state(nos_switch, LV_STATE_CHECKED);
+	config_set_int("audio", "dac_nos", on ? 1 : 0);
+	config_save();
+	set_dac_nos(on ? 1 : 0);
+}
 
 // High gain: the 6 dB gain step, done as the stock player does it -- a shift
 // of the whole volume scale on the DAC's attenuation register.
@@ -557,7 +549,7 @@ static void build_balance_page(gui_config_t *cfg) {
 
 static lv_obj_t *rg_switch;
 static lv_obj_t *rg_card, *rg_pills;
-static lv_obj_t *rg_track_pill, *rg_album_pill;
+static lv_obj_t *rg_track_pill, *rg_album_pill, *rg_track_when_shuffled_pill;
 
 static void rg_refresh(void) {
 	if (!rg_switch) {
@@ -575,6 +567,7 @@ static void rg_refresh(void) {
 	}
 	settingsrow_pill_active(rg_track_pill, mode == REPLAYGAIN_TRACK);
 	settingsrow_pill_active(rg_album_pill, mode == REPLAYGAIN_ALBUM);
+	settingsrow_pill_active(rg_track_when_shuffled_pill, mode == REPLAYGAIN_TRACK_WHEN_SHUFFLED);
 }
 
 // Whatever the setting becomes, the track already loaded has to be re-measured
@@ -1364,10 +1357,11 @@ static void build_playback_page(gui_config_t *cfg) {
 		lv_obj_add_state(gapless_switch, LV_STATE_CHECKED);
 	}
 
-	// ReplayGain: off, or corrected per track or per record.
+	// ReplayGain: off, corrected per track, corrected per album or corrected per track when shuffled.
 	rg_card = settingsrow_toggle_pills(container, "musicsettings_replay_gain", rg_toggle_cb, &rg_switch, &rg_pills);
 	rg_track_pill = settingsrow_pill(rg_pills, "track", REPLAYGAIN_TRACK, rg_pick_cb);
 	rg_album_pill = settingsrow_pill(rg_pills, "albums", REPLAYGAIN_ALBUM, rg_pick_cb);
+	rg_track_when_shuffled_pill = settingsrow_pill(rg_pills, "track_when_shuffled", REPLAYGAIN_TRACK_WHEN_SHUFFLED, rg_pick_cb);
 	rg_refresh();
 
 	// The fade at the two ends of a track: a page of its own because it carries
@@ -1493,25 +1487,17 @@ void musicsettings_init(gui_config_t *cfg) {
 	build_filter_page(cfg);
 	settingsrow_add(container, "musicsettings_filters", NULL, switch_screen_cb, dacfilter_screen);
 
-	#ifdef BOARD_R1
-		// R1 does not have the NOS_EN option in amixer
-	#else
-		// Non-oversampling, off by default like the stock player.
-		settingsrow_toggle(container, "musicsettings_nos", &nos_switch, nos_toggle_cb);
-		if (config_get_int("audio", "dac_nos", 0)) {
-			lv_obj_add_state(nos_switch, LV_STATE_CHECKED);
-		}
-	#endif
+	// Non-oversampling, off by default like the stock player.
+	settingsrow_toggle(container, "musicsettings_nos", &nos_switch, nos_toggle_cb);
+	if (config_get_int("audio", "dac_nos", 0)) {
+		lv_obj_add_state(nos_switch, LV_STATE_CHECKED);
+	}
 
-	#ifdef BOARD_R1
-		// R1 does not have the DRE_EN option in amxier
-	#else
-		// The DAC's dynamic-range enhancement, on by default like the stock player.
-		settingsrow_toggle(container, "musicsettings_dac_dre", &dre_switch, dre_toggle_cb);
-		if (config_get_int("audio", "dac_dre", 1)) {
-			lv_obj_add_state(dre_switch, LV_STATE_CHECKED);
-		}
-	#endif
+	// The DAC's dynamic-range enhancement, on by default like the stock player.
+	settingsrow_toggle(container, "musicsettings_dac_dre", &dre_switch, dre_toggle_cb);
+	if (config_get_int("audio", "dac_dre", 1)) {
+		lv_obj_add_state(dre_switch, LV_STATE_CHECKED);
+	}
 
 	theme_register_refresh(rg_refresh);
 	theme_register_refresh(dsd_gain_refresh);
