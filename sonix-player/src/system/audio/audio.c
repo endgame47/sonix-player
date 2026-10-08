@@ -2414,8 +2414,6 @@ static snd_pcm_sframes_t pcm_write_recover(snd_pcm_t **pcm, const void *buf, snd
 		}
 		if (written >= 0) {
 			playback_wrote(*pcm, (snd_pcm_uframes_t)written);
-			audio_capture_pcm(buf, frames, channels, bits);
-			audio_run_fft(buf, frames, channels, bits);
 			return written;
 		}
 
@@ -3693,6 +3691,11 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 				mono_process_s32((int32_t *)buffer, (int)frames_read, channels);
 				balance_process_s32((int32_t *)buffer, (int)frames_read, channels);
 			}
+
+			if (!passthrough && frames_read > 0) {
+				audio_capture_pcm(buffer, frames_read, channels, out_bits);
+				audio_run_fft(buffer, frames_read, channels, out_bits);
+			}
 		} else {
 			pthread_mutex_lock(&audio_mutex);
 			double want_speed = playback_speed;
@@ -3720,6 +3723,11 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 				// the level: the balance is about what reaches each ear.
 				mono_process((short *)buffer, (int)frames_read, channels);
 				balance_process((short *)buffer, (int)frames_read, channels);
+			}
+
+			if (!passthrough && frames_read > 0) {
+				audio_capture_pcm(buffer, frames_read, channels, out_bits);
+				audio_run_fft(buffer, frames_read, channels, out_bits);
 			}
 		}
 
