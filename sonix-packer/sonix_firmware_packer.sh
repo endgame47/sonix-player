@@ -161,6 +161,33 @@ rename_player_in() {
 	grep -n "sonix_player" "$file" | sed 's/^/        /'
 }
 
+# Copies FS_data, the HBC3000's FPGA configuration, out of the stock
+# sa_sound_hbc3000.ko into a file: the array named by the module's symbol table,
+# in its own section. perl because macOS and Linux both have it.
+hbc3000_firmware() {
+	perl -e '
+		local $/;
+		open(my $f, "<:raw", $ARGV[0]) or die "$ARGV[0]: $!\n";
+		my $e = <$f>;
+		substr($e, 0, 6) eq "\x7fELF\x01\x01" or die "$ARGV[0]: not a 32-bit little-endian ELF\n";
+		my $shoff = unpack("V", substr($e, 0x20, 4));
+		my ($shentsize, $shnum) = unpack("vv", substr($e, 0x2e, 4));
+		my @sh = map { [unpack("V10", substr($e, $shoff + $_ * $shentsize, 40))] } 0 .. $shnum - 1;
+		for my $s (grep { $_->[1] == 2 } @sh) {
+			my $strtab = $sh[$s->[6]]->[4];
+			for (my $o = 0; $o < $s->[5]; $o += 16) {
+				my ($name, $value, $size, $info, $other, $shndx) =
+					unpack("VVVCCv", substr($e, $s->[4] + $o, 16));
+				next unless unpack("Z*", substr($e, $strtab + $name)) eq "FS_data";
+				open(my $out, ">:raw", $ARGV[1]) or die "$ARGV[1]: $!\n";
+				print $out substr($e, $sh[$shndx]->[4] + $value, $size);
+				exit 0;
+			}
+		}
+		die "$ARGV[0]: no FS_data\n";
+	' "$1" "$2"
+}
+
 # Writes an image into the OTA folder the way the updater reads it: 512 KiB
 # chunks named NAME.NNNN.<md5 of the previous chunk>, the first one named after
 # the md5 of the whole image, and ota_md5_NAME.<md5 of the whole image> listing
@@ -344,6 +371,28 @@ build_one() {
 
 	rename_player_in "$SQUASH_DIR/$INIT_SCRIPT" "$INIT_SCRIPT"
 	say ""
+
+	# ==========================================================================
+	# 4b. The HBC3000's configuration
+	# ==========================================================================
+	#
+	# The open sa_sound_hbc3000.ko loads the FPGA's configuration from
+	# lib/firmware/hbc3000.fw. The configuration is HiBy's and is not in the
+	# assets: it is taken here from the stock module, before the overlay puts
+	# the open one in its place.
+	if [ -f "$ASSETS_DIR/$MODEL_DIR/module_driver/sa_sound_hbc3000.ko" ]; then
+		step "[$MODEL_NAME] taking the HBC3000 configuration from the stock module"
+
+		command -v perl >/dev/null 2>&1 || die "perl is needed to read the stock sa_sound_hbc3000.ko."
+		STOCK_HBC="$SQUASH_DIR/module_driver/sa_sound_hbc3000.ko"
+		[ -f "$STOCK_HBC" ] || die "the stock firmware has no module_driver/sa_sound_hbc3000.ko.
+	  The open one would have no configuration to load: the outputs would stay silent."
+		mkdir -p "$SQUASH_DIR/lib/firmware"
+		hbc3000_firmware "$STOCK_HBC" "$SQUASH_DIR/lib/firmware/hbc3000.fw" ||
+			die "no configuration in the stock sa_sound_hbc3000.ko."
+		say "    lib/firmware/hbc3000.fw: $(wc -c < "$SQUASH_DIR/lib/firmware/hbc3000.fw" | tr -d ' ') bytes"
+		say ""
+	fi
 
 	# ==========================================================================
 	# 5. The overlay
