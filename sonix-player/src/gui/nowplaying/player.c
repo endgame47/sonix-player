@@ -1,5 +1,6 @@
 #include "player.h"
 
+#include <math.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -159,6 +160,14 @@ static int polls_since_stop = POLLS_FAST_AFTER_STOP;
 static lv_obj_t *cover_panel;
 static lv_obj_t *cover_img;
 static lv_obj_t *cover_placeholder_icon;
+
+// Full-screen generated visualizer. It intentionally contains no artwork,
+// image widget, or reference to current_cover; the cover panel remains the
+// dedicated tap target that opens it and the visualizer itself closes it.
+static lv_obj_t *visualizer_canvas;
+static uint8_t *visualizer_buf;
+static lv_timer_t *visualizer_timer;
+static bool visualizer_visible;
 
 // Live mode (internet radio). A stream is not a track: it cannot be paused,
 // skipped or seeked, and it has no position and no length. Rather than leave
@@ -1154,6 +1163,82 @@ static void cover_panel_hit_test_cb(lv_event_t *e) {
 	const lv_point_t *p = info->point;
 	if (p->x >= wave.x1 && p->x <= wave.x2 && p->y >= wave.y1 && p->y <= wave.y2) {
 		info->res = false;
+	}
+}
+
+static void visualizer_open(void) {
+	if (!visualizer_canvas || visualizer_visible) {
+		return;
+	}
+	visualizer_visible = true;
+	lv_obj_set_hidden(visualizer_canvas, false);
+	lv_obj_move_foreground(visualizer_canvas);
+}
+
+static void visualizer_close(void) {
+	if (!visualizer_canvas || !visualizer_visible) {
+		return;
+	}
+	visualizer_visible = false;
+	lv_obj_set_hidden(visualizer_canvas, true);
+}
+
+static void visualizer_canvas_click_cb(lv_event_t *e) {
+	if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+		visualizer_close();
+	}
+}
+
+static void cover_panel_visualizer_cb(lv_event_t *e) {
+	if (lv_event_get_code(e) == LV_EVENT_CLICKED && sheet_open) {
+		visualizer_open();
+	}
+}
+
+static void visualizer_timer_cb(lv_timer_t *timer) {
+	(void)timer;
+	if (!visualizer_visible || !visualizer_canvas || !visualizer_buf) {
+		return;
+	}
+
+	lv_canvas_fill_bg(visualizer_canvas, lv_color_black(), LV_OPA_COVER);
+	int width = (int)lv_obj_get_width(visualizer_canvas);
+	int height = (int)lv_obj_get_height(visualizer_canvas);
+	int cx = width / 2;
+	int cy = height / 2;
+	bool playing = audio_get_status() == AUDIO_STATUS_PLAYING;
+	float time = (float)lv_tick_get() / 1000.0f;
+
+	for (int ring = 0; ring < 5; ring++) {
+		int radius = 48 + ring * 48 +
+			(int)(8.0f * sinf(time * (1.2f + ring * 0.22f)));
+		radius = LV_MIN(radius, LV_MAX(8, LV_MIN(width, height) / 2 - 8));
+		lv_color_t color = ring % 2 == 0
+			? lv_color_make(92 + (playing ? 32 : 0),
+				150 + (playing ? 42 : 0), 255)
+			: lv_color_make(255, 86 + (playing ? 64 : 0),
+				180 + (playing ? 38 : 0));
+		for (int segment = 0; segment < 96; segment++) {
+			float angle = 6.2831853f * segment / 96.0f +
+				time * (ring % 2 ? 0.35f : -0.22f);
+			int x = cx + (int)(cosf(angle) * radius);
+			int y = cy + (int)(sinf(angle) * radius);
+			if (x >= 0 && x < width && y >= 0 && y < height) {
+				lv_canvas_set_px(visualizer_canvas, x, y, color, LV_OPA_COVER);
+			}
+		}
+	}
+
+	for (int bar = 0; bar < 34; bar++) {
+		float angle = 6.2831853f * bar / 34.0f + time * 0.16f;
+		int radius = 94 + (bar % 5) * 12 +
+			(int)(5.0f * sinf(time * 2.0f + bar));
+		int x = cx + (int)(cosf(angle) * radius);
+		int y = cy + (int)(sinf(angle) * radius);
+		if (x >= 0 && x < width && y >= 0 && y < height) {
+			lv_canvas_set_px(visualizer_canvas, x, y,
+				lv_color_make(210, 226, 255), LV_OPA_COVER);
+		}
 	}
 }
 
@@ -4706,6 +4791,8 @@ void player_init(gui_config_t *cfg) {
 	lv_timer_pause(sleep_timer); // apply_playback_status starts it when there is a stretch to count
 	power_slow_in_standby(sleep_timer, 5000);
 
+	visualizer_timer = lv_timer_create(visualizer_timer_cb, 30, NULL);
+
 	lv_obj_t *below_slider_group = lv_obj_create(player_menu);
 	below_slider_obj = below_slider_group;
 	lv_obj_set_size(below_slider_group, lv_pct(100), LV_SIZE_CONTENT);
@@ -4864,6 +4951,8 @@ void player_init(gui_config_t *cfg) {
 	// taller shape of the track can reach: presses there go to the slider.
 	lv_obj_set_adv_hittest(cover_panel, true);
 	lv_obj_add_event_cb(cover_panel, cover_panel_hit_test_cb, LV_EVENT_HIT_TEST, NULL);
+	lv_obj_add_event_cb(cover_panel, cover_panel_visualizer_cb,
+		LV_EVENT_CLICKED, NULL);
 	lv_obj_set_size(cover_panel, cover_size, cover_size);
 	lv_obj_align(cover_panel, LV_ALIGN_TOP_MID, 0, 0);
 	lv_obj_set_style_bg_color(cover_panel, theme()->cover_bg, 0);
@@ -4979,6 +5068,22 @@ void player_init(gui_config_t *cfg) {
 	cover_img = lv_image_create(cover_panel);
 	lv_obj_center(cover_img);
 	lv_obj_set_hidden(cover_img, true);
+
+	// The generated visualizer is a sibling of the artwork panel. It has no
+	// image source or artwork child and is hidden until the cover panel opens it.
+	visualizer_canvas = lv_canvas_create(player_screen);
+	lv_obj_set_size(visualizer_canvas, cfg->screen_width, cfg->screen_height);
+	lv_obj_set_pos(visualizer_canvas, 0, 0);
+	lv_obj_set_clickable(visualizer_canvas, true);
+	lv_obj_add_event_cb(visualizer_canvas, visualizer_canvas_click_cb,
+		LV_EVENT_CLICKED, NULL);
+	lv_obj_set_hidden(visualizer_canvas, true);
+	visualizer_buf = malloc((size_t)cfg->screen_width *
+		(size_t)cfg->screen_height * 2);
+	if (visualizer_buf) {
+		lv_canvas_set_buffer(visualizer_canvas, visualizer_buf,
+			cfg->screen_width, cfg->screen_height, LV_COLOR_FORMAT_RGB565);
+	}
 
 	// ---------------------------------------------------------------------
 	// Studio: the blurred sleeve behind the whole screen, and everything else
