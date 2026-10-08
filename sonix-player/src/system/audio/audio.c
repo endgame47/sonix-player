@@ -1,35 +1,36 @@
 #include "audio.h"
 #include "src/system/audio/alsa-controls.h"
-#include "src/system/bluetooth/bluetooth.h"
-#include "src/system/decode/decode.h"
-#include "src/system/decode/growfile.h"
-#include "src/system/decode/sndfile.h"
+#include "src/system/audio/decimate.h"
+#include "src/system/audio/eq.h"
 #include "src/system/audio/replaygain.h"
 #include "src/system/audio/speed.h"
 #include "src/system/audio/swvolume.h"
-#include "src/system/audio/eq.h"
-#include "src/system/audio/decimate.h"
+#include "src/system/audio/visualizer.h"
+#include "src/system/bluetooth/bluetooth.h"
 #include "src/system/core/config.h"
-#include "src/system/device/power.h"
 #include "src/system/core/utils.h"
+#include "src/system/decode/decode.h"
+#include "src/system/decode/growfile.h"
+#include "src/system/decode/sndfile.h"
+#include "src/system/device/power.h"
 
+#include <errno.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdarg.h>
-#include <errno.h>
 #include <unistd.h>
 
-#include <sched.h>
-#include <poll.h>
-#include <sys/prctl.h>
-#include <sys/stat.h>
-#include <dirent.h>
 #include <alloca.h>
 #include <alsa/asoundlib.h>
+#include <dirent.h>
+#include <poll.h>
+#include <sched.h>
+#include <sys/prctl.h>
+#include <sys/stat.h>
 #include <time.h>
 
 // Millisecond timestamps for the play/start/end log lines, so the ordering and
@@ -39,7 +40,6 @@ static long log_ms(void) {
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
-
 
 // The host build has no sound card: ALSA falls back to a null device that
 // swallows a whole track in a few milliseconds, so playback there is over
@@ -124,10 +124,8 @@ static void pcm_restart_after_pause(snd_pcm_t *pcm) {
 	// there is nothing to un-pause: it just needs preparing again before the
 	// next write.
 	int err = snd_pcm_prepare(pcm);
-	fprintf(stderr, "audio[%ld]: restarting after pause (state %d, prepare %s)\n", log_ms(), (int)st,
-			err < 0 ? snd_strerror(err) : "ok");
+	fprintf(stderr, "audio[%ld]: restarting after pause (state %d, prepare %s)\n", log_ms(), (int)st, err < 0 ? snd_strerror(err) : "ok");
 }
-
 
 // The sample encodings the WAV path reads. The device is opened at S16_LE for
 // the first two and at S32_LE, left-justified, for the rest -- the same format
@@ -536,9 +534,7 @@ static double progress_floor_secs = -1.0;
 // moving to or from the headphones -- is a play and a seek, and reporting 0
 // until the seek is reached drew the bar at the start and back. Caller holds
 // audio_mutex.
-static double opening_position(void) {
-	return seek_request && seek_target_secs > 0 ? seek_target_secs : 0.0;
-}
+static double opening_position(void) { return seek_request && seek_target_secs > 0 ? seek_target_secs : 0.0; }
 
 // The position after a block has gone out, unless a seek has been asked for
 // meanwhile: audio_seek() already reports its target, and the block that was
@@ -583,9 +579,7 @@ static char stream_codec[16] = "";
 
 // Little-endian readers for the header fields.
 static uint16_t le16(const unsigned char *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
-static uint32_t le32(const unsigned char *p) {
-	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
+static uint32_t le32(const unsigned char *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
 
 #define WAVE_FORMAT_PCM 0x0001
 #define WAVE_FORMAT_IEEE_FLOAT 0x0003
@@ -601,8 +595,7 @@ static int parse_wav(const char *filepath, wav_info_t *info, FILE **file_out) {
 	memset(info, 0, sizeof(*info));
 
 	unsigned char riff[12];
-	if (fread(riff, 1, sizeof(riff), f) != sizeof(riff) || memcmp(riff, "RIFF", 4) != 0 ||
-		memcmp(riff + 8, "WAVE", 4) != 0) {
+	if (fread(riff, 1, sizeof(riff), f) != sizeof(riff) || memcmp(riff, "RIFF", 4) != 0 || memcmp(riff + 8, "WAVE", 4) != 0) {
 		fclose(f);
 		return WAV_BAD;
 	}
@@ -682,8 +675,7 @@ static int parse_wav(const char *filepath, wav_info_t *info, FILE **file_out) {
 	} else if (tag == WAVE_FORMAT_IEEE_FLOAT && bits == 64) {
 		info->sample = WAV_FLOAT64;
 	} else {
-		fprintf(stderr, "audio: '%s' is WAV format 0x%04x at %d bits, not read by the WAV path\n", filepath, tag,
-				bits);
+		fprintf(stderr, "audio: '%s' is WAV format 0x%04x at %d bits, not read by the WAV path\n", filepath, tag, bits);
 		fclose(f);
 		return WAV_UNSUPPORTED;
 	}
@@ -745,9 +737,7 @@ static void wav_convert(const wav_info_t *info, const unsigned char *in, void *o
 	}
 }
 
-static bool wav_needs_conversion(const wav_info_t *info) {
-	return info->sample != WAV_PCM_S16 && info->sample != WAV_PCM_S32;
-}
+static bool wav_needs_conversion(const wav_info_t *info) { return info->sample != WAV_PCM_S16 && info->sample != WAV_PCM_S32; }
 
 // When non-zero, the next open_pcm_device() sizes the buffer to this many
 // milliseconds instead of its own 750.
@@ -966,8 +956,7 @@ static void pcm_drain_bounded(snd_pcm_t *pcm) {
 		previous = left;
 
 		if (stalled_ms >= DRAIN_STALL_MS || waited_ms >= DRAIN_TIMEOUT_MS) {
-			fprintf(stderr, "audio[%ld]: the Bluetooth PCM will not drain (%ld frames left after %ld ms): letting it go\n",
-					log_ms(), (long)left, waited_ms);
+			fprintf(stderr, "audio[%ld]: the Bluetooth PCM will not drain (%ld frames left after %ld ms): letting it go\n", log_ms(), (long)left, waited_ms);
 			break;
 		}
 		usleep(20 * 1000);
@@ -1077,10 +1066,8 @@ static snd_pcm_t *gapless_take(int channels, int rate, int bits, snd_pcm_uframes
 	// The output route counts too: headphones can have been plugged in between
 	// the two tracks, and reprogramming the codec under a live stream is
 	// exactly what the stock binary never does.
-	if (channels != held_channels || rate != held_rate || bits != held_bits || strcmp(device, held_device) != 0 ||
-		alsa_output_key() != held_route) {
-		fprintf(stderr, "audio[%ld]: gapless: different format (%d/%d/%d against %d/%d/%d), reopening\n", log_ms(), channels,
-				rate, bits, held_channels, held_rate, held_bits);
+	if (channels != held_channels || rate != held_rate || bits != held_bits || strcmp(device, held_device) != 0 || alsa_output_key() != held_route) {
+		fprintf(stderr, "audio[%ld]: gapless: different format (%d/%d/%d against %d/%d/%d), reopening\n", log_ms(), channels, rate, bits, held_channels, held_rate, held_bits);
 		gapless_release();
 		return NULL;
 	}
@@ -1093,8 +1080,7 @@ static snd_pcm_t *gapless_take(int channels, int rate, int bits, snd_pcm_uframes
 		return NULL;
 	}
 	if (pcm_is_bluetooth(pcm) && !bt_hold_usable(pcm)) {
-		fprintf(stderr, "audio[%ld]: gapless: the Bluetooth queue ran low or the stream stopped, reopening\n",
-				log_ms());
+		fprintf(stderr, "audio[%ld]: gapless: the Bluetooth queue ran low or the stream stopped, reopening\n", log_ms());
 		pthread_mutex_lock(&held_lock);
 		held_pcm = pcm;
 		pthread_mutex_unlock(&held_lock);
@@ -1189,8 +1175,7 @@ static void log_pcm_chain(snd_pcm_t *pcm) {
 		return;
 	}
 	char *text = NULL;
-	if (snd_pcm_dump(pcm, out) >= 0 && snd_output_buffer_string(out, &text) > 0 && text &&
-		strncmp(text, last, sizeof(last) - 1) != 0) {
+	if (snd_pcm_dump(pcm, out) >= 0 && snd_output_buffer_string(out, &text) > 0 && text && strncmp(text, last, sizeof(last) - 1) != 0) {
 		snprintf(last, sizeof(last), "%s", text);
 		char *save = NULL;
 		for (char *line = strtok_r(text, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
@@ -1224,8 +1209,7 @@ static void log_pcm_chain(snd_pcm_t *pcm) {
 // configuration it opens from, too.
 static int open_bluetooth_at_rate(snd_pcm_t **pcm, const char *device, unsigned rate, int mode) {
 	char text[sizeof(output_pcm) + 128];
-	int len = snprintf(text, sizeof(text), "pcm." BT_CONVERTED_PCM " { type plug slave { pcm \"%s\" rate %u } }",
-					   device, rate);
+	int len = snprintf(text, sizeof(text), "pcm." BT_CONVERTED_PCM " { type plug slave { pcm \"%s\" rate %u } }", device, rate);
 	if (len < 0 || (size_t)len >= sizeof(text)) {
 		return -EINVAL;
 	}
@@ -1355,8 +1339,7 @@ static snd_pcm_t *open_pcm_device_now(int channels, int sample_rate, int bits_pe
 		unsigned sink_rate = bluetooth_sink_rate();
 		if (sink_rate > 0 && sink_rate != (unsigned)sample_rate) {
 			convert_to = sink_rate;
-			fprintf(stderr, "audio: the headphones stay at %u Hz; the %d Hz track is converted to it\n", sink_rate,
-					sample_rate);
+			fprintf(stderr, "audio: the headphones stay at %u Hz; the %d Hz track is converted to it\n", sink_rate, sample_rate);
 		}
 	}
 
@@ -1364,13 +1347,11 @@ static snd_pcm_t *open_pcm_device_now(int channels, int sample_rate, int bits_pe
 	int attempts = 0;
 	int budget = (bluetooth && bluetooth_audio_active()) ? 160 : 40; // eight seconds, or two
 	for (; attempts < budget; attempts++) {
-		err = convert_to ? open_bluetooth_at_rate(&pcm_handle, device, convert_to, mode)
-						 : snd_pcm_open(&pcm_handle, device, SND_PCM_STREAM_PLAYBACK, mode);
+		err = convert_to ? open_bluetooth_at_rate(&pcm_handle, device, convert_to, mode) : snd_pcm_open(&pcm_handle, device, SND_PCM_STREAM_PLAYBACK, mode);
 		if (err >= 0) {
 			break;
 		}
-		bool transient = (err == -EBUSY || err == -EAGAIN) ||
-						 (bluetooth && (err == -ENODEV || err == -EIO || err == -ETIMEDOUT || err == -ECONNREFUSED));
+		bool transient = (err == -EBUSY || err == -EAGAIN) || (bluetooth && (err == -ENODEV || err == -EIO || err == -ETIMEDOUT || err == -ECONNREFUSED));
 		if (!transient) {
 			break; // a real error, not a teardown race: no point retrying
 		}
@@ -1381,8 +1362,7 @@ static snd_pcm_t *open_pcm_device_now(int channels, int sample_rate, int bits_pe
 	// track that refuses to start is a worse outcome than one coming out of
 	// the wrong hole. Fall back to the jack, and say so in the log.
 	if (err < 0 && strcmp(device, AUDIO_DEFAULT_PCM) != 0) {
-		fprintf(stderr, "audio: '%s' would not open (%s); falling back to " AUDIO_DEFAULT_PCM "\n", device,
-				snd_strerror(err));
+		fprintf(stderr, "audio: '%s' would not open (%s); falling back to " AUDIO_DEFAULT_PCM "\n", device, snd_strerror(err));
 		err = snd_pcm_open(&pcm_handle, AUDIO_DEFAULT_PCM, SND_PCM_STREAM_PLAYBACK, 0);
 
 		// And stop asking for it, so the dead name does not stay installed and
@@ -1397,13 +1377,11 @@ static snd_pcm_t *open_pcm_device_now(int channels, int sample_rate, int bits_pe
 	}
 
 	if (err < 0) {
-		fprintf(stderr, "Audio: Cannot open PCM device '%s': %s (after %d attempts)\n", device, snd_strerror(err),
-				attempts);
+		fprintf(stderr, "Audio: Cannot open PCM device '%s': %s (after %d attempts)\n", device, snd_strerror(err), attempts);
 		return NULL;
 	}
 	if (attempts > 0) {
-		fprintf(stderr, "audio[%ld]: opening '%s' took %d attempts (%d ms)\n", log_ms(), device, attempts,
-				attempts * 50);
+		fprintf(stderr, "audio[%ld]: opening '%s' took %d attempts (%d ms)\n", log_ms(), device, attempts, attempts * 50);
 	}
 
 	snd_pcm_hw_params_t *hw_params;
@@ -1529,12 +1507,11 @@ static snd_pcm_t *open_pcm_device_now(int channels, int sample_rate, int bits_pe
 	// see pcm_forced_buffer_ms.
 	int buffer_time_ms = pcm_forced_buffer_ms > 0 ? pcm_forced_buffer_ms : (int)config_get_int("audio", "buffer_time_ms", 0);
 	if (buffer_time_ms > 0) {
-		unsigned int buffer_time = (unsigned int)buffer_time_ms * 1000u;   // microseconds
+		unsigned int buffer_time = (unsigned int)buffer_time_ms * 1000u; // microseconds
 		unsigned int period_time = buffer_time / 4;
 		snd_pcm_hw_params_set_buffer_time_near(pcm_handle, hw_params, &buffer_time, &dir);
 		snd_pcm_hw_params_set_period_time_near(pcm_handle, hw_params, &period_time, &dir);
-		fprintf(stderr, "audio: stock-style sizing, buffer %u us / period %u us\n", buffer_time,
-				period_time);
+		fprintf(stderr, "audio: stock-style sizing, buffer %u us / period %u us\n", buffer_time, period_time);
 	} else {
 		snd_pcm_hw_params_set_periods_near(pcm_handle, hw_params, &periods, &dir);
 		snd_pcm_hw_params_set_period_size_near(pcm_handle, hw_params, &period_size, &dir);
@@ -1550,15 +1527,12 @@ static snd_pcm_t *open_pcm_device_now(int channels, int sample_rate, int bits_pe
 	// down with it. So the page cache is let go once -- clean copies of files,
 	// which the card still holds -- and the same format is asked for again with
 	// half the buffer each time, down to a floor.
-	for (int halvings = 0; err == -ENOMEM && buffer_time_ms <= 0 && halvings < PCM_NOMEM_HALVINGS &&
-						   period_size / 2 >= PERIOD_FRAMES_MIN;
-		 halvings++) {
+	for (int halvings = 0; err == -ENOMEM && buffer_time_ms <= 0 && halvings < PCM_NOMEM_HALVINGS && period_size / 2 >= PERIOD_FRAMES_MIN; halvings++) {
 		if (halvings == 0) {
 			release_page_cache();
 		}
 		period_size /= 2;
-		fprintf(stderr, "audio: no memory in the driver for the buffer; asking again with %lu-frame periods\n",
-				(unsigned long)period_size);
+		fprintf(stderr, "audio: no memory in the driver for the buffer; asking again with %lu-frame periods\n", (unsigned long)period_size);
 		snd_pcm_hw_params_copy(hw_params, unsized);
 		periods = 8;
 		snd_pcm_hw_params_set_periods_near(pcm_handle, hw_params, &periods, &dir);
@@ -1586,8 +1560,7 @@ static snd_pcm_t *open_pcm_device_now(int channels, int sample_rate, int bits_pe
 		// The device name belongs on this line: without it the log cannot tell
 		// a track that went to the headphones from one that went to the jack,
 		// since the two otherwise print identically.
-		fprintf(stderr, "audio[%ld]: PCM open on '%s': %u Hz %s %u ch (asked for %d Hz / %d bit)\n", log_ms(), device,
-				actual_rate, snd_pcm_format_name(actual_format), actual_channels, sample_rate, bits_per_sample);
+		fprintf(stderr, "audio[%ld]: PCM open on '%s': %u Hz %s %u ch (asked for %d Hz / %d bit)\n", log_ms(), device, actual_rate, snd_pcm_format_name(actual_format), actual_channels, sample_rate, bits_per_sample);
 	}
 
 	// A seek measurement belongs to the stream it was taken on. A track change
@@ -1612,9 +1585,7 @@ static snd_pcm_t *open_pcm_device_now(int channels, int sample_rate, int bits_pe
 		snd_pcm_uframes_t actual_buffer = 0;
 		if (snd_pcm_hw_params_get_buffer_size(hw_params, &actual_buffer) >= 0 && actual_buffer > 0) {
 			unsigned int rate = val ? val : (unsigned int)sample_rate;
-			fprintf(stderr, "audio: buffer %lu frames (%u ms), period %lu frames (%u ms)\n",
-					(unsigned long)actual_buffer, (unsigned int)((actual_buffer * 1000u) / rate),
-					(unsigned long)period_size, (unsigned int)((period_size * 1000u) / rate));
+			fprintf(stderr, "audio: buffer %lu frames (%u ms), period %lu frames (%u ms)\n", (unsigned long)actual_buffer, (unsigned int)((actual_buffer * 1000u) / rate), (unsigned long)period_size, (unsigned int)((period_size * 1000u) / rate));
 		}
 	}
 
@@ -1728,8 +1699,7 @@ static bool system_ticks(long long *total, long long *idle) {
 		return false;
 	}
 	unsigned long long v[8] = {0};
-	int n = fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu %llu", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6],
-				   &v[7]);
+	int n = fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu %llu", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]);
 	fclose(f);
 	if (n < 4) {
 		return false;
@@ -1869,8 +1839,7 @@ static void health_tick(health_t *h, int rate, int out_rate, int bits) {
 		fprintf(stderr,
 				"audio[%ld]: %ld s at %d Hz%s / %d bit: playback thread %d.%d%% of the core (read+decode %d.%d%%, "
 				"effects %d.%d%%, ALSA write %d.%d%%), %u write recoveries, MemAvailable %ld kB\n",
-				now, span / 1000, rate, to, bits, all / 10, all % 10, rd / 10, rd % 10, fx / 10, fx % 10, wr / 10,
-				wr % 10, write_recoveries - h->recoveries, mem_available_kb());
+				now, span / 1000, rate, to, bits, all / 10, all % 10, rd / 10, rd % 10, fx / 10, fx % 10, wr / 10, wr % 10, write_recoveries - h->recoveries, mem_available_kb());
 
 		long long total = 0, idle = 0;
 		if (h->sys_total >= 0 && system_ticks(&total, &idle) && total > h->sys_total) {
@@ -1882,8 +1851,7 @@ static void health_tick(health_t *h, int rate, int out_rate, int bits) {
 			if (ba_pct >= 0) {
 				snprintf(ba, sizeof(ba), ", bluealsa %d%%", ba_pct);
 			}
-			fprintf(stderr, "audio[%ld]: the core over the same span: idle %d%%, interface %d%%%s\n", now, idle_pct,
-					ui_pct, ba);
+			fprintf(stderr, "audio[%ld]: the core over the same span: idle %d%%, interface %d%%%s\n", now, idle_pct, ui_pct, ba);
 		}
 	}
 	health_start(h);
@@ -2014,22 +1982,18 @@ static void bt_start_probe_note(snd_pcm_t *pcm, snd_pcm_sframes_t written, int r
 		// Asked again here so the line below reads an answer from after the
 		// stream started, not one from before the PCM was even open.
 		bluetooth_request_a2dp_streams();
-		fprintf(stderr, "audio[%ld]: the track started coming out after %ld ms (%lld frames written)\n", now, elapsed,
-				bt_start_frames);
+		fprintf(stderr, "audio[%ld]: the track started coming out after %ld ms (%lld frames written)\n", now, elapsed, bt_start_frames);
 		return;
 	}
 	if (elapsed >= BT_START_GIVEUP_MS) {
 		bt_start_said = true;
 		char streams[224];
 		bt_streams_text(streams, sizeof(streams));
-		fprintf(stderr, "audio[%ld]: after %ld ms the track has still not come out (state %s, %lld frames written)%s\n",
-				now, elapsed, snd_pcm_state_name(state), bt_start_frames, streams);
+		fprintf(stderr, "audio[%ld]: after %ld ms the track has still not come out (state %s, %lld frames written)%s\n", now, elapsed, snd_pcm_state_name(state), bt_start_frames, streams);
 	}
 }
 
-static void bt_seek_probe_arm(snd_pcm_t *pcm) {
-	bt_seek_probe_at = (pcm && pcm_is_bluetooth(pcm)) ? log_ms() + BT_SEEK_PROBE_MS : 0;
-}
+static void bt_seek_probe_arm(snd_pcm_t *pcm) { bt_seek_probe_at = (pcm && pcm_is_bluetooth(pcm)) ? log_ms() + BT_SEEK_PROBE_MS : 0; }
 
 static void bt_seek_probe_cancel(void) { bt_seek_probe_at = 0; }
 
@@ -2045,8 +2009,7 @@ static void bt_seek_probe_report(snd_pcm_t *pcm) {
 	if (snd_pcm_delay(pcm, &queued) < 0) {
 		queued = -1;
 	}
-	fprintf(stderr, "audio[%ld]: %d ms after the seek the Bluetooth queue is %ld frames (state %s)\n", log_ms(),
-			BT_SEEK_PROBE_MS, (long)queued, snd_pcm_state_name(snd_pcm_state(pcm)));
+	fprintf(stderr, "audio[%ld]: %d ms after the seek the Bluetooth queue is %ld frames (state %s)\n", log_ms(), BT_SEEK_PROBE_MS, (long)queued, snd_pcm_state_name(snd_pcm_state(pcm)));
 }
 
 // Waits up to `timeout_ms` for room in a bluealsa PCM: 1 with room, 0 without,
@@ -2110,8 +2073,7 @@ static int pcm_wait_bluetooth(snd_pcm_t *pcm, int timeout_ms) {
 // So the Bluetooth PCM is opened non-blocking (open_pcm_device) and the waiting
 // is done here, in slices, with a deadline. A partial write is not a loss here:
 // the rest of the period is written on the next turn round the loop.
-static snd_pcm_sframes_t pcm_write_bluetooth(snd_pcm_t *pcm, const void *buf, snd_pcm_uframes_t frames,
-											 int frame_bytes) {
+static snd_pcm_sframes_t pcm_write_bluetooth(snd_pcm_t *pcm, const void *buf, snd_pcm_uframes_t frames, int frame_bytes) {
 	const char *from = (const char *)buf;
 	snd_pcm_uframes_t done = 0;
 	long last_progress_ms = log_ms();
@@ -2151,8 +2113,7 @@ static snd_pcm_sframes_t pcm_write_bluetooth(snd_pcm_t *pcm, const void *buf, sn
 			last_progress_ms = log_ms();
 		}
 		if (since >= BT_WRITE_STALL_MS) {
-			fprintf(stderr, "audio[%ld]: the Bluetooth PCM has taken nothing for %ld ms: calling it lost\n",
-					log_ms(), since);
+			fprintf(stderr, "audio[%ld]: the Bluetooth PCM has taken nothing for %ld ms: calling it lost\n", log_ms(), since);
 			return done > 0 ? (snd_pcm_sframes_t)done : -EIO;
 		}
 
@@ -2171,8 +2132,7 @@ static snd_pcm_sframes_t pcm_write_bluetooth(snd_pcm_t *pcm, const void *buf, sn
 	return (snd_pcm_sframes_t)done;
 }
 
-static snd_pcm_sframes_t pcm_write_recover(snd_pcm_t **pcm, const void *buf, snd_pcm_uframes_t frames, int channels,
-										   int rate, int bits, snd_pcm_uframes_t *period) {
+static snd_pcm_sframes_t pcm_write_recover(snd_pcm_t **pcm, const void *buf, snd_pcm_uframes_t frames, int channels, int rate, int bits, snd_pcm_uframes_t *period) {
 	for (int attempt = 0; attempt < 8; attempt++) {
 		if (!*pcm) {
 			return -EIO; // a previous recovery closed it and could not get it back
@@ -2225,8 +2185,7 @@ static snd_pcm_sframes_t pcm_write_recover(snd_pcm_t **pcm, const void *buf, snd
 		}
 
 		write_recoveries++;
-		fprintf(stderr, "audio[%ld]: write error: %s (recovery %d)\n", log_ms(), snd_strerror((int)written),
-				attempt + 1);
+		fprintf(stderr, "audio[%ld]: write error: %s (recovery %d)\n", log_ms(), snd_strerror((int)written), attempt + 1);
 
 		if (written == -EPIPE) {
 			snd_pcm_prepare(*pcm);
@@ -2267,8 +2226,6 @@ static snd_pcm_sframes_t pcm_write_recover(snd_pcm_t **pcm, const void *buf, snd
 	}
 	return -EIO;
 }
-
-
 
 // Mid-track jack change (headphones in/out while playing): the stock engine
 // sets a reinit flag and its device layer reopens on the new route; this is
@@ -2321,8 +2278,8 @@ static bool retry_track_once(const char *filepath, const char *reason) {
 // stuttering by another name.
 // ---------------------------------------------------------------------------
 
-#define REBUFFER_LOW_SECS 2.0	// below this much ahead, stop
-#define REBUFFER_HIGH_SECS 8.0	// and do not resume before this much is back
+#define REBUFFER_LOW_SECS 2.0  // below this much ahead, stop
+#define REBUFFER_HIGH_SECS 8.0 // and do not resume before this much is back
 #define REBUFFER_MAX_WAIT_MS 60000
 
 // Seconds of music ahead of the play position, or -1 when the file is no
@@ -2417,8 +2374,7 @@ static void rebuffer_after_short_read(decoder_t *dec, int sample_rate, uint64_t 
 		target = total;
 	}
 
-	fprintf(stderr, "audio[%ld]: reading at the edge of the download (%ld KB): waiting for the buffer\n", log_ms(),
-			done / 1024);
+	fprintf(stderr, "audio[%ld]: reading at the edge of the download (%ld KB): waiting for the buffer\n", log_ms(), done / 1024);
 
 	int waited_ms = 0;
 	while (waited_ms < REBUFFER_MAX_WAIT_MS) {
@@ -2760,8 +2716,7 @@ static void play_wav_file(const char *filepath) {
 			int now_route = alsa_output_key();
 			if (now_route != track_route) {
 				track_route = now_route;
-				if (!pcm_reroute(&pcm_handle, info.channels, info.sample_rate, info.out_bits,
-								 &period_size)) {
+				if (!pcm_reroute(&pcm_handle, info.channels, info.sample_rate, info.out_bits, &period_size)) {
 					fprintf(stderr, "Audio: reroute failed\n");
 					pthread_mutex_lock(&audio_mutex);
 					audio_command = AUDIO_CMD_STOP;
@@ -2867,8 +2822,7 @@ static void play_wav_file(const char *filepath) {
 		}
 
 		health_lap(&health, STAGE_EFFECTS);
-		snd_pcm_sframes_t written = pcm_write_recover(&pcm_handle, buffer, frames_to_write, info.channels,
-													  info.sample_rate, info.out_bits, &period_size);
+		snd_pcm_sframes_t written = pcm_write_recover(&pcm_handle, buffer, frames_to_write, info.channels, info.sample_rate, info.out_bits, &period_size);
 		health_lap(&health, STAGE_WRITE);
 
 		if (written == -EINTR) {
@@ -2902,8 +2856,7 @@ static void play_wav_file(const char *filepath) {
 	pthread_mutex_unlock(&audio_mutex);
 
 	// Gapless, on the same conditions as the decoded path.
-	bool keep_open = pcm_handle && gapless_enabled && played_to_the_end && !is_paused &&
-					 (!pcm_is_bluetooth(pcm_handle) || bt_hold_usable(pcm_handle));
+	bool keep_open = pcm_handle && gapless_enabled && played_to_the_end && !is_paused && (!pcm_is_bluetooth(pcm_handle) || bt_hold_usable(pcm_handle));
 	if (keep_open) {
 		gapless_hold(pcm_handle, info.channels, info.sample_rate, info.out_bits, period_size);
 		pcm_handle = NULL;
@@ -2930,7 +2883,7 @@ static void play_wav_file(const char *filepath) {
 			pcm_drain_bounded(pcm_handle);
 		} else {
 			snd_pcm_drop(pcm_handle);
-			}
+		}
 		snd_pcm_close(pcm_handle);
 	}
 	pcm_device_open = keep_open;
@@ -3006,8 +2959,7 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 			break;
 		}
 		if (wait == 0) {
-			fprintf(stderr, "audio[%ld]: '%s' is still downloading, waiting instead of giving up\n", log_ms(),
-					filepath);
+			fprintf(stderr, "audio[%ld]: '%s' is still downloading, waiting instead of giving up\n", log_ms(), filepath);
 		}
 		usleep(DECODER_GROW_RETRY_MS * 1000);
 		dec = decoder_open(filepath, format);
@@ -3032,8 +2984,9 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 
 	// New track, clean start: the crossfeed delay line still holds half a
 	// millisecond of the previous one, which would be audible over a quiet
-	// opening.
+	// opening, and the analyser starts with a fresh frame history.
 	crossfeed_reset();
+	visualizer_reset();
 
 	// DoP: the frames are DSD bits with a marker byte the DAC watches for, not
 	// audio. Nothing in the chain may touch them -- see decoder_passthrough().
@@ -3060,8 +3013,7 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 	}
 	int out_rate = sample_rate / decim_factor;
 	if (decim_factor > 1) {
-		fprintf(stderr, "audio: the %d Hz track is decimated by %d to %d Hz before the effects, for the headphones\n",
-				sample_rate, decim_factor, out_rate);
+		fprintf(stderr, "audio: the %d Hz track is decimated by %d to %d Hz before the effects, for the headphones\n", sample_rate, decim_factor, out_rate);
 	}
 
 	pthread_mutex_lock(&audio_mutex);
@@ -3484,6 +3436,9 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 				mono_process_s32((int32_t *)buffer, (int)frames_read, channels);
 				balance_process_s32((int32_t *)buffer, (int)frames_read, channels);
 			}
+			if (!passthrough && frames_read > 0) {
+				visualizer_feed_pcm(buffer, (size_t)frames_read, channels, out_rate, out_bits);
+			}
 		} else {
 			pthread_mutex_lock(&audio_mutex);
 			double want_speed = playback_speed;
@@ -3491,8 +3446,7 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 
 			if (stretch) {
 				speed_set_factor(stretch, want_speed);
-				frames_read = (uint64_t)speed_pull(stretch, (short *)buffer, (int)chunk_frames, decoder_fill, &fill_ctx,
-												   &input_frames);
+				frames_read = (uint64_t)speed_pull(stretch, (short *)buffer, (int)chunk_frames, decoder_fill, &fill_ctx, &input_frames);
 			} else {
 				frames_read = decoder_read_pcm_frames_s16(dec, chunk_frames, (short *)buffer);
 				input_frames = frames_read;
@@ -3511,6 +3465,9 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 				// the level: the balance is about what reaches each ear.
 				mono_process((short *)buffer, (int)frames_read, channels);
 				balance_process((short *)buffer, (int)frames_read, channels);
+			}
+			if (!passthrough && frames_read > 0) {
+				visualizer_feed_pcm(buffer, (size_t)frames_read, channels, out_rate, out_bits);
 			}
 		}
 
@@ -3603,8 +3560,7 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 			}
 
 			if (cut_short) {
-				fprintf(stderr, "audio[%ld]: '%s' stopped at %.1f s of %.1f: cut short, the queue stays put\n", log_ms(),
-						filepath, (double)reached / sample_rate, (double)declared / sample_rate);
+				fprintf(stderr, "audio[%ld]: '%s' stopped at %.1f s of %.1f: cut short, the queue stays put\n", log_ms(), filepath, (double)reached / sample_rate, (double)declared / sample_rate);
 			}
 			break;
 		}
@@ -3632,8 +3588,7 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 		}
 
 		health_lap(&health, STAGE_EFFECTS);
-		snd_pcm_sframes_t written =
-			pcm_write_recover(&pcm_handle, buffer, frames_read, channels, out_rate, out_bits, &period_size);
+		snd_pcm_sframes_t written = pcm_write_recover(&pcm_handle, buffer, frames_read, channels, out_rate, out_bits, &period_size);
 		health_lap(&health, STAGE_WRITE);
 
 		if (written == -EINTR) {
@@ -3681,8 +3636,7 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 	// reason behind each.
 	//
 	// Over Bluetooth only while the handle is live: see bt_hold_usable().
-	bool keep_open = pcm_handle && gapless_enabled && played_to_the_end && !is_paused && !passthrough &&
-					 (!pcm_is_bluetooth(pcm_handle) || bt_hold_usable(pcm_handle));
+	bool keep_open = pcm_handle && gapless_enabled && played_to_the_end && !is_paused && !passthrough && (!pcm_is_bluetooth(pcm_handle) || bt_hold_usable(pcm_handle));
 	if (keep_open) {
 		gapless_hold(pcm_handle, channels, out_rate, out_bits, period_size);
 		pcm_handle = NULL;
@@ -3707,7 +3661,7 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 			pcm_drain_bounded(pcm_handle);
 		} else {
 			snd_pcm_drop(pcm_handle);
-			}
+		}
 		snd_pcm_close(pcm_handle);
 
 		// A stream that sat paused (a track left paused while the screen was
@@ -3786,8 +3740,7 @@ static void play_file(const char *filepath) {
 	pthread_mutex_lock(&audio_mutex);
 	bool replaced = play_request;
 	pthread_mutex_unlock(&audio_mutex);
-	fprintf(stderr, "audio[%ld]: '%s' ended (%s)\n", log_ms(), filepath,
-			replaced ? "replaced by a new track" : "stop or end of track");
+	fprintf(stderr, "audio[%ld]: '%s' ended (%s)\n", log_ms(), filepath, replaced ? "replaced by a new track" : "stop or end of track");
 }
 
 static void *playback_thread_func(void *arg) {
@@ -4109,8 +4062,7 @@ bool audio_suspend_freeze(int timeout_ms) {
 		}
 	}
 	if (!clean) {
-		fprintf(stderr, "audio: freeze failed (context=%d pcm=%d gapless=%d)\n",
-				(int)playback_context_active, (int)pcm_device_open, (int)gapless_holding());
+		fprintf(stderr, "audio: freeze failed (context=%d pcm=%d gapless=%d)\n", (int)playback_context_active, (int)pcm_device_open, (int)gapless_holding());
 		return false;
 	}
 
@@ -4296,7 +4248,7 @@ void audio_seek(double seconds) {
 
 	pthread_mutex_lock(&audio_mutex);
 	progress_current_secs = seconds; // the bar follows the finger, not the decoder
-	progress_floor_secs = -1.0;		// and a deliberate jump outranks the pause floor
+	progress_floor_secs = -1.0;		 // and a deliberate jump outranks the pause floor
 	seek_target_secs = seconds;
 	seek_request = true;
 	pthread_mutex_unlock(&audio_mutex);
@@ -4379,9 +4331,9 @@ static int external_rate;
 static int external_channels;
 static int external_bits;
 static int external_buffer_ms;
-static int external_route = -1;			// alsa_output_key() at the open
-static char external_device[160];		// the ALSA name at the open
-static long external_checked_ms;		// when the two above were last compared
+static int external_route = -1;	  // alsa_output_key() at the open
+static char external_device[160]; // the ALSA name at the open
+static long external_checked_ms;  // when the two above were last compared
 
 // Underruns since the open, and when the last one was reported. A receiver
 // that stutters says so in the log, and how often -- which is the difference
@@ -4418,9 +4370,7 @@ static bool external_open_locked(void) {
 	return true;
 }
 
-bool audio_external_begin(int sample_rate, int channels, int bits) {
-	return audio_external_begin_latency(sample_rate, channels, bits, 0);
-}
+bool audio_external_begin(int sample_rate, int channels, int bits) { return audio_external_begin_latency(sample_rate, channels, bits, 0); }
 
 bool audio_external_begin_latency(int sample_rate, int channels, int bits, int buffer_ms) {
 	// A PCM held by gapless occupies the DAC. Callers here want to open one of
@@ -4454,8 +4404,7 @@ bool audio_external_begin_latency(int sample_rate, int channels, int bits, int b
 
 	bool ok = external_open_locked();
 
-	printf("audio: external source %s (%d Hz, %d ch, %d bits)\n", ok ? "playing" : "COULD NOT OPEN", sample_rate,
-		   channels, bits);
+	printf("audio: external source %s (%d Hz, %d ch, %d bits)\n", ok ? "playing" : "COULD NOT OPEN", sample_rate, channels, bits);
 
 	pthread_mutex_unlock(&external_lock);
 	return ok;
@@ -4477,8 +4426,7 @@ static bool external_follow_output(void) {
 		return true;
 	}
 
-	fprintf(stderr, "audio: the output moved under the external source (route %d -> %d, '%s' -> '%s'); re-opening\n",
-			external_route, route, external_device, device);
+	fprintf(stderr, "audio: the output moved under the external source (route %d -> %d, '%s' -> '%s'); re-opening\n", external_route, route, external_device, device);
 
 	// Dropped rather than drained: what is still in the buffer belongs to the
 	// socket nobody is listening to any more, and draining it would play it
