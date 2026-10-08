@@ -131,6 +131,10 @@ audio_status_t audio_get_status(void);
 // Values are in the range 0..1 and are safe to read from the UI thread.
 void audio_get_visualizer_levels(float *level, float *peak);
 
+// Returns 96 normalized frequency-band magnitudes from the most recent FFT
+// frame, ordered from low to high frequency. Values are in the range 0..1.
+void audio_get_visualizer_spectrum(float spectrum[96]);
+
 // Returns true exactly once if the current track reached its end on its own
 // since the last call, clearing the internal flag. User-initiated stops
 // (audio_stop/audio_play) do NOT set it. Lets the controller distinguish a
