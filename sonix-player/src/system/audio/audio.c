@@ -3693,8 +3693,8 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 			}
 
 			if (!passthrough && frames_read > 0) {
-				audio_capture_pcm(buffer, frames_read, channels, out_bits);
-				audio_run_fft(buffer, frames_read, channels, out_bits);
+				audio_capture_pcm((int32_t *)buffer, (int)frames_read, channels, out_bits);
+				audio_run_fft((int32_t *)buffer, (int)frames_read, channels, out_bits);
 			}
 		} else {
 			pthread_mutex_lock(&audio_mutex);
@@ -3726,8 +3726,8 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 			}
 
 			if (!passthrough && frames_read > 0) {
-				audio_capture_pcm(buffer, frames_read, channels, out_bits);
-				audio_run_fft(buffer, frames_read, channels, out_bits);
+				audio_capture_pcm((short *)buffer, (int)frames_read, channels, out_bits);
+				audio_run_fft((short *)buffer, (int)frames_read, channels, out_bits);
 			}
 		}
 
