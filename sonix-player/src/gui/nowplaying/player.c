@@ -1207,11 +1207,15 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 	int cx = width / 2;
 	int cy = height / 2;
 	bool playing = audio_get_status() == AUDIO_STATUS_PLAYING;
+	float level = 0.0f;
+	float peak = 0.0f;
+	audio_get_visualizer_levels(&level, &peak);
 	float time = (float)lv_tick_get() / 1000.0f;
 
 	for (int ring = 0; ring < 5; ring++) {
 		int radius = 48 + ring * 48 +
-			(int)(8.0f * sinf(time * (1.2f + ring * 0.22f)));
+			(int)(8.0f * sinf(time * (1.2f + ring * 0.22f))) +
+			(int)(level * (20.0f + ring * 3.0f));
 		radius = LV_MIN(radius, LV_MAX(8, LV_MIN(width, height) / 2 - 8));
 		lv_color_t color = ring % 2 == 0
 			? lv_color_make(92 + (playing ? 32 : 0),
@@ -1232,7 +1236,8 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 	for (int bar = 0; bar < 34; bar++) {
 		float angle = 6.2831853f * bar / 34.0f + time * 0.16f;
 		int radius = 94 + (bar % 5) * 12 +
-			(int)(5.0f * sinf(time * 2.0f + bar));
+			(int)(5.0f * sinf(time * 2.0f + bar)) +
+			(int)(peak * (14.0f + (bar % 5) * 3.0f));
 		int x = cx + (int)(cosf(angle) * radius);
 		int y = cy + (int)(sinf(angle) * radius);
 		if (x >= 0 && x < width && y >= 0 && y < height) {
