@@ -12,6 +12,7 @@
 #include "src/system/core/config.h"
 #include "src/system/device/power.h"
 #include "src/system/core/utils.h"
+#include "src/system/audio/kiss_fft.h"
 
 #include <math.h>
 #include <pthread.h>
@@ -236,6 +237,10 @@ static pthread_mutex_t output_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t visualizer_lock = PTHREAD_MUTEX_INITIALIZER;
 static float visualizer_level;
 static float visualizer_peak;
+static float visualizer_spectrum[96];
+static kiss_fft_cfg visualizer_fft_cfg;
+static kiss_fft_cpx visualizer_fft_input[256];
+static kiss_fft_cpx visualizer_fft_output[256];
 
 static pthread_t playback_thread;
 static pthread_mutex_t audio_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -2302,6 +2307,61 @@ void audio_get_visualizer_levels(float *level, float *peak) {
 	pthread_mutex_unlock(&visualizer_lock);
 }
 
+static void audio_run_fft(const void *buf, snd_pcm_uframes_t frames,
+								  int channels, int bits) {
+	if (!visualizer_fft_cfg || !buf || frames == 0 || channels == 0) {
+		return;
+	}
+
+	const size_t fft_size = 256;
+	const size_t frame_count = frames < fft_size ? frames : fft_size;
+	const uint8_t *p = (const uint8_t *)buf;
+	memset(visualizer_fft_input, 0, sizeof(visualizer_fft_input));
+	for (size_t frame = 0; frame < frame_count; frame++) {
+		int64_t mixed = 0;
+		for (int channel = 0; channel < channels; channel++) {
+			const size_t offset = (frame * (size_t)channels + (size_t)channel) * (bits / 8);
+			if (bits == 8) {
+				mixed += (int64_t)p[offset] - 128;
+			} else if (bits == 16) {
+				mixed += ((const int16_t *)(p + offset))[0];
+			} else if (bits == 24) {
+				int value = (int)p[offset] | ((int)p[offset + 1] << 8) |
+					((int)p[offset + 2] << 16);
+				if (value & 0x800000) {
+					value |= -0x1000000;
+				}
+				mixed += value;
+			} else {
+				mixed += ((const int32_t *)(p + offset))[0];
+			}
+		}
+		const int32_t sample = channels > 0 ? (int32_t)(mixed / channels) : 0;
+		visualizer_fft_input[frame].r = (kiss_fft_scalar)sample /
+			(bits == 8 ? 128.0f : bits == 16 ? 32768.0f : 2147483648.0f);
+	}
+	kiss_fft(visualizer_fft_cfg, visualizer_fft_input, visualizer_fft_output);
+
+	pthread_mutex_lock(&visualizer_lock);
+	for (int bin = 0; bin < 96; bin++) {
+		const size_t fft_bin = (size_t)bin * 2;
+		const double magnitude = hypot(
+			(double)visualizer_fft_output[fft_bin].r,
+			(double)visualizer_fft_output[fft_bin].i);
+		visualizer_spectrum[bin] = (float)fmin(1.0, magnitude / 64.0);
+	}
+	pthread_mutex_unlock(&visualizer_lock);
+}
+
+void audio_get_visualizer_spectrum(float spectrum[96]) {
+	if (!spectrum) {
+		return;
+	}
+	pthread_mutex_lock(&visualizer_lock);
+	memcpy(spectrum, visualizer_spectrum, sizeof(visualizer_spectrum));
+	pthread_mutex_unlock(&visualizer_lock);
+}
+
 static snd_pcm_sframes_t pcm_write_recover(snd_pcm_t **pcm, const void *buf, snd_pcm_uframes_t frames, int channels,
 										   int rate, int bits, snd_pcm_uframes_t *period) {
 	for (int attempt = 0; attempt < 8; attempt++) {
@@ -2355,6 +2415,7 @@ static snd_pcm_sframes_t pcm_write_recover(snd_pcm_t **pcm, const void *buf, snd
 		if (written >= 0) {
 			playback_wrote(*pcm, (snd_pcm_uframes_t)written);
 			audio_capture_pcm(buf, frames, channels, bits);
+			audio_run_fft(buf, frames, channels, bits);
 			return written;
 		}
 
@@ -4042,6 +4103,12 @@ int audio_init(void) {
 	static bool initialized = false;
 	if (initialized)
 		return 0;
+
+	visualizer_fft_cfg = kiss_fft_alloc(256, 0, NULL, NULL);
+	if (!visualizer_fft_cfg) {
+		fprintf(stderr, "Audio: failed to allocate visualizer FFT\n");
+		return -1;
+	}
 
 	growfile_set_reader_abort_cb(playback_reader_should_abort);
 

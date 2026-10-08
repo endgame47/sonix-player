@@ -1209,42 +1209,94 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 	bool playing = audio_get_status() == AUDIO_STATUS_PLAYING;
 	float level = 0.0f;
 	float peak = 0.0f;
+	float spectrum[96] = {0};
 	audio_get_visualizer_levels(&level, &peak);
+	audio_get_visualizer_spectrum(spectrum);
 	float time = (float)lv_tick_get() / 1000.0f;
+	float inner_radius = LV_MIN(width, height) * 0.18f;
+	float outer_radius = LV_MIN(width, height) * 0.36f;
+	lv_color_t spectrum_color = playing
+		? lv_color_make(72, 150, 255)
+		: lv_color_make(125, 125, 155);
+	lv_color_t waveform_color = playing
+		? lv_color_make(180, 235, 255)
+		: lv_color_make(110, 160, 195);
 
-	for (int ring = 0; ring < 5; ring++) {
-		int radius = 48 + ring * 48 +
-			(int)(8.0f * sinf(time * (1.2f + ring * 0.22f))) +
-			(int)(level * (20.0f + ring * 3.0f));
-		radius = LV_MIN(radius, LV_MAX(8, LV_MIN(width, height) / 2 - 8));
-		lv_color_t color = ring % 2 == 0
-			? lv_color_make(92 + (playing ? 32 : 0),
-				150 + (playing ? 42 : 0), 255)
-			: lv_color_make(255, 86 + (playing ? 64 : 0),
-				180 + (playing ? 38 : 0));
-		for (int segment = 0; segment < 96; segment++) {
-			float angle = 6.2831853f * segment / 96.0f +
-				time * (ring % 2 ? 0.35f : -0.22f);
-			int x = cx + (int)(cosf(angle) * radius);
-			int y = cy + (int)(sinf(angle) * radius);
+	// Draw the circular spectrum as a set of radial bars. Each segment grows
+	// from the inner ring in proportion to the live PCM level, while the
+	// angular modulation makes the result feel like a spectrum rather than a
+	// set of unrelated dots.
+	for (int segment = 0; segment < 96; segment++) {
+		float angle = 2.0f * M_PI * segment / 96.0f + time * 0.08f;
+		float band = 0.22f + 0.78f *
+			(0.5f + 0.5f * sinf((float)segment * 0.48f + time * 1.4f));
+		float magnitude = spectrum[segment] * (0.35f + level * 0.65f);
+		float bar_length = inner_radius + (outer_radius - inner_radius) *
+			(0.22f + magnitude * 0.78f * band);
+		float start_radius = inner_radius;
+		float end_radius = bar_length;
+		int start_x = cx + (int)(cosf(angle) * start_radius);
+		int start_y = cy + (int)(sinf(angle) * start_radius);
+		int end_x = cx + (int)(cosf(angle) * end_radius);
+		int end_y = cy + (int)(sinf(angle) * end_radius);
+		int dx = end_x - start_x;
+		int dy = end_y - start_y;
+		int steps = LV_MAX(1, LV_MAX(abs(dx), abs(dy)));
+		for (int i = 0; i <= steps; i++) {
+			int x = start_x + dx * i / steps;
+			int y = start_y + dy * i / steps;
 			if (x >= 0 && x < width && y >= 0 && y < height) {
-				lv_canvas_set_px(visualizer_canvas, x, y, color, LV_OPA_COVER);
+				lv_canvas_set_px(visualizer_canvas, x, y, spectrum_color,
+					LV_OPA_COVER);
 			}
 		}
 	}
 
-	for (int bar = 0; bar < 34; bar++) {
-		float angle = 6.2831853f * bar / 34.0f + time * 0.16f;
-		int radius = 94 + (bar % 5) * 12 +
-			(int)(5.0f * sinf(time * 2.0f + bar)) +
-			(int)(peak * (14.0f + (bar % 5) * 3.0f));
+	/*
+	// Draw a continuous waveform ring, with PCM amplitude changing the ring's
+	// vertical displacement. The point sequence is connected with short line
+	// segments so the result is visibly circular instead of a collection of
+	// isolated pixels.
+	int previous_x = cx + (int)(cosf(time * 0.8f) * outer_radius);
+	int previous_y = cy + (int)(sinf(time * 0.8f) * outer_radius);
+	for (int point = 0; point <= 180; point++) {
+		float angle = 2.0f * M_PI * point / 180.0f + time * 0.18f;
+		float fft_wave = spectrum[point % 96] * 0.28f;
+		float waveform = sinf(angle * 5.0f + time * 2.2f) *
+			(0.08f + peak * 0.2f + fft_wave);
+		float radius = outer_radius * (1.0f + waveform);
 		int x = cx + (int)(cosf(angle) * radius);
 		int y = cy + (int)(sinf(angle) * radius);
-		if (x >= 0 && x < width && y >= 0 && y < height) {
-			lv_canvas_set_px(visualizer_canvas, x, y,
-				lv_color_make(210, 226, 255), LV_OPA_COVER);
+		int dx = x - previous_x;
+		int dy = y - previous_y;
+		int steps = LV_MAX(1, LV_MAX(abs(dx), abs(dy)));
+		for (int i = 1; i <= steps; i++) {
+			int px = previous_x + dx * i / steps;
+			int py = previous_y + dy * i / steps;
+			if (px >= 0 && px < width && py >= 0 && py < height) {
+				lv_canvas_set_px(visualizer_canvas, px, py, waveform_color,
+					LV_OPA_COVER);
+			}
+		}
+		previous_x = x;
+		previous_y = y;
+	}
+	//*/
+
+	/*
+	// Add a quiet circular guide and a bright center to keep the geometry
+	// readable without allowing either to use artwork or cover pixels.
+	for (int radius = 0; radius < 3; radius++) {
+		for (int x = cx - radius; x <= cx + radius; x++) {
+			for (int y = cy - radius; y <= cy + radius; y++) {
+				if (x >= 0 && x < width && y >= 0 && y < height) {
+					lv_canvas_set_px(visualizer_canvas, x, y,
+						lv_color_make(255, 255, 255), LV_OPA_COVER);
+				}
+			}
 		}
 	}
+	//*/
 }
 
 static void slider_over_waveform(bool over) {
