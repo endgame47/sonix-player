@@ -324,12 +324,12 @@ carried across from the stock firmware.
 |---|---|---|
 | sound card | `x1600_hiby_r3proii_sound_card.ko` | `x1600_hiby_r1_sound_card.ko` |
 | DAC | `codec_cs43198_dual.ko` | `codec_cs43131.ko` |
-| panel, touch | `lcd_st7701_sbtc033001.ko` | `cst8xx_touch.ko` (two fingers) |
+| panel, touch | `lcd_st7701_sbtc033001.ko` | `lcd_lg35583.ko`, `cst8xx_touch.ko` (two fingers) |
 | keys | `keyboard_adc.ko` | `keyboard_adc_multifunc.ko` |
 | LEDs | `leds_sgm31324_add.ko` | `leds_pwm_add.ko` |
 | Type-C | `fusb302b_add.ko` | `tcs1421_add.ko` |
 | board | `gpio_aw95016_add.ko`, `sau.ko` | |
-| on both | `cw2015.ko` (fuel gauge), `soc_efuse.ko`, `sa_sound_switch.ko`, `sa_earpods_adc.ko`, `pwm_backlight.ko`, `soc_utils.ko`, `sa_config_module.ko` | the same |
+| on both | `cw2015.ko` (fuel gauge), `soc_efuse.ko`, `soc_adc.ko`, `rmem_manager.ko`, `i2c_gpio_add.ko` (the DAC's I2C bus), `keyboard_gpio_add.ko` (power and track keys), `sa_sound_switch.ko`, `sa_earpods_adc.ko`, `pwm_backlight.ko`, `soc_utils.ko`, `sa_config_module.ko` | the same |
 | Wi-Fi | `brcmfmac.ko`, `brcmutil.ko` and `bcm_wlbt_power.ko` in place of `cywdhd.ko` | the same |
 
 The R3 Pro II's `gt9xx_touch.ko` is still HiBy's, patched for multitouch (see
