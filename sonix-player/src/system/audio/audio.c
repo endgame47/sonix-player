@@ -13,6 +13,7 @@
 #include "src/system/device/power.h"
 #include "src/system/core/utils.h"
 
+#include <math.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -232,6 +233,9 @@ static s24_scratch_t playback_s24;
 static s24_scratch_t external_s24;
 
 static pthread_mutex_t output_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t visualizer_lock = PTHREAD_MUTEX_INITIALIZER;
+static float visualizer_level;
+static float visualizer_peak;
 
 static pthread_t playback_thread;
 static pthread_mutex_t audio_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -2248,6 +2252,56 @@ static void playback_wrote(snd_pcm_t *pcm, snd_pcm_uframes_t frames) {
 	playback_follow(pcm);
 }
 
+static void audio_capture_pcm(const void *buf, snd_pcm_uframes_t frames,
+									   int channels, int bits) {
+	const size_t samples = (size_t)frames * (size_t)channels;
+	if (!buf || samples == 0) {
+		return;
+	}
+
+	double sum = 0.0;
+	double peak = 0.0;
+	const uint8_t *p = (const uint8_t *)buf;
+	if (bits == 8) {
+		for (size_t i = 0; i < samples; i++) {
+			const int value = (int)p[i] - 128;
+			sum += (double)value * value;
+			peak = fmax(peak, fabs((double)value));
+		}
+	} else if (bits == 16) {
+		for (size_t i = 0; i < samples; i++) {
+			const int16_t value = ((const int16_t *)p)[i];
+			sum += (double)value * value;
+			peak = fmax(peak, fabs((double)value));
+		}
+	} else {
+		for (size_t i = 0; i < samples; i++) {
+			const int32_t value = ((const int32_t *)p)[i];
+			sum += (double)value * value;
+			peak = fmax(peak, fabs((double)value));
+		}
+	}
+
+	const double rms = sqrt(sum / (double)samples);
+	const double scale = bits == 8 ? 128.0 : bits == 16 ? 32768.0 : 2147483648.0;
+	const float level = (float)fmin(1.0, rms / scale);
+	const float peak_level = (float)fmin(1.0, peak / scale);
+	pthread_mutex_lock(&visualizer_lock);
+	visualizer_level = level;
+	visualizer_peak = peak_level;
+	pthread_mutex_unlock(&visualizer_lock);
+}
+
+void audio_get_visualizer_levels(float *level, float *peak) {
+	if (!level || !peak) {
+		return;
+	}
+	pthread_mutex_lock(&visualizer_lock);
+	*level = visualizer_level;
+	*peak = visualizer_peak;
+	pthread_mutex_unlock(&visualizer_lock);
+}
+
 static snd_pcm_sframes_t pcm_write_recover(snd_pcm_t **pcm, const void *buf, snd_pcm_uframes_t frames, int channels,
 										   int rate, int bits, snd_pcm_uframes_t *period) {
 	for (int attempt = 0; attempt < 8; attempt++) {
@@ -2300,6 +2354,7 @@ static snd_pcm_sframes_t pcm_write_recover(snd_pcm_t **pcm, const void *buf, snd
 		}
 		if (written >= 0) {
 			playback_wrote(*pcm, (snd_pcm_uframes_t)written);
+			audio_capture_pcm(buf, frames, channels, bits);
 			return written;
 		}
 
