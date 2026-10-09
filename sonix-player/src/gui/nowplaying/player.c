@@ -1251,13 +1251,19 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 		int end_y = cy + (int)(sinf(angle) * end_radius);
 		int dx = end_x - start_x;
 		int dy = end_y - start_y;
+		int perpendicular_x = (int)roundf(-sinf(angle));
+		int perpendicular_y = (int)roundf(cosf(angle));
 		int steps = LV_MAX(1, LV_MAX(abs(dx), abs(dy)));
 		for (int i = 0; i <= steps; i++) {
 			int x = start_x + dx * i / steps;
 			int y = start_y + dy * i / steps;
-			if (x >= 0 && x < width && y >= 0 && y < height) {
-				lv_canvas_set_px(visualizer_canvas, x, y, bar_color,
-					LV_OPA_COVER);
+			for (int thickness = -1; thickness <= 1; thickness++) {
+				int px = x + perpendicular_x * thickness;
+				int py = y + perpendicular_y * thickness;
+				if (px >= 0 && px < width && py >= 0 && py < height) {
+					lv_canvas_set_px(visualizer_canvas, px, py, bar_color,
+						LV_OPA_COVER);
+				}
 			}
 		}
 	}
