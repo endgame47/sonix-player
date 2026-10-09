@@ -136,16 +136,16 @@ void audio_stop();
 
 audio_status_t audio_get_status(void);
 
-// Enables or disables the PCM analysis used by the now-playing visualizer.
+// Starts or stops the now-playing visualizer's capture (visualizer.c).
 void audio_set_visualizer_enabled(bool enabled);
 
-// Returns normalized RMS and peak level from the most recent local PCM write.
-// Values are in the range 0..1 and are safe to read from the UI thread.
-void audio_get_visualizer_levels(float *level, float *peak);
-
-// Returns AUDIO_VISUALIZER_BINS normalized frequency-band magnitudes from the
-// most recent FFT frame, ordered from low to high frequency. Values are 0..1.
-void audio_get_visualizer_spectrum(float spectrum[AUDIO_VISUALIZER_BINS]);
+// One visualizer frame, for the UI thread: AUDIO_VISUALIZER_BINS bands from
+// low to high frequency, on a log scale and in dB, and the RMS and peak level
+// of the same audio; all 0..1. False, with everything 0, when nothing is
+// playing through the PCM path (paused, stopped, native DSD or DoP). Asking
+// is also what keeps the capture running: without a call for 250 ms the
+// playback thread stops copying.
+bool audio_get_visualizer_frame(float spectrum[AUDIO_VISUALIZER_BINS], float *level, float *peak);
 
 // Returns true exactly once if the current track reached its end on its own
 // since the last call, clearing the internal flag. User-initiated stops
