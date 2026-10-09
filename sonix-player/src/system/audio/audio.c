@@ -239,9 +239,11 @@ static bool visualizer_enabled;
 static float visualizer_level;
 static float visualizer_peak;
 static float visualizer_spectrum[AUDIO_VISUALIZER_BINS];
+#define VISUALIZER_FFT_SIZE 256
 static kiss_fft_cfg visualizer_fft_cfg;
-static kiss_fft_cpx visualizer_fft_input[256];
-static kiss_fft_cpx visualizer_fft_output[256];
+static kiss_fft_cpx visualizer_fft_input[VISUALIZER_FFT_SIZE];
+static kiss_fft_cpx visualizer_fft_output[VISUALIZER_FFT_SIZE];
+static float visualizer_fft_window[VISUALIZER_FFT_SIZE];
 
 static pthread_t playback_thread;
 static pthread_mutex_t audio_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -2330,7 +2332,7 @@ static void audio_run_fft(const void *buf, snd_pcm_uframes_t frames,
 		return;
 	}
 
-	const size_t fft_size = 256;
+	const size_t fft_size = VISUALIZER_FFT_SIZE;
 	const size_t frame_count = frames < fft_size ? frames : fft_size;
 	const uint8_t *p = (const uint8_t *)buf;
 	memset(visualizer_fft_input, 0, sizeof(visualizer_fft_input));
@@ -2354,8 +2356,10 @@ static void audio_run_fft(const void *buf, snd_pcm_uframes_t frames,
 			}
 		}
 		const int32_t sample = channels > 0 ? (int32_t)(mixed / channels) : 0;
-		visualizer_fft_input[frame].r = (kiss_fft_scalar)sample /
+		float normalized_sample = (float)sample /
 			(bits == 8 ? 128.0f : bits == 16 ? 32768.0f : 2147483648.0f);
+		// apply window function to reduce spectral leakage
+		visualizer_fft_input[frame].r = (kiss_fft_scalar)(normalized_sample * visualizer_fft_window[frame]);
 	}
 	kiss_fft(visualizer_fft_cfg, visualizer_fft_input, visualizer_fft_output);
 
@@ -4129,10 +4133,16 @@ int audio_init(void) {
 	if (initialized)
 		return 0;
 
-	visualizer_fft_cfg = kiss_fft_alloc(256, 0, NULL, NULL);
+	visualizer_fft_cfg = kiss_fft_alloc(VISUALIZER_FFT_SIZE, 0, NULL, NULL);
 	if (!visualizer_fft_cfg) {
 		fprintf(stderr, "Audio: failed to allocate visualizer FFT\n");
 		return -1;
+	}
+
+	// calculate the Hann window for the visualizer FFT: it is a one-time cost
+	for (int i = 0; i < VISUALIZER_FFT_SIZE; i++) {
+		visualizer_fft_window[i] = 0.5f * (1.0f - cosf(
+			2.0f * (float)M_PI * i / (VISUALIZER_FFT_SIZE - 1)));
 	}
 
 	growfile_set_reader_abort_cb(playback_reader_should_abort);
