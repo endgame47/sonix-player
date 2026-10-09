@@ -1214,8 +1214,7 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 	float level = 0.0f;
 	float peak_level = 0.0f;
 	float spectrum[AUDIO_VISUALIZER_BINS] = {0};
-	audio_get_visualizer_levels(&level, &peak_level);
-	audio_get_visualizer_spectrum(spectrum);
+	audio_get_visualizer_frame(spectrum, &level, &peak_level);
 	
 	bool playing = audio_get_status() == AUDIO_STATUS_PLAYING;
 
@@ -1236,7 +1235,7 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 		// Each bin rises from the same baseline, with a dim reflection and a
 		// decaying peak marker above the current level.
 		for (int segment = 0; segment < AUDIO_VISUALIZER_BINS; segment++) {
-			float magnitude = sqrtf(fminf(1.0f, spectrum[segment] * 32.0f));
+			float magnitude = spectrum[segment];
 			magnitude *= 0.55f + sqrtf(level) * 0.45f;
 			float *held_peak = &visualizer_bin_peaks[segment];
 			if (magnitude >= *held_peak) {
@@ -1305,9 +1304,8 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 			float band = 0.22f + 0.78f *
 				(0.5f + 0.5f * sinf((float)segment * 0.48f + time * 1.4f));
 
-			// FFT magnitudes are usually far below 1.0, so amplify and compress
-			// them before mapping to pixels. Keep quiet passages responsive too.
-			float magnitude = sqrtf(fminf(1.0f, spectrum[segment] * 32.0f));
+			// The bands come on a dB scale already, 0..1.
+			float magnitude = spectrum[segment];
 			magnitude *= 0.55f + sqrtf(level) * 0.45f;
 
 			float color_intensity = 0.2f + magnitude * 0.8f;

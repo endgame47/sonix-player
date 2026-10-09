@@ -12,9 +12,8 @@
 #include "src/system/core/config.h"
 #include "src/system/device/power.h"
 #include "src/system/core/utils.h"
-#include "src/system/audio/kiss_fft.h"
+#include "src/system/audio/visualizer.h"
 
-#include <math.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -234,16 +233,6 @@ static s24_scratch_t playback_s24;
 static s24_scratch_t external_s24;
 
 static pthread_mutex_t output_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t visualizer_lock = PTHREAD_MUTEX_INITIALIZER;
-static bool visualizer_enabled;
-static float visualizer_level;
-static float visualizer_peak;
-static float visualizer_spectrum[AUDIO_VISUALIZER_BINS];
-#define VISUALIZER_FFT_SIZE 256
-static kiss_fft_cfg visualizer_fft_cfg;
-static kiss_fft_cpx visualizer_fft_input[VISUALIZER_FFT_SIZE];
-static kiss_fft_cpx visualizer_fft_output[VISUALIZER_FFT_SIZE];
-static float visualizer_fft_window[VISUALIZER_FFT_SIZE];
 
 static pthread_t playback_thread;
 static pthread_mutex_t audio_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -2260,129 +2249,6 @@ static void playback_wrote(snd_pcm_t *pcm, snd_pcm_uframes_t frames) {
 	playback_follow(pcm);
 }
 
-static void audio_capture_pcm(const void *buf, snd_pcm_uframes_t frames,
-									   int channels, int bits) {
-	const size_t samples = (size_t)frames * (size_t)channels;
-	if (!buf || samples == 0) {
-		return;
-	}
-
-	double sum = 0.0;
-	double peak = 0.0;
-	const uint8_t *p = (const uint8_t *)buf;
-	if (bits == 8) {
-		for (size_t i = 0; i < samples; i++) {
-			const int value = (int)p[i] - 128;
-			sum += (double)value * value;
-			peak = fmax(peak, fabs((double)value));
-		}
-	} else if (bits == 16) {
-		for (size_t i = 0; i < samples; i++) {
-			const int16_t value = ((const int16_t *)p)[i];
-			sum += (double)value * value;
-			peak = fmax(peak, fabs((double)value));
-		}
-	} else {
-		for (size_t i = 0; i < samples; i++) {
-			const int32_t value = ((const int32_t *)p)[i];
-			sum += (double)value * value;
-			peak = fmax(peak, fabs((double)value));
-		}
-	}
-
-	const double rms = sqrt(sum / (double)samples);
-	const double scale = bits == 8 ? 128.0 : bits == 16 ? 32768.0 : 2147483648.0;
-	const float level = (float)fmin(1.0, rms / scale);
-	const float peak_level = (float)fmin(1.0, peak / scale);
-	pthread_mutex_lock(&visualizer_lock);
-	visualizer_level = level;
-	visualizer_peak = peak_level;
-	pthread_mutex_unlock(&visualizer_lock);
-}
-
-void audio_get_visualizer_levels(float *level, float *peak) {
-	if (!level || !peak) {
-		return;
-	}
-	pthread_mutex_lock(&visualizer_lock);
-	*level = visualizer_level;
-	*peak = visualizer_peak;
-	pthread_mutex_unlock(&visualizer_lock);
-}
-
-void audio_set_visualizer_enabled(bool enabled) {
-	pthread_mutex_lock(&visualizer_lock);
-	visualizer_enabled = enabled;
-	visualizer_level = 0.0f;
-	visualizer_peak = 0.0f;
-	memset(visualizer_spectrum, 0, sizeof(visualizer_spectrum));
-	pthread_mutex_unlock(&visualizer_lock);
-}
-
-static bool audio_visualizer_is_enabled(void) {
-	pthread_mutex_lock(&visualizer_lock);
-	bool enabled = visualizer_enabled;
-	pthread_mutex_unlock(&visualizer_lock);
-	return enabled;
-}
-
-static void audio_run_fft(const void *buf, snd_pcm_uframes_t frames,
-								  int channels, int bits) {
-	if (!visualizer_fft_cfg || !buf || frames == 0 || channels == 0) {
-		return;
-	}
-
-	const size_t fft_size = VISUALIZER_FFT_SIZE;
-	const size_t frame_count = frames < fft_size ? frames : fft_size;
-	const uint8_t *p = (const uint8_t *)buf;
-	memset(visualizer_fft_input, 0, sizeof(visualizer_fft_input));
-	for (size_t frame = 0; frame < frame_count; frame++) {
-		int64_t mixed = 0;
-		for (int channel = 0; channel < channels; channel++) {
-			const size_t offset = (frame * (size_t)channels + (size_t)channel) * (bits / 8);
-			if (bits == 8) {
-				mixed += (int64_t)p[offset] - 128;
-			} else if (bits == 16) {
-				mixed += ((const int16_t *)(p + offset))[0];
-			} else if (bits == 24) {
-				int value = (int)p[offset] | ((int)p[offset + 1] << 8) |
-					((int)p[offset + 2] << 16);
-				if (value & 0x800000) {
-					value |= -0x1000000;
-				}
-				mixed += value;
-			} else {
-				mixed += ((const int32_t *)(p + offset))[0];
-			}
-		}
-		const int32_t sample = channels > 0 ? (int32_t)(mixed / channels) : 0;
-		float normalized_sample = (float)sample /
-			(bits == 8 ? 128.0f : bits == 16 ? 32768.0f : 2147483648.0f);
-		// apply window function to reduce spectral leakage
-		visualizer_fft_input[frame].r = (kiss_fft_scalar)(normalized_sample * visualizer_fft_window[frame]);
-	}
-	kiss_fft(visualizer_fft_cfg, visualizer_fft_input, visualizer_fft_output);
-
-	pthread_mutex_lock(&visualizer_lock);
-	for (int bin = 0; bin < AUDIO_VISUALIZER_BINS; bin++) {
-		const size_t fft_bin = (size_t)bin * 128 / AUDIO_VISUALIZER_BINS;
-		const double magnitude = hypot(
-			(double)visualizer_fft_output[fft_bin].r,
-			(double)visualizer_fft_output[fft_bin].i);
-		visualizer_spectrum[bin] = (float)fmin(1.0, magnitude / 64.0);
-	}
-	pthread_mutex_unlock(&visualizer_lock);
-}
-
-void audio_get_visualizer_spectrum(float spectrum[AUDIO_VISUALIZER_BINS]) {
-	if (!spectrum) {
-		return;
-	}
-	pthread_mutex_lock(&visualizer_lock);
-	memcpy(spectrum, visualizer_spectrum, sizeof(visualizer_spectrum));
-	pthread_mutex_unlock(&visualizer_lock);
-}
-
 static snd_pcm_sframes_t pcm_write_recover(snd_pcm_t **pcm, const void *buf, snd_pcm_uframes_t frames, int channels,
 										   int rate, int bits, snd_pcm_uframes_t *period) {
 	for (int attempt = 0; attempt < 8; attempt++) {
@@ -3028,6 +2894,7 @@ static void play_wav_file(const char *filepath) {
 				mono_process_s32((int32_t *)buffer, frames_read, info.channels);
 				balance_process_s32((int32_t *)buffer, frames_read, info.channels);
 			}
+			visualizer_feed(buffer, frames_read, info.channels, info.out_bits, info.sample_rate, pcm_handle);
 		}
 		if (frames_read <= 0) {
 			// As in the decoded path: a file that gave nothing has not been
@@ -3713,9 +3580,8 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 				balance_process_s32((int32_t *)buffer, (int)frames_read, channels);
 			}
 
-			if (!passthrough && frames_read > 0 && audio_visualizer_is_enabled()) {
-				audio_capture_pcm((int32_t *)buffer, (int)frames_read, channels, out_bits);
-				audio_run_fft((int32_t *)buffer, (int)frames_read, channels, out_bits);
+			if (!passthrough && frames_read > 0) {
+				visualizer_feed(buffer, (int)frames_read, channels, 32, out_rate, pcm_handle);
 			}
 		} else {
 			pthread_mutex_lock(&audio_mutex);
@@ -3746,9 +3612,8 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 				balance_process((short *)buffer, (int)frames_read, channels);
 			}
 
-			if (!passthrough && frames_read > 0 && audio_visualizer_is_enabled()) {
-				audio_capture_pcm((short *)buffer, (int)frames_read, channels, out_bits);
-				audio_run_fft((short *)buffer, (int)frames_read, channels, out_bits);
+			if (!passthrough && frames_read > 0) {
+				visualizer_feed(buffer, (int)frames_read, channels, 16, sample_rate, pcm_handle);
 			}
 		}
 
@@ -4132,18 +3997,6 @@ int audio_init(void) {
 	static bool initialized = false;
 	if (initialized)
 		return 0;
-
-	visualizer_fft_cfg = kiss_fft_alloc(VISUALIZER_FFT_SIZE, 0, NULL, NULL);
-	if (!visualizer_fft_cfg) {
-		fprintf(stderr, "Audio: failed to allocate visualizer FFT\n");
-		return -1;
-	}
-
-	// calculate the Hann window for the visualizer FFT: it is a one-time cost
-	for (int i = 0; i < VISUALIZER_FFT_SIZE; i++) {
-		visualizer_fft_window[i] = 0.5f * (1.0f - cosf(
-			2.0f * (float)M_PI * i / (VISUALIZER_FFT_SIZE - 1)));
-	}
 
 	growfile_set_reader_abort_cb(playback_reader_should_abort);
 
