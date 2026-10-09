@@ -15,7 +15,7 @@ into each image.
 | DAC | two Cirrus Logic CS43198 | one Cirrus Logic CS43131 |
 | headphone outputs | 3.5 mm, 4.4 mm balanced | 3.5 mm |
 | DAC controls | digital filters, DRE, NOS | digital filters, NOS |
-| touch | Goodix gt9xx, patched for multitouch | Hynitron CST8xx, open-source driver, two fingers |
+| touch | Goodix gt9xx, open-source driver, five fingers | Hynitron CST8xx, open-source driver, two fingers |
 | kernel | custom 4.4.94, see [hiby-custom-kernel](https://github.com/Jepl4r/hiby-custom-kernel) | the same |
 | double tap to wake | yes | no |
 | buttons | volume on the left flank, playback on the right | all on the right flank, one skip key |
@@ -237,7 +237,7 @@ assets/R3PII/                           (and assets/R1/, the same shape)
 │   │       ├── fonts/               default.otf, bold.otf, then korean, thai and arabic .otf, each with a -bold
 │   │       └── gui/                 some of the .png assets the UI loads at runtime - the rest are inside the binary.
 │   └── share/web/                   icons and images for the Wi-Fi transfer page                        
-└── module_driver/                   the open-source modules, the patched gt9xx touch driver and the changed load scripts
+└── module_driver/                   the open-source modules and the changed load scripts
 ```
 
 `system-info.json` has to be there, and its `device-name` has to be the model
@@ -330,16 +330,13 @@ carried across from the stock firmware.
 |---|---|---|
 | sound card | `x1600_hiby_r3proii_sound_card.ko` | `x1600_hiby_r1_sound_card.ko` |
 | DAC | `codec_cs43198_dual.ko` | `codec_cs43131.ko` |
-| panel, touch | `lcd_st7701_sbtc033001.ko` | `lcd_lg35583.ko`, `cst8xx_touch.ko` (two fingers) |
+| panel, touch | `lcd_st7701_sbtc033001.ko`, `gt9xx_touch.ko` (five fingers) | `lcd_lg35583.ko`, `cst8xx_touch.ko` (two fingers) |
 | keys | `keyboard_adc.ko` | `keyboard_adc_multifunc.ko` |
 | LEDs | `leds_sgm31324_add.ko` | `leds_pwm_add.ko` |
 | Type-C | `fusb302b_add.ko` | `tcs1421_add.ko` |
 | board | `gpio_aw95016_add.ko`, `sau.ko`, `sa_sound_hbc3000.ko` (the HBC3000 FPGA; its configuration comes from the stock firmware, see step 5 above) | |
-| on both | `cw2015.ko` (fuel gauge), `soc_efuse.ko`, `soc_adc.ko`, `rmem_manager.ko`, `i2c_gpio_add.ko` (the DAC's I2C bus), `keyboard_gpio_add.ko` (power and track keys), `sa_sound_switch.ko`, `sa_earpods_adc.ko`, `pwm_backlight.ko`, `soc_utils.ko`, `sa_config_module.ko`, `utils.ko` (the helpers the other modules link against), `soc_gpio.ko` (`/dev/gpio`), `sa_hgl_dma.ko` (`/dev/sa_hgl_dma`), `soc_aic.ko` (the I2S controller), `soc_pwm.ko` (the PWM controller) | the same |
+| on both | `cw2015.ko` (fuel gauge), `soc_efuse.ko`, `soc_adc.ko`, `rmem_manager.ko`, `i2c_gpio_add.ko` (the DAC's I2C bus), `keyboard_gpio_add.ko` (power and track keys), `sa_sound_switch.ko`, `sa_earpods_adc.ko`, `pwm_backlight.ko`, `soc_utils.ko`, `sa_config_module.ko`, `utils.ko` (the helpers the other modules link against), `soc_gpio.ko` (`/dev/gpio`), `sa_hgl_dma.ko` (`/dev/sa_hgl_dma`), `soc_aic.ko` (the I2S controller), `soc_pwm.ko` (the PWM controller), `soc_i2c.ko` (the I2C controllers) | the same |
 | Wi-Fi | `brcmfmac.ko`, `brcmutil.ko` and `bcm_wlbt_power.ko` in place of `cywdhd.ko` | the same |
-
-The R3 Pro II's `gt9xx_touch.ko` is still HiBy's, patched for multitouch (see
-[PATCHES.md](PATCHES.md)).
 
 ### Patches
 
@@ -390,7 +387,7 @@ sonix-player/
 │   ├── assets/
 │   │   ├── R3PII/                   the R3 Pro II overlay
 │   │   │   ├── etc/                 boot logos (480x720), sonix-player.conf, cert.pem, modified S80_bt_init
-│   │   │   ├── module_driver/       the open-source modules; patched gt9xx_touch.ko, gt9xx_touch.sh and leds_sgm31324_add.sh with 3 added LED registers
+│   │   │   ├── module_driver/       the open-source modules, gt9xx_touch.ko among them; gt9xx_touch.sh for five fingers and leds_sgm31324_add.sh with 3 added LED registers
 │   │   │   └── usr/                 bluealsa 4.3.1, resources required by Sonix Player
 │   │   └── R1/                      the R1 overlay
 │   │       ├── etc/                 boot logos (480x800), sonix-player.conf, cert.pem, modified S80_bt_init
