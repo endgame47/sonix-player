@@ -1230,9 +1230,17 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 		float angle = 2.0f * M_PI * segment / 96.0f + time * 0.08f;
 		float band = 0.22f + 0.78f *
 			(0.5f + 0.5f * sinf((float)segment * 0.48f + time * 1.4f));
-		float magnitude = spectrum[segment] * (0.35f + level * 0.65f);
+		// FFT magnitudes are usually far below 1.0, so amplify and compress
+		// them before mapping to pixels. Keep quiet passages responsive too.
+		float magnitude = sqrtf(fminf(1.0f, spectrum[segment] * 32.0f));
+		magnitude *= 0.55f + sqrtf(level) * 0.45f;
+		float color_intensity = 0.2f + magnitude * 0.8f;
+		lv_color_t bar_color = lv_color_make(
+			(uint8_t)(spectrum_color.red * color_intensity),
+			(uint8_t)(spectrum_color.green * color_intensity),
+			(uint8_t)(spectrum_color.blue * color_intensity));
 		float bar_length = inner_radius + (outer_radius - inner_radius) *
-			(0.22f + magnitude * 0.78f * band);
+			(0.08f + magnitude * 0.92f * band);
 		float start_radius = inner_radius;
 		float end_radius = bar_length;
 		int start_x = cx + (int)(cosf(angle) * start_radius);
@@ -1246,7 +1254,7 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 			int x = start_x + dx * i / steps;
 			int y = start_y + dy * i / steps;
 			if (x >= 0 && x < width && y >= 0 && y < height) {
-				lv_canvas_set_px(visualizer_canvas, x, y, spectrum_color,
+				lv_canvas_set_px(visualizer_canvas, x, y, bar_color,
 					LV_OPA_COVER);
 			}
 		}
