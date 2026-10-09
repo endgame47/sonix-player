@@ -333,12 +333,12 @@ carried across from the stock firmware.
 |---|---|---|
 | sound card | `x1600_hiby_r3proii_sound_card.ko` | `x1600_hiby_r1_sound_card.ko` |
 | DAC | `codec_cs43198_dual.ko` | `codec_cs43131.ko` |
-| panel, touch | `lcd_st7701_sbtc033001.ko`, `gt9xx_touch.ko` (five fingers) | `lcd_lg35583.ko`, `lcd_lg35583.ko`, `cst8xx_touch.ko` (two fingers) |
+| panel, touch | `lcd_st7701_sbtc033001.ko`, `gt9xx_touch.ko` (five fingers), `gt9xx_touch.ko` (five fingers) | `lcd_lg35583.ko`, `lcd_lg35583.ko`, `cst8xx_touch.ko` (two fingers) |
 | keys | `keyboard_adc.ko` | `keyboard_adc_multifunc.ko` |
 | LEDs | `leds_sgm31324_add.ko` | `leds_pwm_add.ko` |
 | Type-C | `fusb302b_add.ko` | `tcs1421_add.ko` |
 | board | `gpio_aw95016_add.ko`, `sau.ko`, `sa_sound_hbc3000.ko` (the HBC3000 FPGA; its configuration comes from the stock firmware, see step 5 above) | |
-| on both | `cw2015.ko` (fuel gauge), `soc_efuse.ko`, `soc_adc.ko`, `rmem_manager.ko`, `i2c_gpio_add.ko` (the DAC's I2C bus), `keyboard_gpio_add.ko` (power and track keys), `sa_sound_switch.ko`, `sa_earpods_adc.ko`, `pwm_backlight.ko`, `soc_utils.ko`, `sa_config_module.ko`, `utils.ko` (the helpers the other modules link against), `soc_gpio.ko` (`/dev/gpio`), `sa_hgl_dma.ko` (`/dev/sa_hgl_dma`), `soc_aic.ko` (the I2S controller), `soc_pwm.ko` (the PWM controller) | the same |
+| on both | `cw2015.ko` (fuel gauge), `soc_efuse.ko`, `soc_adc.ko`, `rmem_manager.ko`, `i2c_gpio_add.ko` (the DAC's I2C bus), `keyboard_gpio_add.ko` (power and track keys), `sa_sound_switch.ko`, `sa_earpods_adc.ko`, `pwm_backlight.ko`, `soc_utils.ko`, `sa_config_module.ko`, `utils.ko` (the helpers the other modules link against), `soc_gpio.ko` (`/dev/gpio`), `sa_hgl_dma.ko` (`/dev/sa_hgl_dma`), `soc_aic.ko` (the I2S controller), `soc_pwm.ko` (the PWM controller), `soc_i2c.ko` (the I2C controllers) | the same |
 | Wi-Fi | `brcmfmac.ko`, `brcmutil.ko` and `bcm_wlbt_power.ko` in place of `cywdhd.ko` | the same |
 
 ### Patches
