@@ -234,6 +234,7 @@ static s24_scratch_t external_s24;
 
 static pthread_mutex_t output_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t visualizer_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool visualizer_enabled;
 static float visualizer_level;
 static float visualizer_peak;
 static float visualizer_spectrum[96];
@@ -2230,6 +2231,22 @@ void audio_get_visualizer_levels(float *level, float *peak) {
 	pthread_mutex_unlock(&visualizer_lock);
 }
 
+void audio_set_visualizer_enabled(bool enabled) {
+	pthread_mutex_lock(&visualizer_lock);
+	visualizer_enabled = enabled;
+	visualizer_level = 0.0f;
+	visualizer_peak = 0.0f;
+	memset(visualizer_spectrum, 0, sizeof(visualizer_spectrum));
+	pthread_mutex_unlock(&visualizer_lock);
+}
+
+static bool audio_visualizer_is_enabled(void) {
+	pthread_mutex_lock(&visualizer_lock);
+	bool enabled = visualizer_enabled;
+	pthread_mutex_unlock(&visualizer_lock);
+	return enabled;
+}
+
 static void audio_run_fft(const void *buf, snd_pcm_uframes_t frames,
 								  int channels, int bits) {
 	if (!visualizer_fft_cfg || !buf || frames == 0 || channels == 0) {
@@ -3599,7 +3616,7 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 				balance_process_s32((int32_t *)buffer, (int)frames_read, channels);
 			}
 
-			if (!passthrough && frames_read > 0) {
+			if (!passthrough && frames_read > 0 && audio_visualizer_is_enabled()) {
 				audio_capture_pcm((int32_t *)buffer, (int)frames_read, channels, out_bits);
 				audio_run_fft((int32_t *)buffer, (int)frames_read, channels, out_bits);
 			}
@@ -3632,7 +3649,7 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 				balance_process((short *)buffer, (int)frames_read, channels);
 			}
 
-			if (!passthrough && frames_read > 0) {
+			if (!passthrough && frames_read > 0 && audio_visualizer_is_enabled()) {
 				audio_capture_pcm((short *)buffer, (int)frames_read, channels, out_bits);
 				audio_run_fft((short *)buffer, (int)frames_read, channels, out_bits);
 			}

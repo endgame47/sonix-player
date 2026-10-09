@@ -127,6 +127,9 @@ void audio_stop();
 
 audio_status_t audio_get_status(void);
 
+// Enables or disables the PCM analysis used by the now-playing visualizer.
+void audio_set_visualizer_enabled(bool enabled);
+
 // Returns normalized RMS and peak level from the most recent local PCM write.
 // Values are in the range 0..1 and are safe to read from the UI thread.
 void audio_get_visualizer_levels(float *level, float *peak);

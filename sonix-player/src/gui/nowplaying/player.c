@@ -1171,6 +1171,7 @@ static void visualizer_open(void) {
 		return;
 	}
 	visualizer_visible = true;
+	audio_set_visualizer_enabled(true);
 	lv_obj_set_hidden(visualizer_canvas, false);
 	lv_obj_move_foreground(visualizer_canvas);
 }
@@ -1180,6 +1181,7 @@ static void visualizer_close(void) {
 		return;
 	}
 	visualizer_visible = false;
+	audio_set_visualizer_enabled(false);
 	lv_obj_set_hidden(visualizer_canvas, true);
 }
 
