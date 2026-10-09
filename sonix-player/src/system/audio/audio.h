@@ -5,6 +5,15 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#ifndef AUDIO_VISUALIZER_BINS
+// Valid values are 1..128; 32 is a good compromise between resolution and CPU load
+#define AUDIO_VISUALIZER_BINS 32
+#endif
+
+#if AUDIO_VISUALIZER_BINS < 1 || AUDIO_VISUALIZER_BINS > 128
+#error "AUDIO_VISUALIZER_BINS must be between 1 and 128"
+#endif
+
 typedef enum {
 	AUDIO_CMD_NONE,
 	AUDIO_CMD_PLAY,
@@ -134,9 +143,9 @@ void audio_set_visualizer_enabled(bool enabled);
 // Values are in the range 0..1 and are safe to read from the UI thread.
 void audio_get_visualizer_levels(float *level, float *peak);
 
-// Returns 96 normalized frequency-band magnitudes from the most recent FFT
-// frame, ordered from low to high frequency. Values are in the range 0..1.
-void audio_get_visualizer_spectrum(float spectrum[96]);
+// Returns AUDIO_VISUALIZER_BINS normalized frequency-band magnitudes from the
+// most recent FFT frame, ordered from low to high frequency. Values are 0..1.
+void audio_get_visualizer_spectrum(float spectrum[AUDIO_VISUALIZER_BINS]);
 
 // Returns true exactly once if the current track reached its end on its own
 // since the last call, clearing the internal flag. User-initiated stops

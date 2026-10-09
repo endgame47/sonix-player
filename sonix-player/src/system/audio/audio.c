@@ -237,7 +237,7 @@ static pthread_mutex_t visualizer_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool visualizer_enabled;
 static float visualizer_level;
 static float visualizer_peak;
-static float visualizer_spectrum[96];
+static float visualizer_spectrum[AUDIO_VISUALIZER_BINS];
 static kiss_fft_cfg visualizer_fft_cfg;
 static kiss_fft_cpx visualizer_fft_input[256];
 static kiss_fft_cpx visualizer_fft_output[256];
@@ -2283,8 +2283,8 @@ static void audio_run_fft(const void *buf, snd_pcm_uframes_t frames,
 	kiss_fft(visualizer_fft_cfg, visualizer_fft_input, visualizer_fft_output);
 
 	pthread_mutex_lock(&visualizer_lock);
-	for (int bin = 0; bin < 96; bin++) {
-		const size_t fft_bin = (size_t)bin * 2;
+	for (int bin = 0; bin < AUDIO_VISUALIZER_BINS; bin++) {
+		const size_t fft_bin = (size_t)bin * 128 / AUDIO_VISUALIZER_BINS;
 		const double magnitude = hypot(
 			(double)visualizer_fft_output[fft_bin].r,
 			(double)visualizer_fft_output[fft_bin].i);
@@ -2293,7 +2293,7 @@ static void audio_run_fft(const void *buf, snd_pcm_uframes_t frames,
 	pthread_mutex_unlock(&visualizer_lock);
 }
 
-void audio_get_visualizer_spectrum(float spectrum[96]) {
+void audio_get_visualizer_spectrum(float spectrum[AUDIO_VISUALIZER_BINS]) {
 	if (!spectrum) {
 		return;
 	}

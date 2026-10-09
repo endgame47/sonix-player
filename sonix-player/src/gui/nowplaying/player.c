@@ -1211,7 +1211,7 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 	bool playing = audio_get_status() == AUDIO_STATUS_PLAYING;
 	float level = 0.0f;
 	float peak = 0.0f;
-	float spectrum[96] = {0};
+	float spectrum[AUDIO_VISUALIZER_BINS] = {0};
 	audio_get_visualizer_levels(&level, &peak);
 	audio_get_visualizer_spectrum(spectrum);
 	float time = (float)lv_tick_get() / 1000.0f;
@@ -1228,8 +1228,8 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 	// from the inner ring in proportion to the live PCM level, while the
 	// angular modulation makes the result feel like a spectrum rather than a
 	// set of unrelated dots.
-	for (int segment = 0; segment < 96; segment++) {
-		float angle = 2.0f * M_PI * segment / 96.0f + time * 0.08f;
+	for (int segment = 0; segment < AUDIO_VISUALIZER_BINS; segment++) {
+		float angle = 2.0f * M_PI * segment / AUDIO_VISUALIZER_BINS + time * 0.08f;
 		float band = 0.22f + 0.78f *
 			(0.5f + 0.5f * sinf((float)segment * 0.48f + time * 1.4f));
 		// FFT magnitudes are usually far below 1.0, so amplify and compress
@@ -1271,7 +1271,7 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 	int previous_y = cy + (int)(sinf(time * 0.8f) * outer_radius);
 	for (int point = 0; point <= 180; point++) {
 		float angle = 2.0f * M_PI * point / 180.0f + time * 0.18f;
-		float fft_wave = spectrum[point % 96] * 0.28f;
+		float fft_wave = spectrum[point % AUDIO_VISUALIZER_BINS] * 0.28f;
 		float waveform = sinf(angle * 5.0f + time * 2.2f) *
 			(0.08f + peak * 0.2f + fft_wave);
 		float radius = outer_radius * (1.0f + waveform);
