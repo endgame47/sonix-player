@@ -1207,68 +1207,139 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 	}
 
 	lv_canvas_fill_bg(visualizer_canvas, lv_color_make(12, 5, 24), LV_OPA_COVER);
+	
 	int width = (int)lv_obj_get_width(visualizer_canvas);
 	int height = (int)lv_obj_get_height(visualizer_canvas);
+	
 	float level = 0.0f;
 	float peak_level = 0.0f;
 	float spectrum[AUDIO_VISUALIZER_BINS] = {0};
 	audio_get_visualizer_levels(&level, &peak_level);
 	audio_get_visualizer_spectrum(spectrum);
-	int baseline = height * 3 / 4;
-	int max_height = height * 48 / 100;
-	int bar_top_limit = LV_MAX(0, baseline - max_height);
-	lv_color_t baseline_color = lv_color_make(35, 94, 116);
-	for (int x = 0; x < width; x++) {
-		lv_canvas_set_px(visualizer_canvas, x, baseline, baseline_color, LV_OPA_COVER);
-	}
+	
+	bool playing = audio_get_status() == AUDIO_STATUS_PLAYING;
 
-	// Each bin rises from the same baseline, with a dim reflection and a
-	// decaying peak marker above the current level.
-	for (int segment = 0; segment < AUDIO_VISUALIZER_BINS; segment++) {
-		float magnitude = sqrtf(fminf(1.0f, spectrum[segment] * 32.0f));
-		magnitude *= 0.55f + sqrtf(level) * 0.45f;
-		float *held_peak = &visualizer_bin_peaks[segment];
-		if (magnitude >= *held_peak) {
-			*held_peak = magnitude;
-		} else {
-			*held_peak = fmaxf(magnitude, *held_peak - 0.012f);
+	if ( 1 == 1 ) {
+		// Horizontal spectrum, which is a set of vertical bars that rise from a baseline. 
+		// The bars are modulated in height and colour to make them feel like a spectrum 
+		// rather than a set of unrelated dots. 
+		
+		// Baseline
+		int baseline = height * 3 / 4;
+		int max_height = height * 48 / 100;
+		int bar_top_limit = LV_MAX(0, baseline - max_height);
+		lv_color_t baseline_color = lv_color_make(35, 94, 116);
+		for (int x = 0; x < width; x++) {
+			lv_canvas_set_px(visualizer_canvas, x, baseline, baseline_color, LV_OPA_COVER);
 		}
 
-		int slot_start = segment * width / AUDIO_VISUALIZER_BINS;
-		int slot_end = (segment + 1) * width / AUDIO_VISUALIZER_BINS;
-		int slot_width = slot_end - slot_start;
-		int bar_width = LV_MAX(1, slot_width * 3 / 4);
-		int x_start = slot_start + (slot_width - bar_width) / 2;
-		int x_end = LV_MIN(width, x_start + bar_width);
-		int bar_height = (int)(magnitude * max_height);
-		int bar_top = LV_MAX(bar_top_limit, baseline - bar_height);
-		int peak_y = LV_MAX(bar_top_limit, baseline - (int)(*held_peak * max_height));
+		// Each bin rises from the same baseline, with a dim reflection and a
+		// decaying peak marker above the current level.
+		for (int segment = 0; segment < AUDIO_VISUALIZER_BINS; segment++) {
+			float magnitude = sqrtf(fminf(1.0f, spectrum[segment] * 32.0f));
+			magnitude *= 0.55f + sqrtf(level) * 0.45f;
+			float *held_peak = &visualizer_bin_peaks[segment];
+			if (magnitude >= *held_peak) {
+				*held_peak = magnitude;
+			} else {
+				*held_peak = fmaxf(magnitude, *held_peak - 0.012f);
+			}
 
-		for (int y = baseline - 1; y >= bar_top; y--) {
-			float position = (float)(baseline - 1 - y) / LV_MAX(1, bar_height - 1);
-			lv_color_t color = lv_color_make(
-				(uint8_t)(245.0f * position),
-				(uint8_t)(225.0f - 195.0f * position),
-				(uint8_t)(245.0f - 25.0f * position));
-			for (int x = x_start; x < x_end; x++) {
-				lv_canvas_set_px(visualizer_canvas, x, y, color, LV_OPA_COVER);
+			int slot_start = segment * width / AUDIO_VISUALIZER_BINS;
+			int slot_end = (segment + 1) * width / AUDIO_VISUALIZER_BINS;
+			int slot_width = slot_end - slot_start;
+			int bar_width = LV_MAX(1, slot_width * 3 / 4);
+			int x_start = slot_start + (slot_width - bar_width) / 2;
+			int x_end = LV_MIN(width, x_start + bar_width);
+			int bar_height = (int)(magnitude * max_height);
+			int bar_top = LV_MAX(bar_top_limit, baseline - bar_height);
+			int peak_y = LV_MAX(bar_top_limit, baseline - (int)(*held_peak * max_height));
+
+			if (playing) {
+				for (int y = baseline - 1; y >= bar_top; y--) {
+					float position = (float)(baseline - 1 - y) / LV_MAX(1, bar_height - 1);
+					lv_color_t color = lv_color_make(
+						(uint8_t)(245.0f * position),
+						(uint8_t)(225.0f - 195.0f * position),
+						(uint8_t)(245.0f - 25.0f * position));
+					for (int x = x_start; x < x_end; x++) {
+						lv_canvas_set_px(visualizer_canvas, x, y, color, LV_OPA_COVER);
+					}
+				}
+
+				int reflection_height = bar_height / 3;
+				for (int y = baseline + 1; y <= baseline + reflection_height && y < height; y++) {
+					float fade = 1.0f - (float)(y - baseline) / LV_MAX(1, reflection_height);
+					lv_color_t reflection = lv_color_make(8, (uint8_t)(42.0f * fade), (uint8_t)(88.0f * fade));
+					for (int x = x_start; x < x_end; x++) {
+						lv_canvas_set_px(visualizer_canvas, x, y, reflection, LV_OPA_COVER);
+					}
+				}
+			}
+
+			if (peak_y < baseline) {
+				float brightness = 0.65f + 0.35f * peak_level;
+				lv_color_t marker = lv_color_make(255, (uint8_t)(215.0f * brightness), 255);
+				for (int x = x_start; x < x_end; x++) {
+					lv_canvas_set_px(visualizer_canvas, x, peak_y, marker, LV_OPA_COVER);
+				}
 			}
 		}
+	} else {
+		// Circular spectrum, which is a set of radial bars that grow from the inner ring
+		// to the outer ring. The bars are modulated in length and colour to make
+		// them feel like a spectrum rather than a set of unrelated dots.
 
-		int reflection_height = bar_height / 3;
-		for (int y = baseline + 1; y <= baseline + reflection_height && y < height; y++) {
-			float fade = 1.0f - (float)(y - baseline) / LV_MAX(1, reflection_height);
-			lv_color_t reflection = lv_color_make(8, (uint8_t)(42.0f * fade), (uint8_t)(88.0f * fade));
-			for (int x = x_start; x < x_end; x++) {
-				lv_canvas_set_px(visualizer_canvas, x, y, reflection, LV_OPA_COVER);
-			}
-		}
+		int cx = width / 2;
+		int cy = height / 2;
+		float time = (float)lv_tick_get() / 1000.0f;
+		float inner_radius = LV_MIN(width, height) * 0.18f;
+		float outer_radius = LV_MIN(width, height) * 0.36f;
 
-		if (peak_y < baseline) {
-			float brightness = 0.65f + 0.35f * peak_level;
-			lv_color_t marker = lv_color_make(255, (uint8_t)(215.0f * brightness), 255);
-			for (int x = x_start; x < x_end; x++) {
-				lv_canvas_set_px(visualizer_canvas, x, peak_y, marker, LV_OPA_COVER);
+		lv_color_t spectrum_color = playing ? lv_color_make(72, 150, 255) : lv_color_make(125, 125, 155);
+
+		// Draw the circular spectrum as a set of radial bars. Each segment grows
+		// from the inner ring in proportion to the live PCM level.
+		for (int segment = 0; segment < AUDIO_VISUALIZER_BINS; segment++) {
+			float angle = 2.0f * M_PI * segment / AUDIO_VISUALIZER_BINS + time * 0.08f;
+			float band = 0.22f + 0.78f *
+				(0.5f + 0.5f * sinf((float)segment * 0.48f + time * 1.4f));
+
+			// FFT magnitudes are usually far below 1.0, so amplify and compress
+			// them before mapping to pixels. Keep quiet passages responsive too.
+			float magnitude = sqrtf(fminf(1.0f, spectrum[segment] * 32.0f));
+			magnitude *= 0.55f + sqrtf(level) * 0.45f;
+
+			float color_intensity = 0.2f + magnitude * 0.8f;
+			lv_color_t bar_color = lv_color_make(
+				(uint8_t)(spectrum_color.red * color_intensity),
+				(uint8_t)(spectrum_color.green * color_intensity),
+				(uint8_t)(spectrum_color.blue * color_intensity));
+
+			float bar_length = inner_radius + (outer_radius - inner_radius) * (0.08f + magnitude * 0.92f * band);
+			float start_radius = inner_radius;
+			float end_radius = bar_length;
+			int start_x = cx + (int)(cosf(angle) * start_radius);
+			int start_y = cy + (int)(sinf(angle) * start_radius);
+			int end_x = cx + (int)(cosf(angle) * end_radius);
+			int end_y = cy + (int)(sinf(angle) * end_radius);
+			int dx = end_x - start_x;
+			int dy = end_y - start_y;
+			int perpendicular_x = (int)roundf(-sinf(angle));
+			int perpendicular_y = (int)roundf(cosf(angle));
+			int steps = LV_MAX(1, LV_MAX(abs(dx), abs(dy)));
+
+			// Draw
+			for (int i = 0; i <= steps; i++) {
+				int x = start_x + dx * i / steps;
+				int y = start_y + dy * i / steps;
+				for (int thickness = -1; thickness <= 1; thickness++) {
+					int px = x + perpendicular_x * thickness;
+					int py = y + perpendicular_y * thickness;
+					if (px >= 0 && px < width && py >= 0 && py < height) {
+						lv_canvas_set_px(visualizer_canvas, px, py, bar_color, LV_OPA_COVER);
+					}
+				}
 			}
 		}
 	}
