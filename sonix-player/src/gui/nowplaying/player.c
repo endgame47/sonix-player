@@ -1167,6 +1167,10 @@ static void cover_panel_hit_test_cb(lv_event_t *e) {
 	}
 }
 
+static bool visualizer_on_screen(void) { return visualizer_canvas && !lv_obj_is_hidden(visualizer_canvas); }
+
+static void visualizer_screen_hold_update(void) { power_hold_screen_for_view(visualizer_visible && visualizer_on_screen()); }
+
 static void visualizer_open(void) {
 	if (!visualizer_canvas || visualizer_visible) {
 		return;
@@ -1176,16 +1180,20 @@ static void visualizer_open(void) {
 	audio_set_visualizer_enabled(true);
 	lv_obj_set_hidden(visualizer_canvas, false);
 	lv_obj_move_foreground(visualizer_canvas);
+	lv_timer_resume(visualizer_timer);
+	visualizer_screen_hold_update();
 }
 
 static void visualizer_close(void) {
 	if (!visualizer_canvas || !visualizer_visible) {
 		return;
 	}
+	lv_timer_pause(visualizer_timer);
 	visualizer_visible = false;
-	memset(visualizer_bin_peaks, 0, sizeof(visualizer_bin_peaks));
 	audio_set_visualizer_enabled(false);
 	lv_obj_set_hidden(visualizer_canvas, true);
+	memset(visualizer_bin_peaks, 0, sizeof(visualizer_bin_peaks));
+	visualizer_screen_hold_update();
 }
 
 static void visualizer_canvas_click_cb(lv_event_t *e) {
@@ -1341,6 +1349,8 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 			}
 		}
 	}
+
+	lv_obj_invalidate(visualizer_canvas);
 }
 
 static void slider_over_waveform(bool over) {
@@ -4893,6 +4903,7 @@ void player_init(gui_config_t *cfg) {
 	power_slow_in_standby(sleep_timer, 5000);
 
 	visualizer_timer = lv_timer_create(visualizer_timer_cb, 30, NULL);
+	lv_timer_pause(visualizer_timer);
 
 	lv_obj_t *below_slider_group = lv_obj_create(player_menu);
 	below_slider_obj = below_slider_group;
