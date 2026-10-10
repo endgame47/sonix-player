@@ -56,6 +56,13 @@ decode_format_t decode_detect_format(const char *filepath);
 // Opens a decoder for the given file/format. Returns NULL on failure.
 decoder_t *decoder_open(const char *filepath, decode_format_t format);
 
+// The same, for a caller that only asks about the stream -- rate, channels,
+// depth, length, codec, bitrate -- and never reads from it. A track of a CUE
+// sheet is not moved to its start: on a long MP3 with a variable bitrate that
+// is a read of the file's headers up to the track, which a question about the
+// format does not need.
+decoder_t *decoder_open_info(const char *filepath, decode_format_t format);
+
 int decoder_channels(const decoder_t *dec);
 int decoder_source_bits(const decoder_t *dec); // 16 for mp3/ogg, the real depth for flac
 int decoder_sample_rate(const decoder_t *dec);

@@ -494,7 +494,7 @@ static void details_rebuild(void) {
 		char codec[16] = "";
 		int kbps = 0;
 		bool lossy = false;
-		decoder_t *dec = format != DECODE_FORMAT_UNKNOWN ? decoder_open(details_path, format) : NULL;
+		decoder_t *dec = format != DECODE_FORMAT_UNKNOWN ? decoder_open_info(details_path, format) : NULL;
 		if (dec) {
 			bits = decoder_source_bits(dec);
 			channels = decoder_channels(dec);

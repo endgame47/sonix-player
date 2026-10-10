@@ -1121,7 +1121,7 @@ static bool list_directory(const char *path, listing_t *out, cue_sheet_t *sheets
 			}
 			char sheet_path[PATH_BUF + sizeof(de->d_name) + 1];
 			snprintf(sheet_path, sizeof(sheet_path), "%s/%s", path, de->d_name);
-			if (!cue_parse(sheet_path, sheets)) {
+			if (!cue_parse(sheet_path, sheets) || sheets->split) {
 				continue; // not a sheet this player can follow: leave the folder as it is
 			}
 

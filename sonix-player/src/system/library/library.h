@@ -99,13 +99,26 @@ typedef enum {
 	LIBRARY_SPLIT_COMMA = 1 << 3,	  // ,
 	LIBRARY_SPLIT_FEAT = 1 << 4,	  // feat., ft., featuring, as a word
 	LIBRARY_SPLIT_VS = 1 << 5,		  // vs., versus, as a word
+	LIBRARY_SPLIT_X = 1 << 6,		  // x as a word, lower case, and the sign
+	LIBRARY_SPLIT_PLUS = 1 << 7,	  // +
+	LIBRARY_SPLIT_WITH = 1 << 8,	  // with, as a word
+	LIBRARY_SPLIT_AND = 1 << 9,		  // and, as a word
 } library_split_t;
+
+// The full-width forms CJK tags are written with count as the separator they
+// stand for: ／ as /, ＆ as &, ；as ;, ， and 、 as a comma, ＋ as +.
 
 // [library] split_artists (off) and artist_separators (; / & feat.).
 bool library_split_artists(void);
 void library_set_split_artists(bool on);
 unsigned library_artist_separators(void);
 void library_set_artist_separators(unsigned separators);
+
+// [library] split_album_artists (off): the album artist split as well, at the
+// artist separators and with the same exceptions, so a record by "A & B" is
+// listed under A and under B in Album artists. Only with split_artists on.
+bool library_split_album_artists(void);
+void library_set_split_album_artists(bool on);
 
 // [library] split_genres (off) and genre_separators (; / ,).
 bool library_split_genres(void);

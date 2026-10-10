@@ -147,4 +147,26 @@ bool cover_thumb_load(const char *path, bool is_dir, int size, cover_image_t *ou
 // affordable and a hundred decodes are not.
 bool cover_thumb_cached(const char *path, int size, cover_image_t *out);
 
+// ---------------------------------------------------------------------------
+// Book covers
+//
+// An EPUB's cover is inside the book: reaching it means opening the ZIP and
+// reading the OPF, then decoding the picture. The shelf keeps the scaled cover
+// and the book's title in the thumbnail cache instead, keyed by the book's
+// path, size and modification time and by the box it is drawn in, so a book
+// is opened once and every later visit is a read. What a page shows is still
+// its own and is freed with the page.
+// ---------------------------------------------------------------------------
+
+// A cached cover for `path` at `box_w` x `box_h`. True on a hit: then
+// `*has_cover` says whether the book has a cover at all, `out` holds it when it
+// does (the caller cover_free()s it), and `title` what the book calls itself,
+// empty when it does not say.
+bool cover_book_cached(const char *path, int box_w, int box_h, cover_image_t *out, bool *has_cover, char *title,
+					   size_t title_size);
+
+// Keeps what was read from the book: its cover, or NULL for a book without
+// one, and its title.
+void cover_book_store(const char *path, int box_w, int box_h, const cover_image_t *cover, const char *title);
+
 #endif // COVER_H

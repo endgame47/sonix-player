@@ -16,7 +16,7 @@
 #include "src/system/audio/eq.h"
 #include "src/system/core/lang.h"
 
-#define NAME_MAX 100
+#define PRESET_NAME_MAX 100
 
 static gui_config_t *config;
 
@@ -35,7 +35,7 @@ static keyboard_t *name_keyboard;
 static void (*reload_cb)(void);
 
 // The preset the ellipsis menu is about.
-static char menu_name[NAME_MAX + 1];
+static char menu_name[PRESET_NAME_MAX + 1];
 
 void eqsettings_set_reload_cb(void (*cb)(void)) { reload_cb = cb; }
 
@@ -120,7 +120,7 @@ static void menu_delete_action(void *user) {
 	if (!menu_name[0]) {
 		return;
 	}
-	char message[NAME_MAX + 64];
+	char message[PRESET_NAME_MAX + 64];
 	snprintf(message, sizeof(message), tr("remove_from_card_confirm_note"), menu_name);
 	confirm_show("delete_the_preset", message, "delete", do_delete_preset, NULL);
 }
@@ -234,7 +234,7 @@ static void name_accept_cb(lv_event_t *e) {
 	(void)e;
 
 	const char *typed = lv_textarea_get_text(name_field);
-	char name[NAME_MAX + 1];
+	char name[PRESET_NAME_MAX + 1];
 	snprintf(name, sizeof(name), "%s", typed ? typed : "");
 
 	size_t len = strlen(name);
@@ -301,7 +301,7 @@ static void build_name_dialog(gui_config_t *cfg) {
 
 	name_field = lv_textarea_create(name_layer);
 	lv_textarea_set_one_line(name_field, true);
-	lv_textarea_set_max_length(name_field, NAME_MAX);
+	lv_textarea_set_max_length(name_field, PRESET_NAME_MAX);
 	lv_textarea_set_placeholder_text(name_field, tr("name"));
 	lv_obj_set_size(name_field, cfg->screen_width - 2 * cfg->padding, 62);
 	lv_obj_set_scrollbar_mode(name_field, LV_SCROLLBAR_MODE_OFF);

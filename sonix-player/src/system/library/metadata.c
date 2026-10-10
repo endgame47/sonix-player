@@ -4,13 +4,10 @@
 #include "src/system/decode/decode.h"
 #include "src/system/decode/dr_flac.h"
 #include "src/system/decode/mp4.h"
-#include "src/system/decode/stb_vorbis_decl.h"
-#include "src/system/decode/wavpackdec.h"
 #include "src/system/decode/apedec.h"
+#include "src/system/library/oggtags.h"
 #include "src/system/core/config.h"
 #include "src/system/core/utils.h"
-
-#include <opusfile.h>
 
 #include <ctype.h>
 #include <stdint.h>
@@ -466,18 +463,39 @@ static void read_flac_metadata(const char *filepath, song_metadata_t *out) {
 	}
 }
 
-static void read_ogg_metadata(const char *filepath, song_metadata_t *out) {
-	int error = 0;
-	stb_vorbis *vorbis = stb_vorbis_open_filename(filepath, &error, NULL);
-	if (!vorbis)
-		return;
+// Ogg Vorbis and Opus: the same Vorbis comments, in the OpusTags packet or the
+// Vorbis comment header. Pictures are skipped unread; any other comment is
+// read whole, up to OGG_TEXT_LONG_MAX (long lyrics).
+#define OGG_TEXT_MAX (64 * 1024)
+#define OGG_TEXT_LONG_MAX (1024 * 1024)
 
-	stb_vorbis_comment comment = stb_vorbis_get_comment(vorbis);
-	for (int i = 0; i < comment.comment_list_length; i++) {
-		apply_vorbis_comment(out, comment.comment_list[i], strlen(comment.comment_list[i]));
+static bool ogg_comment(void *user, const char *comment, size_t len) {
+	apply_vorbis_comment((song_metadata_t *)user, comment, len);
+	return true;
+}
+
+static bool ogg_long_comment(void *user, const char *key, size_t key_len, uint32_t value_len,
+							 oggtags_value_t *value) {
+	if (oggtags_key_is_picture(key, key_len) || value_len > OGG_TEXT_LONG_MAX) {
+		return true;
 	}
+	size_t len = key_len + 1 + value_len;
+	char *comment = malloc(len + 1);
+	if (!comment) {
+		return true;
+	}
+	memcpy(comment, key, key_len);
+	comment[key_len] = '=';
+	if (oggtags_value_read(value, comment + key_len + 1, value_len) == value_len) {
+		comment[len] = '\0';
+		apply_vorbis_comment((song_metadata_t *)user, comment, len);
+	}
+	free(comment);
+	return true;
+}
 
-	stb_vorbis_close(vorbis);
+static void read_ogg_metadata(const char *filepath, song_metadata_t *out) {
+	oggtags_walk(filepath, OGG_TEXT_MAX, ogg_comment, ogg_long_comment, out);
 }
 
 // ---------------------------------------------------------------------------
@@ -1598,33 +1616,12 @@ static void read_mp4_metadata(const char *filepath, song_metadata_t *out) {
 // Opus and WavPack
 // ---------------------------------------------------------------------------
 
-// An Opus file's tags are Vorbis comments, the same as an .ogg's: the packet is
-// called OpusTags and its contents have the same "KEY=value" form, so nothing
-// new is needed -- they are poured into apply_vorbis_comment().
-static void read_opus_metadata(const char *filepath, song_metadata_t *out) {
-	int err = 0;
-	OggOpusFile *of = op_open_file(filepath, &err);
-	if (!of) {
-		return;
-	}
 
-	const OpusTags *tags = op_tags(of, -1);
-	if (tags) {
-		for (int i = 0; i < tags->comments; i++) {
-			if (tags->user_comments[i] && tags->comment_lengths[i] > 0) {
-				apply_vorbis_comment(out, tags->user_comments[i], (size_t)tags->comment_lengths[i]);
-			}
-		}
-	}
-
-	op_free(of);
-}
-
-// A .wv carries APEv2 tags. The names are not the Vorbis comment ones --
+// APEv2 tags (.wv, .ape). The names are not the Vorbis comment ones --
 // "Track" instead of "TRACKNUMBER", "Year" instead of "DATE" -- but the rest
 // matches, so the few that differ are renamed and the same reader is reused.
 // The ReplayGain entries already share their names.
-static void wavpack_tag_cb(void *user, const char *key, const char *value) {
+static void apev2_tag_cb(void *user, const char *key, const char *value) {
 	song_metadata_t *out = (song_metadata_t *)user;
 
 	if (strcasecmp(key, "Lyrics") == 0 || strcasecmp(key, "UnsyncedLyrics") == 0) {
@@ -1654,14 +1651,11 @@ static void wavpack_tag_cb(void *user, const char *key, const char *value) {
 	}
 }
 
-static void read_wavpack_metadata(const char *filepath, song_metadata_t *out) {
-	wavpackdec_tags(filepath, wavpack_tag_cb, out);
-}
-
-// An .ape carries the same APEv2 tags, and sometimes an ID3v1 tag after them,
-// which fills whatever the APEv2 one left empty.
+// An .ape or a .wv: APEv2 tags at the end of the file, and sometimes an ID3v1
+// tag after them, which fills whatever the APEv2 one left empty. Binary items,
+// the cover among them, are skipped unread.
 static void read_ape_metadata(const char *filepath, song_metadata_t *out) {
-	apedec_tags(filepath, wavpack_tag_cb, out);
+	apedec_tags(filepath, apev2_tag_cb, out);
 
 	FILE *f = fopen(filepath, "rb");
 	if (f) {
@@ -1802,10 +1796,10 @@ void metadata_read(const char *filepath, song_metadata_t *out) {
 		read_dsd_metadata(filepath, out);
 		break;
 	case DECODE_FORMAT_OPUS:
-		read_opus_metadata(filepath, out);
+		read_ogg_metadata(filepath, out);
 		break;
 	case DECODE_FORMAT_WAVPACK:
-		read_wavpack_metadata(filepath, out);
+		read_ape_metadata(filepath, out);
 		break;
 	case DECODE_FORMAT_APE:
 		read_ape_metadata(filepath, out);

@@ -32,13 +32,15 @@ struct wavpackdec {
 // OPEN_NORMALIZE: applies to floating-point files only, bringing them to
 //           +/-1.0 so the integer conversion below is a multiply and nothing
 //           more.
-// OPEN_TAGS: APEv2 tags, which metadata.c reads through wavpackdec_tags().
+// No OPEN_TAGS: apedec.c reads the tags and the cover from the file, and with
+// the flag the library holds the whole tag, cover included, while the file
+// plays.
 //
 // OPEN_2CH_MAX is deliberately absent: with it WavpackUnpackSamples keeps
 // reasoning in terms of the file's channel count while writing fewer, and the
 // buffer size the caller has to pass stops being obvious. Taking the channels
 // the file has is simpler.
-#define OPEN_FLAGS (OPEN_WVC | OPEN_DSD_AS_PCM | OPEN_NORMALIZE | OPEN_TAGS)
+#define OPEN_FLAGS (OPEN_WVC | OPEN_DSD_AS_PCM | OPEN_NORMALIZE)
 
 wavpackdec_t *wavpackdec_open(const char *filepath) {
 	char err[80];
@@ -205,124 +207,4 @@ bool wavpackdec_seek(wavpackdec_t *w, uint64_t frame) {
 		return false;
 	}
 	return WavpackSeekSample64(w->wpc, (int64_t)frame) != 0;
-}
-
-// ---------------------------------------------------------------------------
-// tags
-// ---------------------------------------------------------------------------
-
-// The APEv2 item names of interest. WavpackGetTagItem compares
-// case-insensitively, so the spelling here is only indicative; the variants,
-// however, matter. APEv2 has no real naming standard and taggers disagree: the
-// album artist appears as "Album Artist" (the conventional spelling),
-// "AlbumArtist" and "album_artist" (what ffmpeg writes); the year as "Year" and
-// "date". Asking for all of them costs a lookup in an already-loaded table, so
-// all are asked and whichever answers wins.
-static const char *const TAG_ITEMS[] = {
-	"Title",
-	"Artist",
-	"Album",
-	"Album Artist",
-	"AlbumArtist",
-	"album_artist",
-	"Genre",
-	"Track",
-	"Year",
-	"date",
-	"replaygain_track_gain",
-	"replaygain_track_peak",
-	"replaygain_album_gain",
-	"replaygain_album_peak",
-	"Compilation",
-};
-
-void wavpackdec_tags(const char *filepath, void (*fn)(void *user, const char *key, const char *value), void *user) {
-	if (!filepath || !fn) {
-		return;
-	}
-
-	char err[80];
-	err[0] = '\0';
-	// Tags only: nothing decoded and no .wvc lookup, so a library scan does not
-	// pay for what it does not need.
-	WavpackContext *wpc = WavpackOpenFileInput(filepath, err, OPEN_TAGS, 0);
-	if (!wpc) {
-		return;
-	}
-
-	for (size_t i = 0; i < sizeof(TAG_ITEMS) / sizeof(TAG_ITEMS[0]); i++) {
-		char value[256];
-		value[0] = '\0';
-		int len = WavpackGetTagItem(wpc, TAG_ITEMS[i], value, (int)sizeof(value));
-		if (len > 0 && value[0]) {
-			fn(user, TAG_ITEMS[i], value);
-		}
-	}
-
-	WavpackCloseFile(wpc);
-}
-
-// The conventional names of the binary item holding the cover, in order of
-// preference: front cover before back cover.
-static const char *const COVER_ITEMS[] = {
-	"Cover Art (Front)",
-	"Cover Art (Back)",
-};
-
-unsigned char *wavpackdec_cover(const char *filepath, size_t max_size, size_t *out_size) {
-	if (out_size) {
-		*out_size = 0;
-	}
-	if (!filepath) {
-		return NULL;
-	}
-
-	char err[80];
-	err[0] = '\0';
-	WavpackContext *wpc = WavpackOpenFileInput(filepath, err, OPEN_TAGS, 0);
-	if (!wpc) {
-		return NULL;
-	}
-
-	unsigned char *image = NULL;
-
-	for (size_t i = 0; i < sizeof(COVER_ITEMS) / sizeof(COVER_ITEMS[0]) && !image; i++) {
-		// With a NULL buffer it returns the size, which is how to learn what to
-		// allocate without guessing.
-		int size = WavpackGetBinaryTagItem(wpc, COVER_ITEMS[i], NULL, 0);
-		if (size <= 0 || (size_t)size > max_size) {
-			continue;
-		}
-
-		char *raw = malloc((size_t)size);
-		if (!raw) {
-			break;
-		}
-		if (WavpackGetBinaryTagItem(wpc, COVER_ITEMS[i], raw, size) != size) {
-			free(raw);
-			continue;
-		}
-
-		// The value is a file name, a NUL, then the image. Without that NUL it
-		// is not a valid cover item and there is no way to tell where the image
-		// starts, so it is skipped.
-		char *nul = memchr(raw, '\0', (size_t)size);
-		if (nul) {
-			size_t skip = (size_t)(nul - raw) + 1;
-			size_t bytes = (size_t)size - skip;
-			if (bytes > 0) {
-				image = malloc(bytes);
-				if (image) {
-					memcpy(image, raw + skip, bytes);
-					if (out_size) {
-						*out_size = bytes;
-					}
-				}
-			}
-		}
-		free(raw);
-	}
-
-	WavpackCloseFile(wpc);
-	return image;
 }

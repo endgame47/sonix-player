@@ -137,10 +137,12 @@ static void build_codec_rows(char mine[][BT_CODEC_MAX], int count) {
 	for (int i = 0; i < count; i++) {
 		for (int j = i + 1; j < count; j++) {
 			if (codec_order(mine[j]) > codec_order(mine[i])) {
+				// %.*s: the compiler cannot see that each row is terminated,
+				// and warns that a name could run on into the next one.
 				char swap[BT_CODEC_MAX];
-				snprintf(swap, sizeof(swap), "%s", mine[i]);
-				snprintf(mine[i], BT_CODEC_MAX, "%s", mine[j]);
-				snprintf(mine[j], BT_CODEC_MAX, "%s", swap);
+				snprintf(swap, sizeof(swap), "%.*s", BT_CODEC_MAX - 1, mine[i]);
+				snprintf(mine[i], BT_CODEC_MAX, "%.*s", BT_CODEC_MAX - 1, mine[j]);
+				snprintf(mine[j], BT_CODEC_MAX, "%.*s", BT_CODEC_MAX - 1, swap);
 			}
 		}
 	}

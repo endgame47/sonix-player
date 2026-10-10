@@ -39,14 +39,14 @@ bool apedec_seek(apedec_t *a, uint64_t frame);
 // file is not an .ape this decoder would play.
 bool apedec_probe(const char *filepath, int *rate, int *bits);
 
-// APEv2 (or APEv1) tags at the end of the file: every text item named in the
-// list inside apedec.c is handed to the callback with its tag name and its
-// first value.
+// APEv2 (or APEv1) tags at the end of the file, an .ape's or a .wv's: every
+// text item named in the list inside apedec.c is handed to the callback with
+// its tag name and its first value. Binary items are skipped unread.
 void apedec_tags(const char *filepath, void (*fn)(void *user, const char *key, const char *value), void *user);
 
-// The image in "Cover Art (Front)", else "Cover Art (Back)", without the file
-// name that precedes it. NULL when there is none or it is over `max_size`; the
-// caller frees with free().
-unsigned char *apedec_cover(const char *filepath, size_t max_size, size_t *out_size);
+// Where the image in "Cover Art (Front)", else "Cover Art (Back)", lies in the
+// file: past the file name and the NUL that start the item's value. Serves .wv
+// files as well, which carry the same tag. False when there is none.
+bool apedec_cover_at(const char *filepath, int64_t *offset, uint32_t *size);
 
 #endif /* APE_DECODE_H */

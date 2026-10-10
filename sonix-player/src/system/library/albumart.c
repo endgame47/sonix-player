@@ -2,21 +2,22 @@
 
 #include "src/system/library/cue.h"
 #include "src/system/decode/decode.h"
-#include "src/system/decode/dr_flac.h"
 #include "src/system/decode/mp4.h"
-#include "src/system/decode/stb_vorbis_decl.h"
-#include "src/system/decode/wavpackdec.h"
 #include "src/system/decode/apedec.h"
+#include "src/system/library/oggtags.h"
 #include "src/system/core/utils.h"
 
-#include <opusfile.h>
-
 #include <dirent.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 // APIC / FLAC PICTURE picture type for "front cover". When a file carries
 // several pictures (front, back, artist, ...) this is the one to keep.
@@ -72,12 +73,188 @@ static bool take_picture(albumart_t *out, const uint8_t *data, size_t size) {
 	return true;
 }
 
+// Takes `data`, a malloc'd picture, into `out` when it is a usable image, and
+// frees it otherwise.
+static bool adopt_picture(albumart_t *out, uint8_t *data, size_t size) {
+	if (!data || size > ALBUMART_MAX_BYTES || !is_supported_image(data, size)) {
+		free(data);
+		return false;
+	}
+	albumart_free(out);
+	out->data = data;
+	out->size = size;
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Pictures mapped from the file
+//
+// A picture stored as it is in the file is mapped, not copied: its pages are
+// page cache, given back when the picture is freed. Reading a mapped page
+// whose card has been pulled out raises SIGBUS. The handler finds the mapping
+// the address belongs to, puts zero pages in its place and lets the read carry
+// on; the picture is then faulted (albumart_faulted()) and whatever was made
+// from it is thrown away. Any other SIGBUS goes to the handler installed
+// before this one.
+// ---------------------------------------------------------------------------
+
+#define LIVE_MAPS 16
+
+// `gen` is odd while a slot changes, so the handler can tell a consistent
+// lo/hi pair from one caught half-written.
+static struct {
+	volatile uint32_t gen;
+	volatile uintptr_t lo; // 0 while the slot is free
+	volatile uintptr_t hi;
+	volatile sig_atomic_t faulted;
+} live_maps[LIVE_MAPS];
+static pthread_mutex_t live_maps_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t bus_once = PTHREAD_ONCE_INIT;
+static struct sigaction bus_chained;
+
+static void bus_handler(int sig, siginfo_t *info, void *context) {
+	uintptr_t addr = (uintptr_t)info->si_addr;
+	for (int i = 0; i < LIVE_MAPS; i++) {
+		uint32_t gen = live_maps[i].gen;
+		__sync_synchronize();
+		uintptr_t lo = live_maps[i].lo;
+		uintptr_t hi = live_maps[i].hi;
+		__sync_synchronize();
+		if ((gen & 1) || gen != live_maps[i].gen) {
+			continue;
+		}
+		if (lo && addr >= lo && addr < hi &&
+			mmap((void *)lo, hi - lo, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != MAP_FAILED) {
+			live_maps[i].faulted = 1;
+			return;
+		}
+	}
+	if (bus_chained.sa_flags & SA_SIGINFO) {
+		bus_chained.sa_sigaction(sig, info, context);
+	} else if (bus_chained.sa_handler != SIG_DFL && bus_chained.sa_handler != SIG_IGN) {
+		bus_chained.sa_handler(sig);
+	} else {
+		signal(sig, SIG_DFL);
+		raise(sig);
+	}
+}
+
+static void bus_install(void) {
+	struct sigaction sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_sigaction = bus_handler;
+	sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGBUS, &sa, &bus_chained);
+}
+
+// A slot for a new mapping, or -1 when all are taken.
+static int live_map_add(void *map, size_t len) {
+	pthread_once(&bus_once, bus_install);
+	int slot = -1;
+	pthread_mutex_lock(&live_maps_lock);
+	for (int i = 0; i < LIVE_MAPS; i++) {
+		if (!live_maps[i].lo) {
+			live_maps[i].gen++;
+			__sync_synchronize();
+			live_maps[i].faulted = 0;
+			live_maps[i].lo = (uintptr_t)map;
+			live_maps[i].hi = (uintptr_t)map + len;
+			__sync_synchronize();
+			live_maps[i].gen++;
+			slot = i;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&live_maps_lock);
+	return slot;
+}
+
+static void live_map_remove(int slot) {
+	pthread_mutex_lock(&live_maps_lock);
+	live_maps[slot].gen++;
+	__sync_synchronize();
+	live_maps[slot].lo = 0;
+	live_maps[slot].hi = 0;
+	__sync_synchronize();
+	live_maps[slot].gen++;
+	pthread_mutex_unlock(&live_maps_lock);
+}
+
+bool albumart_faulted(const albumart_t *art) {
+	return art && art->map && live_maps[art->map_slot].faulted;
+}
+
 void albumart_free(albumart_t *art) {
 	if (!art)
 		return;
-	free(art->data);
-	art->data = NULL;
-	art->size = 0;
+	if (art->map) {
+		live_map_remove(art->map_slot);
+		munmap(art->map, art->map_len);
+		// Read once, for one decode: the pages go back now rather than
+		// pushing out what the player and the audio decoder still use.
+		posix_fadvise(art->map_fd, (off_t)art->map_at, (off_t)art->map_len, POSIX_FADV_DONTNEED);
+		close(art->map_fd);
+	} else {
+		free(art->data);
+	}
+	memset(art, 0, sizeof(*art));
+}
+
+// The picture stored as it is at [offset, offset + size) of the file, mapped
+// (see above). Copied instead, up to ALBUMART_MAX_BYTES, when it cannot be
+// mapped. Returns false, leaving `out` untouched, when the bytes are not a
+// usable image.
+static bool take_file_range(albumart_t *out, const char *path, long long offset, size_t size) {
+	if (size < 12 || size > ALBUMART_MAP_MAX_BYTES || offset < 0) {
+		return false;
+	}
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0) {
+		return false;
+	}
+	struct stat st;
+	long page = sysconf(_SC_PAGESIZE);
+	if (page <= 0 || fstat(fd, &st) != 0 || offset + (long long)size > (long long)st.st_size) {
+		close(fd);
+		return false;
+	}
+
+	long long at = offset - offset % page;
+	size_t len = (size_t)(offset - at) + size;
+	void *map = mmap(NULL, len, PROT_READ, MAP_PRIVATE, fd, (off_t)at);
+	int slot = map != MAP_FAILED ? live_map_add(map, len) : -1;
+	if (slot >= 0) {
+		uint8_t *data = (uint8_t *)map + (offset - at);
+		if (!is_supported_image(data, size) || live_maps[slot].faulted) {
+			live_map_remove(slot);
+			munmap(map, len);
+			close(fd);
+			return false;
+		}
+		posix_fadvise(fd, (off_t)at, (off_t)len, POSIX_FADV_SEQUENTIAL);
+		albumart_free(out);
+		out->data = data;
+		out->size = size;
+		out->map = map;
+		out->map_len = len;
+		out->map_at = at;
+		out->map_fd = fd;
+		out->map_slot = slot;
+		return true;
+	}
+	if (map != MAP_FAILED) {
+		munmap(map, len);
+	}
+
+	uint8_t *buf = size <= ALBUMART_MAX_BYTES ? malloc(size) : NULL;
+	bool ok = buf && pread(fd, buf, size, (off_t)offset) == (ssize_t)size;
+	close(fd);
+	if (!ok) {
+		free(buf);
+		return false;
+	}
+	return adopt_picture(out, buf, size);
 }
 
 // ---------------------------------------------------------------------------
@@ -119,13 +296,14 @@ static size_t skip_encoded_string(const uint8_t *data, size_t size, size_t pos, 
 	return size;
 }
 
-// Parses one APIC (v2.3/v2.4) or PIC (v2.2) frame body. `is_v22` selects the
-// old layout, whose "MIME type" is a fixed 3-character format id ("JPG"/"PNG")
-// instead of a null-terminated string.
-// Returns the picture type (0-20) via `out_type`.
-static bool parse_apic_body(const uint8_t *body, size_t size, bool is_v22, albumart_t *out, uint8_t *out_type) {
+// Where the image starts in an APIC (v2.3/v2.4) or PIC (v2.2) frame body, of
+// which `size` bytes are at `body`; 0 when it does not start within them.
+// `is_v22` selects the old layout, whose "MIME type" is a fixed 3-character
+// format id ("JPG"/"PNG") instead of a null-terminated string. The picture
+// type (0-20) goes to `out_type`.
+static size_t apic_image_at(const uint8_t *body, size_t size, bool is_v22, uint8_t *out_type) {
 	if (size < 4)
-		return false;
+		return 0;
 
 	uint8_t encoding = body[0];
 	size_t pos = 1;
@@ -136,16 +314,18 @@ static bool parse_apic_body(const uint8_t *body, size_t size, bool is_v22, album
 		pos = skip_encoded_string(body, size, pos, 0x00); // MIME type is always ISO-8859-1
 	}
 	if (pos >= size)
-		return false;
+		return 0;
 
 	*out_type = body[pos];
 	pos++;
 
 	pos = skip_encoded_string(body, size, pos, encoding); // description
-	if (pos >= size)
-		return false;
+	return pos < size ? pos : 0;
+}
 
-	return take_picture(out, body + pos, size - pos);
+static bool parse_apic_body(const uint8_t *body, size_t size, bool is_v22, albumart_t *out, uint8_t *out_type) {
+	size_t at = apic_image_at(body, size, is_v22, out_type);
+	return at > 0 && take_picture(out, body + at, size - at);
 }
 
 // Whether `pos` is where another frame header begins -- or where the tag ends,
@@ -168,17 +348,11 @@ static bool frame_starts_at(const uint8_t *tag, size_t tag_size, size_t pos) {
 	return true;
 }
 
-// Reads the ID3v2 tag that starts at the file's current position and keeps its
-// best picture. Separate from the callers below because three containers put
-// the very same tag in three different places: an MP3 or a raw .aac at byte
-// zero, a .dsf at the offset its header points to, an AIFF inside an "ID3 "
-// chunk.
-static bool read_id3v2_picture(FILE *f, albumart_t *out) {
-	uint8_t header[10];
-	if (fread(header, 1, sizeof(header), f) != sizeof(header) || memcmp(header, "ID3", 3) != 0) {
-		return false;
-	}
-
+// A v2.3 tag unsynchronised as a whole, read into memory: its frame sizes
+// count the bytes after the unsynchronisation is undone, so the frames cannot
+// be found in the file itself. `header` is the tag header, already read; the
+// file is positioned just past it.
+static bool read_id3v2_whole(FILE *f, const uint8_t *header, albumart_t *out) {
 	uint8_t major = header[3];
 	uint8_t tag_flags = header[5];
 	size_t tag_size = syncsafe32(&header[6]);
@@ -290,12 +464,161 @@ static bool read_id3v2_picture(FILE *f, albumart_t *out) {
 	return found;
 }
 
+// Whether `at` is where another frame header begins in the tag ending at `end`
+// -- or where the tag ends, by running out or by turning into padding. The
+// file-side twin of frame_starts_at().
+static bool frame_starts_in_file(FILE *f, off_t end, off_t at) {
+	if (at >= end)
+		return at == end;
+	uint8_t id[4];
+	size_t n = end - at < 4 ? (size_t)(end - at) : 4;
+	if (fseeko(f, at, SEEK_SET) != 0 || fread(id, 1, n, f) != n)
+		return false;
+	if (id[0] == 0)
+		return true; // padding
+	if (n < 4)
+		return false;
+	for (size_t i = 0; i < 4; i++) {
+		if (!((id[i] >= 'A' && id[i] <= 'Z') || (id[i] >= '0' && id[i] <= '9')))
+			return false;
+	}
+	return true;
+}
+
+// v2.4 frame flags.
+#define ID3_V24_COMPRESSED 0x0008
+#define ID3_V24_ENCRYPTED 0x0004
+#define ID3_V24_UNSYNC 0x0002
+#define ID3_V24_DATA_LENGTH 0x0001
+// v2.3 frame flags.
+#define ID3_V23_COMPRESSED 0x0080
+#define ID3_V23_ENCRYPTED 0x0040
+
+// The few hundred bytes in front of the image: encoding, MIME type, picture
+// type, description. A description longer than this leaves the picture out.
+#define APIC_HEAD_MAX 1024
+
+// Reads the ID3v2 tag that starts at the file's current position and keeps its
+// best picture: the first usable one, or a front cover after it. Separate from
+// the callers below because three containers put the very same tag in three
+// different places: an MP3 or a raw .aac at byte zero, a .dsf at the offset its
+// header points to, an AIFF or a WAV inside an "ID3 " chunk.
+//
+// The frames are walked in the file and the image is mapped where it lies;
+// only a frame unsynchronised on its own is read into memory to be undone.
+static bool read_id3v2_picture(FILE *f, const char *path, albumart_t *out) {
+	off_t tag_at = ftello(f);
+	uint8_t header[10];
+	if (tag_at < 0 || fread(header, 1, sizeof(header), f) != sizeof(header) || memcmp(header, "ID3", 3) != 0) {
+		return false;
+	}
+
+	uint8_t major = header[3];
+	uint8_t tag_flags = header[5];
+	off_t tag_size = (off_t)syncsafe32(&header[6]);
+	if (tag_size < 16) {
+		return false;
+	}
+	if ((tag_flags & 0x80) && major < 4) {
+		return read_id3v2_whole(f, header, out);
+	}
+
+	off_t end = tag_at + 10 + tag_size;
+	off_t pos = tag_at + 10;
+
+	// Skip the extended header if there is one.
+	if ((tag_flags & 0x40) && major >= 3) {
+		uint8_t b[4];
+		if (fread(b, 1, 4, f) != 4) {
+			return false;
+		}
+		pos += (major >= 4) ? (off_t)syncsafe32(b) : (off_t)be32(b) + 4;
+	}
+
+	size_t header_len = (major < 3) ? 6 : 10;
+	bool found = false;
+	uint8_t best_type = 0xFF;
+
+	while (pos + (off_t)header_len <= end && !(found && best_type == PIC_TYPE_FRONT_COVER)) {
+		uint8_t fh[10];
+		if (fseeko(f, pos, SEEK_SET) != 0 || fread(fh, 1, header_len, f) != header_len || fh[0] == 0)
+			break; // out of file, or padding
+
+		char id[5] = {0};
+		off_t frame_size;
+		uint16_t frame_flags = 0;
+		if (major < 3) {
+			memcpy(id, fh, 3);
+			frame_size = ((off_t)fh[3] << 16) | ((off_t)fh[4] << 8) | (off_t)fh[5];
+		} else {
+			memcpy(id, fh, 4);
+			frame_size = (off_t)((major >= 4) ? syncsafe32(fh + 4) : be32(fh + 4));
+			frame_flags = ((uint16_t)fh[8] << 8) | fh[9];
+		}
+		off_t body = pos + (off_t)header_len;
+
+		// Plain 32-bit sizes where v2.4 calls for syncsafe ones, as several
+		// taggers write them: taken when that is the reading that lands on the
+		// next frame.
+		if (major >= 4) {
+			off_t plain = (off_t)be32(fh + 4);
+			if (plain != frame_size && plain <= end - body && !frame_starts_in_file(f, end, body + frame_size) &&
+				frame_starts_in_file(f, end, body + plain)) {
+				frame_size = plain;
+			}
+		}
+		if (frame_size == 0 || frame_size > end - body)
+			break;
+
+		bool is_picture = (major < 3) ? (strcmp(id, "PIC") == 0) : (strcmp(id, "APIC") == 0);
+		bool opaque = (major == 3 && (frame_flags & (ID3_V23_COMPRESSED | ID3_V23_ENCRYPTED))) ||
+					  (major >= 4 && (frame_flags & (ID3_V24_COMPRESSED | ID3_V24_ENCRYPTED)));
+		if (is_picture && !opaque) {
+			off_t data_at = body;
+			off_t data_size = frame_size;
+			if (major >= 4 && (frame_flags & ID3_V24_DATA_LENGTH) && data_size > 4) {
+				data_at += 4;
+				data_size -= 4;
+			}
+
+			uint8_t type = 0xFF;
+			bool took = false;
+			if (major >= 4 && (frame_flags & ID3_V24_UNSYNC)) {
+				uint8_t *copy = data_size <= ALBUMART_MAX_BYTES + 65536 ? malloc((size_t)data_size) : NULL;
+				if (copy && fseeko(f, data_at, SEEK_SET) == 0 &&
+					fread(copy, 1, (size_t)data_size, f) == (size_t)data_size) {
+					size_t n = de_unsynchronise(copy, (size_t)data_size);
+					took = parse_apic_body(copy, n, false, out, &type);
+				}
+				free(copy);
+			} else {
+				uint8_t head[APIC_HEAD_MAX];
+				size_t n = data_size < (off_t)sizeof(head) ? (size_t)data_size : sizeof(head);
+				size_t at = 0;
+				if (fseeko(f, data_at, SEEK_SET) == 0 && fread(head, 1, n, f) == n) {
+					at = apic_image_at(head, n, major < 3, &type);
+				}
+				took = at > 0 && take_file_range(out, path, (long long)(data_at + (off_t)at),
+												 (size_t)(data_size - (off_t)at));
+			}
+			if (took) {
+				found = true;
+				best_type = type;
+			}
+		}
+
+		pos = body + frame_size;
+	}
+
+	return found;
+}
+
 static bool read_mp3_embedded(const char *filepath, albumart_t *out) {
 	FILE *f = fopen(filepath, "rb");
 	if (!f)
 		return false;
 
-	bool found = read_id3v2_picture(f, out);
+	bool found = read_id3v2_picture(f, filepath, out);
 	fclose(f);
 	return found;
 }
@@ -326,7 +649,7 @@ static bool read_dsf_embedded(const char *filepath, albumart_t *out) {
 		if (fseeko(f, 0, SEEK_END) == 0) {
 			off_t size = ftello(f);
 			if (tag_at != 0 && size > 0 && tag_at < (uint64_t)size && fseeko(f, (off_t)tag_at, SEEK_SET) == 0) {
-				found = read_id3v2_picture(f, out);
+				found = read_id3v2_picture(f, filepath, out);
 			}
 		}
 	}
@@ -372,7 +695,7 @@ static bool read_iff_embedded(const char *filepath, albumart_t *out) {
 		}
 		uint32_t size = aiff ? be32(ch + 4) : ((uint32_t)ch[4] | ((uint32_t)ch[5] << 8) | ((uint32_t)ch[6] << 16) | ((uint32_t)ch[7] << 24));
 		if (memcmp(ch, "ID3 ", 4) == 0 || memcmp(ch, "id3 ", 4) == 0) {
-			found = read_id3v2_picture(f, out);
+			found = read_id3v2_picture(f, filepath, out);
 			break;
 		}
 		pos += 8 + (off_t)size + (off_t)(size & 1);
@@ -386,34 +709,78 @@ static bool read_iff_embedded(const char *filepath, albumart_t *out) {
 // FLAC: PICTURE metadata block
 // ---------------------------------------------------------------------------
 
-typedef struct {
-	albumart_t *out;
-	bool found;
-	uint8_t best_type;
-} flac_picture_ctx_t;
-
-static void flac_picture_callback(void *user_data, drflac_metadata *meta) {
-	if (meta->type != DRFLAC_METADATA_BLOCK_TYPE_PICTURE)
-		return;
-
-	flac_picture_ctx_t *ctx = user_data;
-	if (ctx->found && ctx->best_type == PIC_TYPE_FRONT_COVER)
-		return; // the front cover is already in hand
-
-	if (take_picture(ctx->out, meta->data.picture.pPictureData, meta->data.picture.pictureDataSize)) {
-		ctx->found = true;
-		ctx->best_type = (uint8_t)meta->data.picture.type;
-	}
-}
+// The metadata blocks are walked here rather than through dr_flac, which reads
+// a whole PICTURE block into memory before the callback sees it: this reads
+// the few fields in front of the picture and leaves the bytes where they are,
+// for take_file_range() to copy or map. The front cover wins; failing that,
+// the last usable picture.
+#define FLAC_MAX_BLOCKS 1024
 
 static bool read_flac_embedded(const char *filepath, albumart_t *out) {
-	flac_picture_ctx_t ctx = {.out = out, .found = false, .best_type = 0xFF};
+	FILE *f = fopen(filepath, "rb");
+	if (!f)
+		return false;
 
-	drflac *flac = drflac_open_file_with_metadata(filepath, flac_picture_callback, &ctx, NULL);
-	if (flac)
-		drflac_close(flac);
+	// An ID3v2 tag in front of the stream, which some taggers write and the
+	// decoder skips.
+	long long pos = 0;
+	uint8_t head[10];
+	if (fread(head, 1, sizeof(head), f) == sizeof(head) && memcmp(head, "ID3", 3) == 0) {
+		pos = 10 + (long long)syncsafe32(head + 6) + ((head[5] & 0x10) ? 10 : 0);
+	}
+	uint8_t magic[4];
+	if (fseeko(f, (off_t)pos, SEEK_SET) != 0 || fread(magic, 1, 4, f) != 4 || memcmp(magic, "fLaC", 4) != 0) {
+		fclose(f);
+		return false;
+	}
+	pos += 4;
 
-	return ctx.found;
+	bool found = false;
+	uint32_t best_type = 0;
+	for (int n = 0; n < FLAC_MAX_BLOCKS; n++) {
+		uint8_t bh[4];
+		if (fseeko(f, (off_t)pos, SEEK_SET) != 0 || fread(bh, 1, 4, f) != 4)
+			break;
+		bool last = (bh[0] & 0x80) != 0;
+		int type = bh[0] & 0x7F;
+		uint32_t length = ((uint32_t)bh[1] << 16) | ((uint32_t)bh[2] << 8) | (uint32_t)bh[3];
+		long long body = pos + 4;
+
+		// PICTURE: type, MIME, description, four 32-bit dimensions, length.
+		if (type == 6 && !(found && best_type == PIC_TYPE_FRONT_COVER) && length >= 32) {
+			uint8_t b[8];
+			long long at = body;
+			uint32_t ptype = 0, mime_len = 0, desc_len = 0, data_len = 0;
+			bool ok = fread(b, 1, 8, f) == 8;
+			if (ok) {
+				ptype = be32(b);
+				mime_len = be32(b + 4);
+				at += 8 + (long long)mime_len;
+				ok = mime_len <= length && fseeko(f, (off_t)at, SEEK_SET) == 0 && fread(b, 1, 4, f) == 4;
+			}
+			if (ok) {
+				desc_len = be32(b);
+				at += 4 + (long long)desc_len + 16;
+				ok = desc_len <= length && fseeko(f, (off_t)at, SEEK_SET) == 0 && fread(b, 1, 4, f) == 4;
+			}
+			if (ok) {
+				data_len = be32(b);
+				at += 4;
+				ok = at + (long long)data_len <= body + (long long)length;
+			}
+			if (ok && take_file_range(out, filepath, at, data_len)) {
+				found = true;
+				best_type = ptype;
+			}
+		}
+
+		pos = body + (long long)length;
+		if (last)
+			break;
+	}
+
+	fclose(f);
+	return found;
 }
 
 // ---------------------------------------------------------------------------
@@ -434,191 +801,113 @@ static int base64_value(char c) {
 	return -1; // padding, whitespace or garbage
 }
 
-// Decodes base64 text into a freshly allocated buffer. Returns NULL on
-// failure; on success *out_size holds the decoded length.
-static uint8_t *base64_decode(const char *text, size_t text_len, size_t *out_size) {
-	if (text_len / 4 * 3 > ALBUMART_MAX_BYTES)
-		return NULL;
+// A base64 value read through oggtags and decoded as it comes, so neither the
+// text nor more than the image itself is ever in memory.
+typedef struct {
+	oggtags_value_t *value;
+	char in[4096];
+	size_t have, used;
+	uint32_t accum;
+	int bits;
+	bool end;
+} b64_stream_t;
 
-	uint8_t *out = malloc(text_len / 4 * 3 + 3);
-	if (!out)
-		return NULL;
-
-	size_t written = 0;
-	uint32_t accum = 0;
-	int bits = 0;
-
-	for (size_t i = 0; i < text_len; i++) {
-		int v = base64_value(text[i]);
+// Decodes up to `n` bytes into `dst`, or skips them when `dst` is NULL.
+static size_t b64_read(b64_stream_t *b, uint8_t *dst, size_t n) {
+	size_t done = 0;
+	while (done < n) {
+		if (b->bits >= 8) {
+			b->bits -= 8;
+			if (dst)
+				dst[done] = (uint8_t)(b->accum >> b->bits);
+			done++;
+			continue;
+		}
+		if (b->used == b->have) {
+			b->have = b->end ? 0 : oggtags_value_read(b->value, b->in, sizeof(b->in));
+			b->used = 0;
+			if (b->have == 0) {
+				b->end = true;
+				break;
+			}
+		}
+		int v = base64_value(b->in[b->used++]);
 		if (v < 0)
 			continue;
-
-		accum = (accum << 6) | (uint32_t)v;
-		bits += 6;
-		if (bits >= 8) {
-			bits -= 8;
-			out[written++] = (uint8_t)((accum >> bits) & 0xFF);
-		}
+		b->accum = ((b->accum << 6) | (uint32_t)v) & 0xFFFFFF;
+		b->bits += 6;
 	}
-
-	if (written == 0) {
-		free(out);
-		return NULL;
-	}
-
-	*out_size = written;
-	return out;
+	return done;
 }
 
-// Parses the FLAC PICTURE structure that METADATA_BLOCK_PICTURE comments
-// carry (same layout as the FLAC metadata block, all big endian).
-static bool parse_flac_picture_block(const uint8_t *block, size_t size, albumart_t *out, uint8_t *out_type) {
-	size_t pos = 0;
-	if (size < 32)
-		return false;
+typedef struct {
+	albumart_t *out;
+	bool found;
+	uint32_t best_type;
+} ogg_art_t;
 
-	uint32_t type = be32(block + pos);
-	pos += 4;
+// METADATA_BLOCK_PICTURE holds a FLAC PICTURE block (big endian: type, MIME,
+// description, four dimensions, length, image); COVERART the image alone. The
+// front cover ends the walk; otherwise a later picture replaces an earlier
+// one.
+static bool ogg_art_comment(void *user, const char *key, size_t key_len, uint32_t value_len,
+							oggtags_value_t *value) {
+	ogg_art_t *a = user;
+	if (!oggtags_key_is_picture(key, key_len))
+		return true;
+	bool block = key_len == 22;
 
-	uint32_t mime_len = be32(block + pos);
-	pos += 4;
-	if (mime_len > size - pos)
-		return false;
-	pos += mime_len;
-
-	if (pos + 4 > size)
-		return false;
-	uint32_t desc_len = be32(block + pos);
-	pos += 4;
-	if (desc_len > size - pos)
-		return false;
-	pos += desc_len;
-
-	pos += 16; // width, height, colour depth, indexed colour count
-	if (pos + 4 > size)
-		return false;
-
-	uint32_t data_len = be32(block + pos);
-	pos += 4;
-	if (data_len > size - pos)
-		return false;
-
-	*out_type = (uint8_t)type;
-	return take_picture(out, block + pos, data_len);
-}
-
-// Examines one Vorbis comment for a cover picture. Kept separate because it
-// serves two formats unchanged: an Opus file's tags ARE Vorbis comments, same
-// shape and same keys as an .ogg. Returns true once a front cover is in hand
-// and looking further cannot improve on it.
-static bool consider_vorbis_picture(const char *entry, size_t entry_len, albumart_t *out, bool *found,
-									uint8_t *best_type) {
-	if (!entry || entry_len == 0)
-		return false;
-
-	const char *eq = memchr(entry, '=', entry_len);
-	if (!eq)
-		return false;
-
-	size_t key_len = (size_t)(eq - entry);
-	const char *value = eq + 1;
-	size_t value_len = entry_len - key_len - 1;
-
-	bool is_block = (key_len == 22 && strncasecmp(entry, "METADATA_BLOCK_PICTURE", 22) == 0);
-	bool is_coverart = (key_len == 8 && strncasecmp(entry, "COVERART", 8) == 0);
-	if (!is_block && !is_coverart)
-		return false;
-
-	size_t raw_size = 0;
-	uint8_t *raw = base64_decode(value, value_len, &raw_size);
-	if (!raw)
-		return false;
-
-	uint8_t type = 0xFF;
-	bool ok = is_block ? parse_flac_picture_block(raw, raw_size, out, &type)
-					   : take_picture(out, raw, raw_size); // COVERART holds the image directly
-	free(raw);
-
-	if (ok) {
-		*found = true;
-		*best_type = type;
+	b64_stream_t b;
+	memset(&b, 0, sizeof(b));
+	b.value = value;
+	uint32_t type = 0xFF;
+	size_t size = (size_t)value_len / 4 * 3; // COVERART: the most it can decode to
+	if (block) {
+		uint8_t f[8];
+		if (b64_read(&b, f, 8) != 8)
+			return true;
+		type = be32(f);
+		uint32_t mime_len = be32(f + 4);
+		if (b64_read(&b, NULL, mime_len) != mime_len || b64_read(&b, f, 4) != 4)
+			return true;
+		uint32_t desc_len = be32(f);
+		if (b64_read(&b, NULL, desc_len) != desc_len || b64_read(&b, NULL, 16) != 16 || b64_read(&b, f, 4) != 4)
+			return true;
+		size = be32(f);
 	}
-	return *found && *best_type == PIC_TYPE_FRONT_COVER;
+	if (size == 0 || size > ALBUMART_MAX_BYTES)
+		return true;
+
+	uint8_t *data = malloc(size);
+	if (!data)
+		return true;
+	size_t got = b64_read(&b, data, size);
+	if (block && got != size) {
+		free(data);
+		return true;
+	}
+	if (adopt_picture(a->out, data, got)) {
+		a->found = true;
+		a->best_type = type;
+	}
+	return !(a->found && a->best_type == PIC_TYPE_FRONT_COVER);
 }
 
+// Ogg Vorbis and Opus: the same Vorbis comments, walked in the file (see
+// oggtags.h). A picture there is base64 text and has to be decoded into
+// memory, up to ALBUMART_MAX_BYTES.
 static bool read_ogg_embedded(const char *filepath, albumart_t *out) {
-	int error = 0;
-	stb_vorbis *vorbis = stb_vorbis_open_filename(filepath, &error, NULL);
-	if (!vorbis)
-		return false;
-
-	stb_vorbis_comment comment = stb_vorbis_get_comment(vorbis);
-	bool found = false;
-	uint8_t best_type = 0xFF;
-
-	for (int i = 0; i < comment.comment_list_length; i++) {
-		const char *entry = comment.comment_list[i];
-		if (!entry)
-			continue;
-		if (consider_vorbis_picture(entry, strlen(entry), out, &found, &best_type))
-			break;
-	}
-
-	stb_vorbis_close(vorbis);
-	return found;
+	ogg_art_t a = {.out = out, .found = false, .best_type = 0xFF};
+	oggtags_walk(filepath, 0, NULL, ogg_art_comment, &a);
+	return a.found;
 }
 
-// Opus: the same Vorbis comments, taken from the OpusTags packet instead of a
-// Vorbis stream header. The library hands over the lengths here, so not even an
-// strlen is needed.
-static bool read_opus_embedded(const char *filepath, albumart_t *out) {
-	int err = 0;
-	OggOpusFile *of = op_open_file(filepath, &err);
-	if (!of)
-		return false;
-
-	bool found = false;
-	uint8_t best_type = 0xFF;
-
-	const OpusTags *tags = op_tags(of, -1);
-	if (tags) {
-		for (int i = 0; i < tags->comments; i++) {
-			if (tags->comment_lengths[i] <= 0)
-				continue;
-			if (consider_vorbis_picture(tags->user_comments[i], (size_t)tags->comment_lengths[i], out, &found,
-										&best_type))
-				break;
-		}
-	}
-
-	op_free(of);
-	return found;
-}
-
-// WavPack: no base64 and no FLAC block. APEv2 holds the raw image inside a
-// binary item, and wavpackdec_cover() has already stripped the file name that
-// precedes it.
-static bool read_wavpack_embedded(const char *filepath, albumart_t *out) {
-	size_t size = 0;
-	unsigned char *image = wavpackdec_cover(filepath, ALBUMART_MAX_BYTES, &size);
-	if (!image)
-		return false;
-
-	bool ok = take_picture(out, image, size);
-	free(image);
-	return ok;
-}
-
-// Monkey's Audio keeps its cover the same way, in an APEv2 tag at the end.
-static bool read_ape_embedded(const char *filepath, albumart_t *out) {
-	size_t size = 0;
-	unsigned char *image = apedec_cover(filepath, ALBUMART_MAX_BYTES, &size);
-	if (!image)
-		return false;
-
-	bool ok = take_picture(out, image, size);
-	free(image);
-	return ok;
+// WavPack and Monkey's Audio: the raw image inside the APEv2 binary item, past
+// the file name that starts it.
+static bool read_apev2_embedded(const char *filepath, albumart_t *out) {
+	int64_t at = 0;
+	uint32_t size = 0;
+	return apedec_cover_at(filepath, &at, &size) && take_file_range(out, filepath, (long long)at, size);
 }
 
 // ---------------------------------------------------------------------------
@@ -654,32 +943,9 @@ static int cover_name_rank(const char *name) {
 
 static bool read_whole_file(const char *path, albumart_t *out) {
 	long size = get_file_size(path);
-	if (size <= 0 || size > ALBUMART_MAX_BYTES)
+	if (size <= 0)
 		return false;
-
-	FILE *f = fopen(path, "rb");
-	if (!f)
-		return false;
-
-	uint8_t *buf = malloc((size_t)size);
-	if (!buf) {
-		fclose(f);
-		return false;
-	}
-
-	size_t got = fread(buf, 1, (size_t)size, f);
-	fclose(f);
-
-	bool ok = (got == (size_t)size) && is_supported_image(buf, got);
-	if (!ok) {
-		free(buf);
-		return false;
-	}
-
-	albumart_free(out);
-	out->data = buf;
-	out->size = got;
-	return true;
+	return take_file_range(out, path, 0, (size_t)size);
 }
 
 // Whether an image file is named after `stem` -- the same name, a different
@@ -783,28 +1049,14 @@ static bool read_mp4_embedded(const char *filepath, albumart_t *out) {
 	bool found = mp4_cover_art(m, &offset, &size, &is_png);
 	mp4_close(m);
 
-	if (!found || size == 0 || size > ALBUMART_MAX_BYTES) {
+	if (!found) {
 		return false;
 	}
 
-	FILE *f = fopen(filepath, "rb");
-	if (!f) {
-		return false;
-	}
-	uint8_t *data = malloc(size);
-	if (!data || fseeko(f, (off_t)offset, SEEK_SET) != 0 || fread(data, 1, size, f) != size) {
-		free(data);
-		fclose(f);
-		return false;
-	}
-	fclose(f);
-
-	// Through take_picture like every other format: a `covr` atom may hold a
-	// BMP, or the atom may simply be mis-sized, and handing those bytes on as
-	// artwork costs a failed decode and, worse, a cached "no cover here".
-	bool ok = take_picture(out, data, size);
-	free(data);
-	return ok;
+	// Checked like every other format: a `covr` atom may hold a BMP, or the
+	// atom may simply be mis-sized, and handing those bytes on as artwork
+	// costs a failed decode and, worse, a cached "no cover here".
+	return take_file_range(out, filepath, (long long)offset, size);
 }
 
 // Reads the picture stored inside the file's own tags, if the format has a
@@ -819,6 +1071,7 @@ static bool read_embedded(const char *filepath, albumart_t *out) {
 	case DECODE_FORMAT_FLAC:
 		return read_flac_embedded(filepath, out);
 	case DECODE_FORMAT_OGG_VORBIS:
+	case DECODE_FORMAT_OPUS:
 		return read_ogg_embedded(filepath, out);
 	case DECODE_FORMAT_AAC_MP4:
 	case DECODE_FORMAT_ALAC_MP4:
@@ -826,12 +1079,9 @@ static bool read_embedded(const char *filepath, albumart_t *out) {
 		// is irrelevant. ALAC is listed explicitly because a file named .alac
 		// is detected as its own format and would otherwise never be asked.
 		return read_mp4_embedded(filepath, out);
-	case DECODE_FORMAT_OPUS:
-		return read_opus_embedded(filepath, out);
 	case DECODE_FORMAT_WAVPACK:
-		return read_wavpack_embedded(filepath, out);
 	case DECODE_FORMAT_APE:
-		return read_ape_embedded(filepath, out);
+		return read_apev2_embedded(filepath, out);
 	case DECODE_FORMAT_DSD:
 		return has_extension(filepath, ".dsf") && read_dsf_embedded(filepath, out);
 	case DECODE_FORMAT_SNDFILE:

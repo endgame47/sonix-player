@@ -279,10 +279,13 @@ static const timezone_t TIMEZONES[] = {
 static lv_obj_t *tz_checks[TIMEZONE_COUNT];
 
 // "UTC+01:00". Always with a sign and always two digits: lined up in a column,
-// the entries can be scanned by eye instead of read one by one.
+// the entries can be scanned by eye instead of read one by one. Real offsets
+// stop at 14 hours; the hours are kept to two digits so the text always fits
+// in the 16-byte buffers the callers pass.
 static void tz_format_offset(int minutes, char *out, size_t size) {
-	int abs_min = minutes < 0 ? -minutes : minutes;
-	snprintf(out, size, "UTC%c%02d:%02d", minutes < 0 ? '-' : '+', abs_min / 60, abs_min % 60);
+	unsigned abs_min = minutes < 0 ? 0u - (unsigned)minutes : (unsigned)minutes;
+	unsigned hours = (abs_min / 60) % 100;
+	snprintf(out, size, "UTC%c%02u:%02u", minutes < 0 ? '-' : '+', hours, abs_min % 60);
 }
 
 // Which list entry is the one in use, or -1 until someone has chosen: on the

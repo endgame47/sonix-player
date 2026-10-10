@@ -1124,7 +1124,8 @@ static cover_build_t build_from_sources(const char *path, bool is_dir, const ima
 		}
 
 		had_bytes = true;
-		bool ok = build_images_safely(art.data, art.size, reqs, n, outs);
+		// A card pulled out under the decode: an image made of zeros, not kept.
+		bool ok = build_images_safely(art.data, art.size, reqs, n, outs) && !albumart_faulted(&art);
 		albumart_free(&art);
 		if (ok) {
 			crumb_set_artwork(NULL);
@@ -1310,6 +1311,9 @@ uint64_t cover_source_id(const char *filepath) {
 			continue;
 		}
 		uint64_t id = art.size ? bytes_id(art.data, art.size) : 0;
+		if (albumart_faulted(&art)) {
+			id = 0;
+		}
 		albumart_free(&art);
 		if (id) {
 			return id;
@@ -1399,6 +1403,12 @@ void cover_free(cover_image_t *img) {
 #define THUMB_DISK_MAX_SIZE 216
 #define THUMB_WAV_EPOCH "|w2"
 
+// A cached "no artwork here" is a row with no width, and its height carries
+// the epoch of the readers that gave that answer. A row from another epoch is
+// a miss: raising the epoch has every file without artwork asked again, while
+// every cached picture stays as it is.
+#define THUMB_NONE_EPOCH 3
+
 static sqlite3 *thumb_db;
 // The thumbnail worker writes while the GUI thread may be reading, and a card
 // change closes and reopens the database under both: one connection, guarded by
@@ -1455,6 +1465,14 @@ static bool thumb_db_prepare_schema(sqlite3 *db) {
 					 "PRAGMA cache_size=-256;"
 					 "CREATE TABLE IF NOT EXISTS thumbs("
 					 " key TEXT PRIMARY KEY,"
+					 " w INTEGER NOT NULL,"
+					 " h INTEGER NOT NULL,"
+					 " pixels BLOB);"
+					 // The EPUB shelf's covers, with the title read from the
+					 // same opening of the book (see cover_book_cached).
+					 "CREATE TABLE IF NOT EXISTS books("
+					 " key TEXT PRIMARY KEY,"
+					 " title TEXT,"
 					 " w INTEGER NOT NULL,"
 					 " h INTEGER NOT NULL,"
 					 " pixels BLOB)",
@@ -1596,6 +1614,36 @@ static bool thumb_key(char *out, size_t out_size, const char *path, int box, boo
 	return true;
 }
 
+// The RGB565 pixels in column `col` of the current row as an image of `w` x `h`.
+// False for a blob whose size does not match its dimensions -- an interrupted
+// write, which counts as a miss: the picture is decoded again and the row
+// overwritten.
+static bool image_from_column(sqlite3_stmt *stmt, int col, int w, int h, cover_image_t *out) {
+	if (w <= 0 || h <= 0 || w > 0xFFFF || h > 0xFFFF) {
+		return false;
+	}
+	size_t bytes = (size_t)w * h * 2;
+	const void *blob = sqlite3_column_blob(stmt, col);
+	if (!blob || (size_t)sqlite3_column_bytes(stmt, col) != bytes) {
+		return false;
+	}
+	uint8_t *pixels = malloc(bytes);
+	if (!pixels) {
+		return false;
+	}
+	memcpy(pixels, blob, bytes);
+	memset(out, 0, sizeof(*out));
+	out->pixels = pixels;
+	out->dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+	out->dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+	out->dsc.header.w = (uint32_t)w;
+	out->dsc.header.h = (uint32_t)h;
+	out->dsc.header.stride = (uint32_t)w * 2;
+	out->dsc.data_size = (uint32_t)bytes;
+	out->dsc.data = pixels;
+	return true;
+}
+
 // Reads a cached thumbnail. Returns false on a miss; on a hit, has_image tells
 // whether there was artwork at all.
 static bool thumb_db_load(const char *key, cover_image_t *out, bool *has_image) {
@@ -1614,32 +1662,14 @@ static bool thumb_db_load(const char *key, cover_image_t *out, bool *has_image) 
 			int w = sqlite3_column_int(stmt, 0);
 			int h = sqlite3_column_int(stmt, 1);
 
-			if (w == 0 || h == 0) {
-				*has_image = false; // cached "no artwork here"
-				hit = true;
-			} else if (w > 0 && h > 0 && w <= 0xFFFF && h <= 0xFFFF) {
-				size_t bytes = (size_t)w * h * 2;
-				const void *blob = sqlite3_column_blob(stmt, 2);
-				// A row whose blob size does not match its dimensions comes from an
-				// interrupted write and counts as a miss: decode again and
-				// overwrite it.
-				if (blob && (size_t)sqlite3_column_bytes(stmt, 2) == bytes) {
-					uint8_t *pixels = malloc(bytes);
-					if (pixels) {
-						memcpy(pixels, blob, bytes);
-						memset(out, 0, sizeof(*out));
-						out->pixels = pixels;
-						out->dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
-						out->dsc.header.cf = LV_COLOR_FORMAT_RGB565;
-						out->dsc.header.w = (uint32_t)w;
-						out->dsc.header.h = (uint32_t)h;
-						out->dsc.header.stride = (uint32_t)w * 2;
-						out->dsc.data_size = (uint32_t)bytes;
-						out->dsc.data = pixels;
-						*has_image = true;
-						hit = true;
-					}
+			if (w == 0) {
+				if (h == THUMB_NONE_EPOCH) {
+					*has_image = false; // cached "no artwork here"
+					hit = true;
 				}
+			} else if (image_from_column(stmt, 2, w, h, out)) {
+				*has_image = true;
+				hit = true;
 			}
 		}
 		sqlite3_finalize(stmt);
@@ -1670,7 +1700,7 @@ static void thumb_db_store(const char *key, const cover_image_t *img, bool has_i
 			sqlite3_bind_blob(stmt, 4, img->pixels, (int)((size_t)w * h * 2), SQLITE_STATIC);
 		} else {
 			sqlite3_bind_int(stmt, 2, 0);
-			sqlite3_bind_int(stmt, 3, 0);
+			sqlite3_bind_int(stmt, 3, THUMB_NONE_EPOCH);
 			sqlite3_bind_null(stmt, 4);
 		}
 		sqlite3_step(stmt); // a failure here only costs a future re-decode
@@ -1740,4 +1770,106 @@ bool cover_thumb_load(const char *path, bool is_dir, int size, cover_image_t *ou
 	}
 
 	return built == COVER_BUILD_OK;
+}
+
+// ---------------------------------------------------------------------------
+// book covers
+// ---------------------------------------------------------------------------
+
+// The largest box a book cover is kept for: the shelf's tiles on either panel
+// are well inside it, and a page asking for something bigger decodes it.
+#define BOOK_DISK_MAX_W 512
+#define BOOK_DISK_MAX_H 768
+
+// A book without a cover is a row with no width, its height this epoch; one
+// from another epoch is a miss.
+#define BOOK_NONE_EPOCH 1
+
+// FNV-1a over the book's path, size and modification time and the box: a book
+// replaced or rewritten is a new key, and the old row is simply never asked for.
+static bool book_key(char *out, size_t out_size, const char *path, int box_w, int box_h) {
+	if (!path || box_w <= 0 || box_h <= 0 || box_w > BOOK_DISK_MAX_W || box_h > BOOK_DISK_MAX_H) {
+		return false;
+	}
+	struct stat st;
+	if (stat(path, &st) != 0) {
+		return false;
+	}
+	char material[700];
+	snprintf(material, sizeof(material), "book|%s|%d|%d|%lld|%lld", path, box_w, box_h, (long long)st.st_mtime,
+			 (long long)st.st_size);
+	uint64_t h = 1469598103934665603ULL;
+	for (const char *p = material; *p; p++) {
+		h ^= (uint8_t)*p;
+		h *= 1099511628211ULL;
+	}
+	snprintf(out, out_size, "%016llx", (unsigned long long)h);
+	return true;
+}
+
+bool cover_book_cached(const char *path, int box_w, int box_h, cover_image_t *out, bool *has_cover, char *title,
+					   size_t title_size) {
+	memset(out, 0, sizeof(*out));
+	*has_cover = false;
+	if (title && title_size) {
+		title[0] = '\0';
+	}
+	char key[32];
+	if (!book_key(key, sizeof(key), path, box_w, box_h)) {
+		return false;
+	}
+
+	bool hit = false;
+	pthread_mutex_lock(&thumb_db_lock);
+	sqlite3_stmt *stmt = NULL;
+	if (thumb_db && sqlite3_prepare_v2(thumb_db, "SELECT title, w, h, pixels FROM books WHERE key = ?1", -1, &stmt,
+									   NULL) == SQLITE_OK) {
+		sqlite3_bind_text(stmt, 1, key, -1, SQLITE_STATIC);
+		if (sqlite3_step(stmt) == SQLITE_ROW) {
+			int w = sqlite3_column_int(stmt, 1);
+			int h = sqlite3_column_int(stmt, 2);
+			if (w == 0) {
+				hit = h == BOOK_NONE_EPOCH;
+			} else {
+				hit = image_from_column(stmt, 3, w, h, out);
+				*has_cover = hit;
+			}
+			const char *text = (const char *)sqlite3_column_text(stmt, 0);
+			if (hit && title && title_size && text) {
+				snprintf(title, title_size, "%s", text);
+			}
+		}
+		sqlite3_finalize(stmt);
+	}
+	pthread_mutex_unlock(&thumb_db_lock);
+	return hit;
+}
+
+void cover_book_store(const char *path, int box_w, int box_h, const cover_image_t *cover, const char *title) {
+	char key[32];
+	if (!book_key(key, sizeof(key), path, box_w, box_h)) {
+		return;
+	}
+	pthread_mutex_lock(&thumb_db_lock);
+	sqlite3_stmt *stmt = NULL;
+	if (thumb_db && sqlite3_prepare_v2(thumb_db,
+									   "INSERT OR REPLACE INTO books(key, title, w, h, pixels) VALUES(?1, ?2, ?3, ?4, ?5)",
+									   -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(stmt, 1, key, -1, SQLITE_STATIC);
+		sqlite3_bind_text(stmt, 2, title ? title : "", -1, SQLITE_STATIC);
+		if (cover && cover->pixels) {
+			int w = (int)cover->dsc.header.w;
+			int h = (int)cover->dsc.header.h;
+			sqlite3_bind_int(stmt, 3, w);
+			sqlite3_bind_int(stmt, 4, h);
+			sqlite3_bind_blob(stmt, 5, cover->pixels, (int)((size_t)w * h * 2), SQLITE_STATIC);
+		} else {
+			sqlite3_bind_int(stmt, 3, 0);
+			sqlite3_bind_int(stmt, 4, BOOK_NONE_EPOCH);
+			sqlite3_bind_null(stmt, 5);
+		}
+		sqlite3_step(stmt); // a failure here only costs opening the book again
+		sqlite3_finalize(stmt);
+	}
+	pthread_mutex_unlock(&thumb_db_lock);
 }

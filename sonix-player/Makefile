@@ -87,9 +87,39 @@ HOST_CFLAGS = $(CFLAGS) -DHOST_BUILD=1 $(shell sdl2-config --cflags) $(shell pkg
 # arithmetic is untouched: only how code and data are reached. Needs a dynamic
 # linker with MIPS PLT support, which glibc has had since 2.9 (the device has
 # 2.22). Ignored for anything built with -fPIC.
-TARGET_CFLAGS = $(CFLAGS) -march=mips32r2 -mno-madd4 -mplt -I$(LVGL_DIR)/src -I$(FREETYPE_PREFIX)/include/freetype2 \
+#
+# -ffunction-sections -fdata-sections: every function and every object in a
+# section of its own, so that --gc-sections (TARGET_LDFLAGS) can leave out the
+# ones nothing calls -- the LVGL widgets the interface never creates, the parts
+# of SQLite it never asks for. The player locks its code into RAM at startup
+# (lock_code_pages in main.c), so code that is never run is memory that is
+# never given back. What stays is compiled exactly as before.
+TARGET_CFLAGS = $(CFLAGS) -march=mips32r2 -mno-madd4 -mplt -ffunction-sections -fdata-sections \
+				-I$(LVGL_DIR)/src -I$(FREETYPE_PREFIX)/include/freetype2 \
 				-I$(AUDIO_PREFIX)/include -I$(AUDIO_PREFIX)/include/opus \
 				-include src/system/core/glibc_compat.h
+
+# How hard each target object is optimised, on top of TARGET_CFLAGS (the last
+# -O on the command line is the one that counts).
+#
+# -O3 inlines and unrolls, and the code grows with it: worth it where the
+# player spends its time with music playing or a game running, and nowhere
+# else. Locked into RAM as all the code is (see above), the rest at -O2 is
+# about half a megabyte given back, and on a core with a small instruction
+# cache, smaller code is seldom slower code.
+#
+# The hot paths: the audio chain and its effects, the decoders, the Game Boy
+# core, and LVGL's software renderer and colour mixing. SQLite is at -O2, the
+# level it is normally built at.
+#
+# TARGET_OPT is per object: the default level everywhere, the hot one on the
+# objects matching TARGET_HOT_PATTERNS.
+TARGET_DEFAULT_OPT = -O2
+TARGET_HOT_OPT = -O3
+TARGET_HOT_PATTERNS = build_target/system/audio/% build_target/system/decode/% build_target/gb/% \
+					  build_target/lvgl/src/draw/sw/% build_target/lvgl/src/misc/lv_color%
+TARGET_OPT = $(TARGET_DEFAULT_OPT)
+$(TARGET_HOT_PATTERNS): TARGET_OPT = $(TARGET_HOT_OPT)
 
 # The C++ in this project is the Game Boy core (src/gb, Gearboy) plus the facade
 # that makes it callable from the player, which is C.
@@ -122,8 +152,10 @@ TARGET_CXXFLAGS = $(TARGET_CFLAGS) $(GB_CFLAGS)
 GB_LDFLAGS = -static-libstdc++ -static-libgcc
 HOST_LDFLAGS = $(shell sdl2-config --libs) -lpthread -lm -ldl -lasound $(shell pkg-config --libs freetype2) \
 			   $(shell pkg-config --libs opusfile wavpack)
+#
+# --gc-sections: the other half of -ffunction-sections (see TARGET_CFLAGS).
 TARGET_LDFLAGS = $(FREETYPE_PREFIX)/lib/libfreetype.a $(AUDIO_LIBS) -lpthread -lm -ldl -lasound \
-				 $(GB_LDFLAGS)
+				 $(GB_LDFLAGS) -Wl,--gc-sections
 
 # FreeType for the target, built static: the rootfs has no libfreetype.so. The
 # host uses the system one. The device's fonts are plain OTF/TTF, so zlib,
@@ -337,26 +369,28 @@ check-abi:
 	fi; \
 	echo "check-abi: no symbol beyond glibc $(DEVICE_GLIBC_MAJOR).$(DEVICE_GLIBC_MINOR)."
 
-# The flags every target object was compiled with. Rewritten only when they
-# differ, so a change of flags rebuilds everything and nothing else does.
+# The flags every target object was compiled with, the optimisation levels
+# included. Rewritten only when they differ, so a change of flags rebuilds
+# everything and nothing else does.
 TARGET_FLAGS_STAMP = build_target/.flags
+TARGET_FLAGS_LINE = $(TARGET_CFLAGS) | $(TARGET_CXXFLAGS) | $(TARGET_DEFAULT_OPT) $(TARGET_HOT_OPT) $(TARGET_HOT_PATTERNS)
 $(TARGET_FLAGS_STAMP): FORCE
 	@mkdir -p $(dir $@)
-	@echo '$(TARGET_CFLAGS) | $(TARGET_CXXFLAGS)' | cmp -s - $@ || \
-		echo '$(TARGET_CFLAGS) | $(TARGET_CXXFLAGS)' > $@
+	@echo '$(TARGET_FLAGS_LINE)' | cmp -s - $@ || \
+		echo '$(TARGET_FLAGS_LINE)' > $@
 FORCE:
 
 build_target/%.o: src/%.c $(TARGET_FLAGS_STAMP)
 	@mkdir -p $(dir $@)
-	$(CROSS_CC) $(TARGET_CFLAGS) -c $< -o $@
+	$(CROSS_CC) $(TARGET_CFLAGS) $(TARGET_OPT) -c $< -o $@
 
 build_target/%.opp: src/%.cpp $(TARGET_FLAGS_STAMP)
 	@mkdir -p $(dir $@)
-	$(CROSS_CXX) $(TARGET_CXXFLAGS) -c $< -o $@
+	$(CROSS_CXX) $(TARGET_CXXFLAGS) $(TARGET_OPT) -c $< -o $@
 
 build_target/lvgl/%.o: $(LVGL_DIR)/%.c $(TARGET_FLAGS_STAMP)
 	@mkdir -p $(dir $@)
-	$(CROSS_CC) $(TARGET_CFLAGS) -c $< -o $@
+	$(CROSS_CC) $(TARGET_CFLAGS) $(TARGET_OPT) -c $< -o $@
 
 # For the Zed/clangd LSP: autofill and hover popups.
 compile_commands.json:

@@ -284,7 +284,7 @@ static long track_seconds(const char *track_path) {
 		return -1;
 	}
 
-	decoder_t *dec = decoder_open(track_path, format);
+	decoder_t *dec = decoder_open_info(track_path, format);
 	if (!dec) {
 		return -1;
 	}

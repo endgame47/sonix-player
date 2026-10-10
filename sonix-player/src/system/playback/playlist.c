@@ -464,7 +464,9 @@ static size_t load_folder_cues(const char *folder, char claimed[][512], size_t c
 		}
 		char sheet_path[768];
 		snprintf(sheet_path, sizeof(sheet_path), "%s/%s", folder, de->d_name);
-		if (!cue_parse(sheet_path, sheet)) {
+		// A sheet over files split one per track leaves them as they are, as
+		// the library and the browser do.
+		if (!cue_parse(sheet_path, sheet) || sheet->split) {
 			continue;
 		}
 		for (int t = 0; t < sheet->track_count; t++) {

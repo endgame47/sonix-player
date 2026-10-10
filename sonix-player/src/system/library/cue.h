@@ -45,6 +45,11 @@ typedef struct {
 	int year;				// from REM DATE, 0 if absent
 	int disc;				// from REM DISCNUMBER, 0 if absent
 	int track_count;
+	// A sheet over a disc already split one file per track: only the first
+	// file's track is here. The library and the browser take the files as
+	// they are and leave such a sheet alone; a track path that names it still
+	// plays, as it did when the library indexed it.
+	bool split;
 	cue_track_t tracks[CUE_MAX_TRACKS];
 } cue_sheet_t;
 

@@ -735,7 +735,10 @@ static void walk_items(FILE *f, const ape_tag_t *tag,
 	}
 }
 
-// The same names wavpackdec.c asks for; see the note on the variants there.
+// The item names of interest, compared case-insensitively. APEv2 has no naming
+// standard: the album artist appears as "Album Artist", "AlbumArtist" and
+// "album_artist" (ffmpeg), the year as "Year" and "date"; whichever is there
+// answers.
 static const char *const TAG_ITEMS[] = {
 	"Title",		 "Artist", "Album", "Album Artist",	 "AlbumArtist",			  "album_artist",
 	"Genre",		 "Track",  "Year",	"date",			 "replaygain_track_gain", "replaygain_track_peak",
@@ -805,54 +808,42 @@ static bool cover_item(void *user, const char *key, uint32_t flags, uint32_t siz
 	return true;
 }
 
-unsigned char *apedec_cover(const char *filepath, size_t max_size, size_t *out_size) {
-	if (out_size) {
-		*out_size = 0;
-	}
-	if (!filepath) {
-		return NULL;
+bool apedec_cover_at(const char *filepath, int64_t *offset, uint32_t *size) {
+	if (!filepath || !offset || !size) {
+		return false;
 	}
 	FILE *f = fopen(filepath, "rb");
 	if (!f) {
-		return NULL;
+		return false;
 	}
 
-	unsigned char *image = NULL;
 	ape_tag_t tag;
 	cover_walk_t w = {{0, 0}, {0, 0}};
 	if (find_tag(f, &tag)) {
 		walk_items(f, &tag, cover_item, &w);
 	}
 
-	for (int slot = 0; slot < 2 && !image; slot++) {
-		uint32_t size = w.size[slot];
-		if (!size || size > max_size + 256) {
+	bool found = false;
+	for (int slot = 0; slot < 2 && !found; slot++) {
+		// The value is a file name, a NUL, then the image.
+		if (w.size[slot] == 0 || fseeko(f, (off_t)w.at[slot], SEEK_SET) != 0) {
 			continue;
 		}
-		unsigned char *raw = malloc(size);
-		if (!raw) {
-			break;
-		}
-		if (fseeko(f, (off_t)w.at[slot], SEEK_SET) == 0 && fread(raw, 1, size, f) == size) {
-			// The value is a file name, a NUL, then the image.
-			unsigned char *nul = memchr(raw, '\0', size);
-			if (nul) {
-				size_t skip = (size_t)(nul - raw) + 1;
-				size_t bytes = size - skip;
-				if (bytes > 0 && bytes <= max_size) {
-					image = malloc(bytes);
-					if (image) {
-						memcpy(image, raw + skip, bytes);
-						if (out_size) {
-							*out_size = bytes;
-						}
-					}
-				}
+		uint32_t skip = 0;
+		int c = EOF;
+		while (skip < w.size[slot] && (c = fgetc(f)) != EOF) {
+			skip++;
+			if (c == 0) {
+				break;
 			}
 		}
-		free(raw);
+		if (skip > 0 && skip < w.size[slot] && c == 0) {
+			*offset = w.at[slot] + skip;
+			*size = w.size[slot] - skip;
+			found = true;
+		}
 	}
 
 	fclose(f);
-	return image;
+	return found;
 }

@@ -18,6 +18,7 @@
 #include "src/gui/bluetooth/btaudio.h"
 #include "src/gui/bluetooth/btsettings.h"
 #include "src/gui/shell/confirm.h"
+#include "src/gui/shell/corners.h"
 #include "src/gui/settings/kblayoutpage.h"
 #include "src/gui/settings/screensaver.h"
 #include "src/gui/library/audiobookextras.h"
@@ -634,6 +635,10 @@ void gui_init(gui_config_t *cfg) {
 	// config. Built the other way round, a screensaver saved as on comes up
 	// showing an off switch.
 	screensaver_init(cfg);
+
+	// The rounded screen corners, if they are on: above everything, including
+	// the screensaver, which is why they live on the system layer.
+	corners_init(cfg);
 
 	main_menu_init(cfg);
 

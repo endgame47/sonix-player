@@ -6,6 +6,7 @@
 
 #include "src/gui/fonts/fonts.h"
 #include "src/gui/nowplaying/player.h"
+#include "src/gui/shell/corners.h"
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/switcher.h"
 #include "src/gui/shell/theme.h"
@@ -21,6 +22,7 @@ static lv_obj_t *btn_clock[4]; // left / centre / right / hidden
 static lv_obj_t *btn_accent[THEME_ACCENT_COUNT]; // the coloured circles
 static lv_obj_t *tint_toggle;
 static lv_obj_t *battery_percent_toggle;
+static lv_obj_t *rounded_corners_toggle;
 static lv_obj_t *text_size_pill[2]; // normal / large
 // The status bar draws the battery either way; this setting is only about the
 // number beside it, and is on by default.
@@ -30,6 +32,11 @@ static void battery_percent_cb(lv_event_t *e) {
 	topbar_set_battery_percent(shown);
 	config_set_int("screen", "battery_percent", shown ? 1 : 0);
 	config_save();
+}
+
+static void rounded_corners_cb(lv_event_t *e) {
+	(void)e;
+	corners_set_enabled(lv_obj_has_state(rounded_corners_toggle, LV_STATE_CHECKED));
 }
 
 // The accent's hue spread over the backgrounds and cards. theme_set_dynamic_tint
@@ -305,11 +312,17 @@ void appearance_init(gui_config_t *cfg) {
 	text_size_pill[FONTS_TEXT_LARGE] =
 		settingsrow_pill(text_size_pills, "appearance_text_large", FONTS_TEXT_LARGE, text_size_cb);
 
-	// A fifth card, and the last plain switch on the page: whether the status
+	// A fifth card, and a plain switch: whether the status
 	// bar prints the charge as a number as well as drawing it.
 	settingsrow_toggle(container, "appearance_battery_percentage", &battery_percent_toggle, battery_percent_cb);
 	if (config_get_int("screen", "battery_percent", 1) != 0) {
 		lv_obj_add_state(battery_percent_toggle, LV_STATE_CHECKED);
+	}
+
+	// Rounds off the four corners of the screen, over every page and overlay.
+	settingsrow_toggle(container, "appearance_rounded_corners", &rounded_corners_toggle, rounded_corners_cb);
+	if (corners_enabled()) {
+		lv_obj_add_state(rounded_corners_toggle, LV_STATE_CHECKED);
 	}
 
 	refresh_buttons();

@@ -41,17 +41,4 @@ uint64_t wavpackdec_read_s32(wavpackdec_t *w, uint64_t frames, int32_t *out);
 
 bool wavpackdec_seek(wavpackdec_t *w, uint64_t frame);
 
-// APEv2 tags, for metadata.c. The file is opened once and every tag of
-// interest that is found is handed to the callback with its APEv2 name
-// (`Title`, `Album`, `replaygain_track_gain`, ...) and its value. Absent tags
-// produce no call.
-void wavpackdec_tags(const char *filepath, void (*fn)(void *user, const char *key, const char *value), void *user);
-
-// The embedded cover, for albumart.c. In APEv2 it lives in a binary item
-// named "Cover Art (Front)" (or "(Back)") whose value is the file name, a NUL,
-// then the image: the name is already stripped here and only the image bytes
-// are returned. NULL when there is none; the caller frees with free().
-// `max_size` rejects anything too large without allocating it.
-unsigned char *wavpackdec_cover(const char *filepath, size_t max_size, size_t *out_size);
-
 #endif /* WAVPACK_DECODE_H */

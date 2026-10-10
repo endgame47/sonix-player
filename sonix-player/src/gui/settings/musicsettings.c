@@ -1318,6 +1318,7 @@ static void organize_touched(void) { organize_changed = true; }
 static lv_obj_t *split_artists_switch, *split_artists_pills;
 static lv_obj_t *split_genres_switch, *split_genres_pills;
 static lv_obj_t *unsplit_row;
+static lv_obj_t *split_album_artists_row, *split_album_artists_switch;
 static lv_obj_t *join_albums_switch;
 
 typedef struct {
@@ -1332,6 +1333,10 @@ static const split_pill_t SPLIT_ARTIST_PILLS[] = {
 	{",", LIBRARY_SPLIT_COMMA},
 	{"feat.", LIBRARY_SPLIT_FEAT},
 	{"vs.", LIBRARY_SPLIT_VS},
+	{"x", LIBRARY_SPLIT_X},
+	{"+", LIBRARY_SPLIT_PLUS},
+	{"with", LIBRARY_SPLIT_WITH},
+	{"and", LIBRARY_SPLIT_AND},
 };
 static const split_pill_t SPLIT_GENRE_PILLS[] = {
 	{";", LIBRARY_SPLIT_SEMICOLON},
@@ -1352,6 +1357,8 @@ static void organize_refresh(void) {
 	lv_obj_set_state(split_artists_switch, LV_STATE_CHECKED, artists);
 	lv_obj_set_hidden(split_artists_pills, !artists);
 	lv_obj_set_hidden(unsplit_row, !artists);
+	lv_obj_set_hidden(split_album_artists_row, !artists);
+	lv_obj_set_state(split_album_artists_switch, LV_STATE_CHECKED, library_split_album_artists());
 	for (int i = 0; i < SPLIT_ARTIST_COUNT; i++) {
 		settingsrow_pill_active(split_artist_pill[i], (a & SPLIT_ARTIST_PILLS[i].bit) != 0);
 	}
@@ -1367,6 +1374,11 @@ static void split_artists_cb(lv_event_t *e) {
 	library_set_split_artists(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
 	organize_touched();
 	organize_refresh();
+}
+
+static void split_album_artists_cb(lv_event_t *e) {
+	library_set_split_album_artists(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+	organize_touched();
 }
 
 static void split_genres_cb(lv_event_t *e) {
@@ -1444,6 +1456,8 @@ static void build_scan_page(gui_config_t *cfg) {
 		split_artist_pill[i] = settingsrow_pill_text(split_artists_pills, SPLIT_ARTIST_PILLS[i].text, (int)SPLIT_ARTIST_PILLS[i].bit,
 											   split_artist_pill_cb);
 	}
+	split_album_artists_row = settingsrow_toggle(container, "musicsettings_split_album_artists",
+												 &split_album_artists_switch, split_album_artists_cb);
 	unsplit_row = settingsrow_add(container, "musicsettings_unsplit_artists", NULL, switch_screen_cb,
 								  artistexceptions_screen);
 

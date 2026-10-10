@@ -71,7 +71,8 @@ static void host_pace(snd_pcm_sframes_t frames, int rate) {
 // back by the returned amount.
 // One per turn of a decode loop, for the watchdog.
 //
-// The playback thread runs SCHED_RR, and this device has one core: a turn that
+// The playback thread runs SCHED_RR while its stream plays (see
+// playback_follow), and this device has one core: a turn that
 // never blocks starves everything else, the interface included, and the log
 // stops because nothing else is scheduled to write to it. From outside that is
 // a frozen player with nothing in the log -- and from the watchdog's side a
@@ -1677,8 +1678,8 @@ static void track_started(void) {
 
 // A line every HEALTH_PERIOD_MS while a track plays: the share of the core the
 // playback thread used, how many writes needed recovering, and MemAvailable.
-// The thread runs SCHED_RR on a single core, so whatever it uses is taken from
-// the interface first.
+// While a stream plays the thread runs SCHED_RR on a single core, so whatever
+// it uses is taken from the interface first.
 #define HEALTH_PERIOD_MS 10000
 
 static volatile unsigned write_recoveries; // counted in pcm_write_recover()
@@ -2172,12 +2173,89 @@ static snd_pcm_sframes_t pcm_write_bluetooth(snd_pcm_t *pcm, const void *buf, sn
 	return (snd_pcm_sframes_t)done;
 }
 
+// The playback thread is real-time only while a stream is playing.
+//
+// Real-time is what keeps a playing stream fed whatever the interface is
+// doing. But a stream that is not running yet -- a track starting, a seek, a
+// resume, a recovery -- is filled from empty in one go: the start threshold is
+// the whole buffer, so nothing is written to the card until it is full, and
+// no write blocks on the way. At 192 kHz that is most of a second of audio
+// decoded, run through the effects and written without a pause, on the one
+// core, ahead of the interface -- right as the now-playing screen slides in.
+// Opening the device is worse: the codec's power-up and reset are busy waits
+// in the driver (more than a hundred milliseconds of them), and a real-time
+// caller holds the core through every one.
+//
+// Nothing is playing in either case, so there is nothing for the priority to
+// protect: the thread steps down to the interface's level until the stream
+// starts, and goes back up from the first write that finds it running.
+#define PLAYBACK_RT_PRIORITY 10
+
+static bool playback_rt;
+
+static void playback_set_rt(bool on) {
+	if (on == playback_rt) {
+		return;
+	}
+	struct sched_param param = {.sched_priority = on ? PLAYBACK_RT_PRIORITY : 0};
+	if (pthread_setschedparam(pthread_self(), on ? SCHED_RR : SCHED_OTHER, &param) == 0) {
+		playback_rt = on;
+	}
+}
+
+// The stream the thread's priority follows, its buffer, and how much has been
+// written to it since it last stopped playing.
+static snd_pcm_t *follow_pcm;
+static snd_pcm_uframes_t follow_buffer;
+static snd_pcm_uframes_t follow_filled;
+
+static bool pcm_playing(snd_pcm_t *pcm) {
+	snd_pcm_state_t st = snd_pcm_state(pcm);
+	return st == SND_PCM_STATE_RUNNING || st == SND_PCM_STATE_DRAINING;
+}
+
+// Real-time while `pcm` plays, the interface's level otherwise. NULL is a
+// device about to be opened. A whole buffer written also counts as playing,
+// whatever the state says: the stream starts on a full buffer, so by then it
+// is either running or about to, and a PCM that never reports it does not
+// leave the thread below the interface for the length of a track.
+static void playback_follow(snd_pcm_t *pcm) {
+	if (pcm != follow_pcm) {
+		follow_pcm = pcm;
+		follow_filled = 0;
+		follow_buffer = 0;
+		snd_pcm_uframes_t period = 0;
+		if (pcm && snd_pcm_get_params(pcm, &follow_buffer, &period) < 0) {
+			follow_buffer = 0;
+		}
+	}
+	if (!pcm) {
+		playback_set_rt(false);
+		return;
+	}
+	if (pcm_playing(pcm)) {
+		follow_filled = 0;
+		playback_set_rt(true);
+		return;
+	}
+	playback_set_rt(follow_buffer > 0 && follow_filled >= follow_buffer);
+}
+
+// After a write of `frames` to `pcm`.
+static void playback_wrote(snd_pcm_t *pcm, snd_pcm_uframes_t frames) {
+	if (pcm == follow_pcm && !pcm_playing(pcm)) {
+		follow_filled += frames;
+	}
+	playback_follow(pcm);
+}
+
 static snd_pcm_sframes_t pcm_write_recover(snd_pcm_t **pcm, const void *buf, snd_pcm_uframes_t frames, int channels,
 										   int rate, int bits, snd_pcm_uframes_t *period) {
 	for (int attempt = 0; attempt < 8; attempt++) {
 		if (!*pcm) {
 			return -EIO; // a previous recovery closed it and could not get it back
 		}
+		playback_follow(*pcm);
 
 		// Never write blind to a RUNNING stream. The blocking writei waits for
 		// room in the card's buffer; after a storm of underruns this hardware
@@ -2222,6 +2300,7 @@ static snd_pcm_sframes_t pcm_write_recover(snd_pcm_t **pcm, const void *buf, snd
 			written = snd_pcm_writei(*pcm, buf, frames);
 		}
 		if (written >= 0) {
+			playback_wrote(*pcm, (snd_pcm_uframes_t)written);
 			return written;
 		}
 
@@ -2253,6 +2332,7 @@ static snd_pcm_sframes_t pcm_write_recover(snd_pcm_t **pcm, const void *buf, snd
 		// immediately only earns another EIO.
 		snd_pcm_close(*pcm);
 		*pcm = NULL;
+		playback_follow(NULL);
 		usleep((attempt + 1) * 150 * 1000);
 		// The route, not just the PCM. Reopening the stream without redoing the
 		// codec routing leaves the DAC in a state where high-rate streams never
@@ -2282,6 +2362,7 @@ static bool pcm_reroute(snd_pcm_t **pcm, int channels, int rate, int bits, snd_p
 		snd_pcm_close(*pcm);
 		*pcm = NULL;
 	}
+	playback_follow(NULL);
 	usleep(150 * 1000); // let the switch settle before the codec is poked
 	auto_set_output();
 	*pcm = open_pcm_device(channels, rate, bits, period);
@@ -2509,6 +2590,7 @@ static void play_wav_file(const char *filepath) {
 	// the decoded path.
 	snd_pcm_uframes_t period_size;
 	snd_pcm_t *pcm_handle = gapless_take(info.channels, info.sample_rate, info.out_bits, &period_size);
+	playback_follow(pcm_handle);
 	if (pcm_handle) {
 		pcm_device_open = true;
 	} else {
@@ -2658,6 +2740,7 @@ static void play_wav_file(const char *filepath) {
 				snd_pcm_close(pcm_handle);
 				pcm_handle = NULL;
 				pcm_device_open = false;
+				playback_follow(NULL);
 				fprintf(stderr, "audio[%ld]: device released while paused (DAC powered down)\n", log_ms());
 			}
 
@@ -2692,6 +2775,7 @@ static void play_wav_file(const char *filepath) {
 					snd_pcm_close(pcm_handle);
 					pcm_handle = NULL;
 					pcm_device_open = false;
+					playback_follow(NULL);
 					// Breathing room after the close: the same as the 120 ms
 					// on a track's way out and the 150 ms in pcm_reroute. On
 					// this driver an open glued to a close comes back busy or
@@ -2734,6 +2818,7 @@ static void play_wav_file(const char *filepath) {
 							snd_pcm_close(pcm_handle);
 							pcm_handle = NULL;
 							pcm_device_open = false;
+							playback_follow(NULL);
 							audio_command = AUDIO_CMD_STOP;
 							playback_status = AUDIO_STATUS_STOPPED;
 							pthread_mutex_unlock(&audio_mutex);
@@ -2773,6 +2858,7 @@ static void play_wav_file(const char *filepath) {
 			}
 		}
 
+		playback_follow(pcm_handle);
 		// Up to the end of the data chunk and no further: what follows it is
 		// metadata, not audio.
 		health_mark(&health);
@@ -3105,6 +3191,7 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 	// is the whole of gapless. Never for DoP -- see the comment above
 	// gapless_release().
 	snd_pcm_t *pcm_handle = passthrough ? NULL : gapless_take(channels, out_rate, out_bits, &period_size);
+	playback_follow(pcm_handle);
 	if (pcm_handle) {
 		pcm_device_open = true;
 	} else {
@@ -3344,6 +3431,7 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 				snd_pcm_close(pcm_handle);
 				pcm_handle = NULL;
 				pcm_device_open = false;
+				playback_follow(NULL);
 				fprintf(stderr, "audio[%ld]: device released while paused (DAC powered down)\n", log_ms());
 			}
 
@@ -3371,6 +3459,7 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 					snd_pcm_close(pcm_handle);
 					pcm_handle = NULL;
 					pcm_device_open = false;
+					playback_follow(NULL);
 					// Breathing room after the close -- like the 120 ms on a
 					// track's way out and the 150 ms in pcm_reroute: on this
 					// driver an open glued to a close comes back busy or
@@ -3399,6 +3488,7 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 							snd_pcm_close(pcm_handle);
 							pcm_handle = NULL;
 							pcm_device_open = false;
+							playback_follow(NULL);
 							audio_command = AUDIO_CMD_STOP;
 							playback_status = AUDIO_STATUS_STOPPED;
 							pthread_mutex_unlock(&audio_mutex);
@@ -3458,6 +3548,9 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 		// same at normal speed, and deliberately not at any other.
 		uint64_t frames_read;
 		uint64_t input_frames;
+		// Before the decode, as a seek or a resume this turn has just emptied
+		// the stream (see playback_follow).
+		playback_follow(pcm_handle);
 		health_mark(&health);
 		if (out_bits == 32) {
 			frames_read = decoder_read_pcm_frames_s32(dec, chunk_frames, (int32_t *)buffer);
@@ -3784,6 +3877,11 @@ static void play_file(const char *filepath) {
 	// the codec route while another stream's PCM is open is the move that
 	// wedges this driver (see pcm_reroute), and this is the one place on the
 	// way into a track where nothing is holding a lock.
+	// No stream of this player's is playing out: the route and the open that
+	// follow can wait for the interface (see playback_follow).
+	if (!gapless_holding()) {
+		playback_follow(NULL);
+	}
 	release_external_output();
 	auto_set_output();
 
@@ -3792,6 +3890,8 @@ static void play_file(const char *filepath) {
 	} else {
 		play_decoded_file(filepath, format);
 	}
+	// A held stream may still be playing out its last buffer.
+	playback_set_rt(true);
 
 	pthread_mutex_lock(&audio_mutex);
 	bool replaced = play_request;
@@ -3816,8 +3916,8 @@ static void *playback_thread_func(void *arg) {
 	// Real-time round-robin, modestly: the UI decoding a 9 MB cover on the
 	// one core must never starve the thread that feeds the DAC. Failing is
 	// fine (the host build has no privilege for it).
-	struct sched_param rt = {.sched_priority = 10};
-	if (pthread_setschedparam(pthread_self(), SCHED_RR, &rt) == 0) {
+	playback_set_rt(true);
+	if (playback_rt) {
 		fprintf(stderr, "audio: playback thread running at RT priority\n");
 	}
 

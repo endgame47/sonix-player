@@ -5258,7 +5258,12 @@ static drflac_bool32 drflac__read_next_flac_frame_header(drflac_bs* bs, drflac_u
             }
             crc8 = drflac_crc8(crc8, header->blockSizeInPCMFrames, 16);
             if (header->blockSizeInPCMFrames == 0xFFFF) {
-                return DRFLAC_FALSE;    /* Frame is too big. This is the size of the frame minus 1. The STREAMINFO block defines the max block size which is 16-bits. Adding one will make it 17 bits and therefore too big. */
+                /*
+                Frame is too big. This is the size of the frame minus 1. The STREAMINFO block defines the max block size which is 16-bits. Adding one will
+                make it 17 bits and therefore too big. So this is no frame header but a sync code inside the audio data: keep looking. Giving up here ends
+                the search of a seek that landed in the middle of a frame, and the seek falls back to decoding from the start of the file.
+                */
+                continue;
             }
             header->blockSizeInPCMFrames += 1;
         } else {
@@ -5299,8 +5304,8 @@ static drflac_bool32 drflac__read_next_flac_frame_header(drflac_bs* bs, drflac_u
         }
 
         if (header->bitsPerSample != streaminfoBitsPerSample) {
-            /* If this subframe has a different bitsPerSample then streaminfo or the first frame, reject it */
-            return DRFLAC_FALSE;
+            /* A different bitsPerSample than STREAMINFO: a sync code inside the audio data, not a frame header. Keep looking, as above. */
+            continue;
         }
 
         if (!drflac__read_uint8(bs, 8, &header->crc8)) {

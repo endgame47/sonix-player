@@ -108,27 +108,43 @@ static void *worker_main(void *arg) {
 		char path[800];
 		snprintf(path, sizeof(path), "%s/%s", job->dir, job->files[index]);
 
-		char title[256];
-		uint32_t size = 0;
-		void *bytes = ebook_peek_cover(path, &size, title, sizeof(title));
-
 		covers_result_t *result = calloc(1, sizeof(*result));
 		if (!result) {
-			free(bytes);
 			continue;
 		}
 		result->gen = job->gen;
 		result->index = index;
 		result->cb = job->cb;
-		snprintf(result->title, sizeof(result->title), "%s", title[0] ? title : job->files[index]);
 
-		if (bytes && size) {
-			// Decoded straight to the size it is drawn at, so a three-thousand
-			// pixel cover never exists at three thousand pixels.
-			result->has_cover =
-				cover_load_image_memory(bytes, size, job->box_w, job->box_h, COVER_FIT_COVER, &result->cover);
+		// The cache first: a book seen before is one read, not a ZIP opened
+		// and a picture decoded.
+		char title[256];
+		bool has_cover = false;
+		if (cover_book_cached(path, job->box_w, job->box_h, &result->cover, &has_cover, title, sizeof(title))) {
+			result->has_cover = has_cover;
+		} else {
+			uint32_t size = 0;
+			void *bytes = ebook_peek_cover(path, &size, title, sizeof(title));
+			if (bytes && size) {
+				// Decoded straight to the size it is drawn at, so a
+				// three-thousand pixel cover never exists at three thousand
+				// pixels.
+				result->has_cover =
+					cover_load_image_memory(bytes, size, job->box_w, job->box_h, COVER_FIT_COVER, &result->cover);
+				// A decode that failed is not kept: the budget it ran into is a
+				// share of the memory free at that moment, and a minute later
+				// the same cover may decode.
+				if (result->has_cover) {
+					cover_book_store(path, job->box_w, job->box_h, &result->cover, title);
+				}
+			} else if (title[0]) {
+				// The book opened and has no cover. An empty title as well is a
+				// book that may not have opened at all, and is asked again.
+				cover_book_store(path, job->box_w, job->box_h, NULL, title);
+			}
 			free(bytes);
 		}
+		snprintf(result->title, sizeof(result->title), "%s", title[0] ? title : job->files[index]);
 
 		if (job->gen != covers_gen || !gui_post(covers_ready, result)) {
 			// The page went away while this book was being read, or the queue

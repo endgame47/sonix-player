@@ -1,3 +1,4 @@
+#define _GNU_SOURCE 1 // strcasestr
 #include "radio.h"
 
 #include <errno.h>
@@ -2204,7 +2205,7 @@ static bool play_hls(const char *url, unsigned mine) {
 	hls_t *h = hls_open(url, why, sizeof(why));
 	if (!h) {
 		pthread_mutex_lock(&now_lock);
-		snprintf(now_state.error, sizeof(now_state.error), "%s",
+		snprintf(now_state.error, sizeof(now_state.error), "%.*s", (int)sizeof(now_state.error) - 1,
 				 why[0] ? why : tr("radio_unreadable"));
 		now_state.playing = false;
 		now_state.connecting = false;

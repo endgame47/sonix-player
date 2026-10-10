@@ -886,9 +886,14 @@ static void peq_migrate_legacy(void) {
 		if (len < 5 || strcasecmp(de->d_name + len - 4, ".ini") != 0) {
 			continue;
 		}
+		// A name too long for the buffers is left where it is: a cut path
+		// would read, write or rename the wrong file.
 		char from[700], to[700], done[720];
-		snprintf(from, sizeof(from), "%s/%s", peq_legacy_dir, de->d_name);
-		snprintf(to, sizeof(to), "%s/%.*s.txt", peq_preset_dir, (int)(len - 4), de->d_name);
+		int n_from = snprintf(from, sizeof(from), "%s/%s", peq_legacy_dir, de->d_name);
+		int n_to = snprintf(to, sizeof(to), "%s/%.*s.txt", peq_preset_dir, (int)(len - 4), de->d_name);
+		if (n_from < 0 || (size_t)n_from >= sizeof(from) || n_to < 0 || (size_t)n_to >= sizeof(to)) {
+			continue;
+		}
 		snprintf(done, sizeof(done), "%s.migrated", from);
 
 		peq_band_t bands[PEQ_BANDS];
@@ -1732,9 +1737,9 @@ int eq_auto_headroom_tenths(void) {
 }
 
 // The chain runs over a block in passes of up to EQ_PASS_FRAMES frames. A pass
-// first works out the two pre-gains frame by frame, then runs each active
-// filter over every frame of the pass with its coefficients and state held in
-// locals, both channels together. Every sample goes through the same float
+// first works out the two pre-gains frame by frame, then runs the active
+// filters over every frame of the pass, two at a time, with their coefficients
+// and state held in locals and both channels together. Every sample goes through the same float
 // operations, in the same order, as it would one sample at a time through the
 // whole chain:
 //
@@ -1788,15 +1793,87 @@ static void biquad_run_stereo(biquad_t *f, float *buf, int n) {
 	f->z2[1] = z2r;
 }
 
+// Two filters in a row, `f` then `g`, in one walk of the buffer: each sample
+// leaves `f` and goes straight into `g`. The operations on it are the ones the
+// two single walks make, in the same order -- only the loads and stores of the
+// buffer between them are gone.
+static void biquad_run_mono2(biquad_t *f, biquad_t *g, float *buf, int n) {
+	const float fb0 = f->b0, fb1 = f->b1, fb2 = f->b2, fa1 = f->a1, fa2 = f->a2;
+	const float gb0 = g->b0, gb1 = g->b1, gb2 = g->b2, ga1 = g->a1, ga2 = g->a2;
+	float fz1 = f->z1[0], fz2 = f->z2[0];
+	float gz1 = g->z1[0], gz2 = g->z2[0];
+	for (int i = 0; i < n; i++) {
+		float x = buf[i];
+		float y = fb0 * x + fz1;
+		fz1 = fb1 * x - fa1 * y + fz2;
+		fz2 = fb2 * x - fa2 * y;
+		float w = gb0 * y + gz1;
+		gz1 = gb1 * y - ga1 * w + gz2;
+		gz2 = gb2 * y - ga2 * w;
+		buf[i] = w;
+	}
+	f->z1[0] = fz1;
+	f->z2[0] = fz2;
+	g->z1[0] = gz1;
+	g->z2[0] = gz2;
+}
+
+static void biquad_run_stereo2(biquad_t *f, biquad_t *g, float *buf, int n) {
+	const float fb0 = f->b0, fb1 = f->b1, fb2 = f->b2, fa1 = f->a1, fa2 = f->a2;
+	const float gb0 = g->b0, gb1 = g->b1, gb2 = g->b2, ga1 = g->a1, ga2 = g->a2;
+	float fz1l = f->z1[0], fz2l = f->z2[0], fz1r = f->z1[1], fz2r = f->z2[1];
+	float gz1l = g->z1[0], gz2l = g->z2[0], gz1r = g->z1[1], gz2r = g->z2[1];
+	for (int i = 0; i < n; i++) {
+		float xl = buf[2 * i];
+		float xr = buf[2 * i + 1];
+		float yl = fb0 * xl + fz1l;
+		float yr = fb0 * xr + fz1r;
+		fz1l = fb1 * xl - fa1 * yl + fz2l;
+		fz1r = fb1 * xr - fa1 * yr + fz2r;
+		fz2l = fb2 * xl - fa2 * yl;
+		fz2r = fb2 * xr - fa2 * yr;
+		float wl = gb0 * yl + gz1l;
+		float wr = gb0 * yr + gz1r;
+		gz1l = gb1 * yl - ga1 * wl + gz2l;
+		gz1r = gb1 * yr - ga1 * wr + gz2r;
+		gz2l = gb2 * yl - ga2 * wl;
+		gz2r = gb2 * yr - ga2 * wr;
+		buf[2 * i] = wl;
+		buf[2 * i + 1] = wr;
+	}
+	f->z1[0] = fz1l;
+	f->z2[0] = fz2l;
+	f->z1[1] = fz1r;
+	f->z2[1] = fz2r;
+	g->z1[0] = gz1l;
+	g->z2[0] = gz2l;
+	g->z1[1] = gz1r;
+	g->z2[1] = gz2r;
+}
+
+// The active filters of slots [from, to), in slot order, two at a time.
 static void slots_run_pass(float *buf, int n, int channels, int from, int to) {
+	biquad_t *held = NULL; // an active filter waiting for a second one
 	for (int b = from; b < to; b++) {
 		if (!chain_active[b]) {
 			continue;
 		}
+		if (!held) {
+			held = &chain[b];
+			continue;
+		}
 		if (channels == 2) {
-			biquad_run_stereo(&chain[b], buf, n);
+			biquad_run_stereo2(held, &chain[b], buf, n);
 		} else {
-			biquad_run_mono(&chain[b], buf, n);
+			biquad_run_mono2(held, &chain[b], buf, n);
+		}
+		held = NULL;
+	}
+	if (held) {
+		if (channels == 2) {
+			biquad_run_stereo(held, buf, n);
+		} else {
+			biquad_run_mono(held, buf, n);
 		}
 	}
 }
@@ -1807,6 +1884,28 @@ static void gain_run_pass(float *buf, int n, int channels, const float *gain) {
 			buf[i * channels + c] = buf[i * channels + c] * gain[i];
 		}
 	}
+}
+
+// The same with one gain for the whole pass. With `skip_unity` a gain of
+// exactly 1 is not applied: the product would be the sample itself. Only for
+// samples known not to be denormal -- converted from the decoder, or scaled
+// from those -- since an FPU that flushes denormals turns x * 1 into zero.
+static void gain_run_const(float *buf, int samples, float gain, bool skip_unity) {
+	if (skip_unity && gain == 1.0f) {
+		return;
+	}
+	for (int i = 0; i < samples; i++) {
+		buf[i] = buf[i] * gain;
+	}
+}
+
+static bool slots_any_active(int from, int to) {
+	for (int b = from; b < to; b++) {
+		if (chain_active[b]) {
+			return true;
+		}
+	}
+	return false;
 }
 
 // Both gains move toward their targets a step at a time rather than jumping.
@@ -1842,7 +1941,19 @@ static inline void pregain_glide(float step) {
 
 // One pass through the chain: pass_buf holds `n` frames on the way in and on
 // the way out. The pre-gains advance one step per frame, before that frame.
+//
+// Both pre-gains at their targets is the usual case -- they move only for the
+// few milliseconds after a setting changes -- and then every frame of the pass
+// would get the same two values: the pass takes them as constants.
 static void chain_run_pass(int n, int channels, float step) {
+	if (pregain == pregain_target && mseb_pregain == mseb_pregain_target) {
+		bool mseb = slots_any_active(0, MSEB_FILTERS);
+		gain_run_const(pass_buf, n * channels, mseb_pregain, true);
+		slots_run_pass(pass_buf, n, channels, 0, MSEB_FILTERS);
+		gain_run_const(pass_buf, n * channels, pregain, !mseb);
+		slots_run_pass(pass_buf, n, channels, MSEB_FILTERS, CHAIN_SLOTS);
+		return;
+	}
 	for (int i = 0; i < n; i++) {
 		pregain_glide(step);
 		pass_mseb_gain[i] = mseb_pregain;

@@ -1059,7 +1059,9 @@ static int codecs_to_ask_for(char out[][BT_CODEC_MAX], int max) {
 				seen = strcasecmp(out[j], name) == 0;
 			}
 			if (!seen) {
-				snprintf(out[count++], BT_CODEC_MAX, "%s", name);
+				// %.*s: the compiler cannot see that each row of the table is
+				// terminated, and warns that a name could run on into the next.
+				snprintf(out[count++], BT_CODEC_MAX, "%.*s", BT_CODEC_MAX - 1, name);
 			}
 		}
 	}

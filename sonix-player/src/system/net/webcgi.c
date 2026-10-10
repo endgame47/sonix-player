@@ -191,8 +191,13 @@ int webcgi_main(void) {
 			continue;
 		}
 
+		// One byte is kept for the slash a folder gets below; a path that does
+		// not fit is left out rather than listed under a cut name.
 		char full[MAX_PATH + 256];
-		snprintf(full, sizeof(full), "%s/%s", path, name);
+		int full_len = snprintf(full, sizeof(full), "%s/%s", path, name);
+		if (full_len < 0 || (size_t)full_len + 1 >= sizeof(full)) {
+			continue;
+		}
 
 		struct stat info;
 		if (lstat(full, &info) != 0) {
@@ -207,7 +212,11 @@ int webcgi_main(void) {
 		first = false;
 
 		printf("{\"path\":");
-		print_json_string(is_dir ? (snprintf(full, sizeof(full), "%s/%s/", path, name), full) : full);
+		if (is_dir) {
+			full[full_len] = '/';
+			full[full_len + 1] = '\0';
+		}
+		print_json_string(full);
 		printf(",\"name\":");
 		print_json_string(name);
 		printf(",\"ctime\":\"%ld\"", (long)info.st_mtime);

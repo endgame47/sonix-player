@@ -37,7 +37,7 @@ lv_obj_t *playlistpage_screen;
 #define ROW_HEIGHT 88
 #define ROW_GAP 8
 #define ROW_RADIUS 12
-#define NAME_MAX 200
+#define PLAYLIST_NAME_MAX 200
 
 static gui_config_t *config;
 static lv_obj_t *list;
@@ -81,7 +81,7 @@ static void pending_many_free(void) {
 // ---------------------------------------------------------------------------
 
 typedef struct {
-	char name[NAME_MAX + 1];
+	char name[PLAYLIST_NAME_MAX + 1];
 	char **paths;
 	int count;
 	int added;
@@ -335,12 +335,12 @@ static void row_delete_cb(lv_event_t *e) { free(lv_event_get_user_data(e)); }
 
 // Playlist the ellipsis menu is acting on. Deleting confirms first: a playlist
 // is something the user built by hand.
-static char menu_name[NAME_MAX + 1];
+static char menu_name[PLAYLIST_NAME_MAX + 1];
 
 // The playlist the naming dialog is renaming, empty when it is creating one.
 // The dialog is the same either way -- same field, same keyboard -- and this is
 // what tells its accept button which of the two it is finishing.
-static char renaming[NAME_MAX + 1];
+static char renaming[PLAYLIST_NAME_MAX + 1];
 
 static void do_delete(void *user) {
 	(void)user;
@@ -360,7 +360,7 @@ static void menu_delete_action(void *user) {
 	if (!menu_name[0]) {
 		return;
 	}
-	char message[NAME_MAX + 64];
+	char message[PLAYLIST_NAME_MAX + 64];
 	snprintf(message, sizeof(message), tr("playlist_will_be_removed_its_backup_stays"), menu_name);
 	confirm_show("delete_the_playlist", message, "delete", do_delete, NULL);
 }
@@ -1099,7 +1099,7 @@ static void name_accept_cb(lv_event_t *e) {
 	(void)e;
 
 	const char *typed = lv_textarea_get_text(name_field);
-	char name[NAME_MAX + 1];
+	char name[PLAYLIST_NAME_MAX + 1];
 	snprintf(name, sizeof(name), "%s", typed ? typed : "");
 
 	// Trailing spaces produce a file name that looks identical but is not.
@@ -1427,7 +1427,7 @@ void playlistpage_init(gui_config_t *cfg) {
 
 	name_field = lv_textarea_create(name_layer);
 	lv_textarea_set_one_line(name_field, true);
-	lv_textarea_set_max_length(name_field, NAME_MAX);
+	lv_textarea_set_max_length(name_field, PLAYLIST_NAME_MAX);
 	lv_textarea_set_placeholder_text(name_field, tr("name"));
 	lv_obj_set_size(name_field, cfg->screen_width - 2 * cfg->padding, 62);
 	lv_obj_set_scrollbar_mode(name_field, LV_SCROLLBAR_MODE_OFF);

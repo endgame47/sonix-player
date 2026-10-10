@@ -660,8 +660,15 @@ bool cue_parse(const char *cue_path, cue_sheet_t *out) {
 		} else if (strcmp(command, "FILE") == 0) {
 			// One file per sheet is what a CD rip looks like. A second FILE
 			// means every offset after it is measured from a different zero,
-			// so parsing stops and what is already correct is kept.
+			// so parsing stops and what is already correct is kept. At most
+			// one track placed in the first file makes it a sheet over files
+			// split one per track (see cue_sheet_t.split).
 			if (have_file) {
+				int placed_count = 0;
+				for (int i = 0; i < count; i++) {
+					placed_count += placed[i] ? 1 : 0;
+				}
+				out->split = placed_count <= 1;
 				break;
 			}
 			read_value(args, file_field, sizeof(file_field), true);

@@ -1189,13 +1189,15 @@ void btstack_refresh_audio(void) {
 	}
 
 	pthread_mutex_lock(&lock);
+	// %.*s: the compiler cannot see that each row of found[] is terminated,
+	// and warns that an address could run on into the next one.
 	pcm_count = count;
 	for (int i = 0; i < count; i++) {
-		snprintf(pcm_addr[i], BT_ADDR_MAX, "%s", found[i]);
+		snprintf(pcm_addr[i], BT_ADDR_MAX, "%.*s", BT_ADDR_MAX - 1, found[i]);
 	}
 	rx_count = count_rx;
 	for (int i = 0; i < count_rx; i++) {
-		snprintf(rx_addr[i], BT_ADDR_MAX, "%s", found_rx[i]);
+		snprintf(rx_addr[i], BT_ADDR_MAX, "%.*s", BT_ADDR_MAX - 1, found_rx[i]);
 	}
 	pthread_mutex_unlock(&lock);
 }

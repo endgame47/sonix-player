@@ -444,15 +444,15 @@ enum STBVorbisError {
 #define STB_VORBIS_MAX_CHANNELS 16 // enough for anyone?
 
 // Local change to upstream: a size a comment block is allowed to be. Vorbis
-// puts no limit on either, and both come off a card unchecked. The length is
-// wide enough for a base64 front cover, which is a real comment this player
-// reads, and short of the ten megabytes it has to live in.
+// puts no limit on either, and both come off a card unchecked.
+//
+// Nothing in the player reads the comments through this decoder -- tags,
+// covers and chapters come from oggtags.c -- and the handle stays open for the
+// length of the track, so none of their text is kept: every comment is an
+// empty string, and its bytes are passed over a segment at a time.
 #define STB_VORBIS_MAX_COMMENTS 256
-#define STB_VORBIS_MAX_COMMENT_LEN (1024 * 1024)
-// And a budget for the whole list, because two hundred and fifty-six of the
-// above is not a budget. The handle stays open for the length of the track, so
-// this is memory held while the music plays, not only while the tags are read.
-#define STB_VORBIS_MAX_COMMENT_BYTES (2 * 1024 * 1024)
+#define STB_VORBIS_MAX_COMMENT_LEN 0
+#define STB_VORBIS_MAX_COMMENT_BYTES 0
 #endif
 
 // STB_VORBIS_PUSHDATA_CRC_COUNT [number]
@@ -1578,6 +1578,43 @@ static int get8_packet(vorb *f) {
 	int x = get8_packet_raw(f);
 	f->valid_bits = 0;
 	return x;
+}
+
+// Local change to upstream: passes over `n` bytes of the current packet as
+// `n` calls of get8_packet() would, leaving the same state behind. FALSE where
+// get8_packet() would have returned EOP. A cover kept as a comment is
+// megabytes; read a byte at a time it is seconds on the player before the
+// first sample. Here the full segments that follow on the same page go in one
+// skip, so most of it is never read off the card.
+static int skip_packet_bytes(vorb *f, uint32 n) {
+	f->valid_bits = 0;
+	while (n > 0) {
+		uint32 take;
+		if (!f->bytes_in_seg) {
+			// What next_segment() would do for each of them: a 255-byte
+			// segment never ends the packet.
+			uint32 run = 0;
+			while (!f->last_seg && f->next_seg != -1 && f->segments[f->next_seg] == 255 && n - run >= 255) {
+				run += 255;
+				if (++f->next_seg >= f->segment_count)
+					f->next_seg = -1;
+			}
+			if (run) {
+				skip(f, (int)run);
+				f->packet_bytes += run;
+				n -= run;
+				continue;
+			}
+			if (f->last_seg || !next_segment(f))
+				return FALSE;
+		}
+		take = (uint32)f->bytes_in_seg < n ? (uint32)f->bytes_in_seg : n;
+		skip(f, (int)take);
+		f->bytes_in_seg -= take;
+		f->packet_bytes += take;
+		n -= take;
+	}
+	return TRUE;
 }
 
 static int get32_packet(vorb *f) {
@@ -3680,14 +3717,19 @@ static int start_decoder(vorb *f) {
 	if (!vorbis_validate(header))
 		return error(f, VORBIS_invalid_setup);
 	//file vendor
+	// Local change to upstream: not kept either (see STB_VORBIS_MAX_COMMENT_LEN),
+	// and its length checked -- upstream allocates len + 1 and writes at
+	// [len], which a length off the card between -8 and -1 puts in front of
+	// a one-byte block.
 	len = get32_packet(f);
-	f->vendor = (char *)setup_malloc(f, sizeof(char) * (len + 1));
+	if (len < 0)
+		return error(f, VORBIS_invalid_setup);
+	f->vendor = (char *)setup_malloc(f, 1);
 	if (f->vendor == NULL)
 		return error(f, VORBIS_outofmem);
-	for (i = 0; i < len; ++i) {
-		f->vendor[i] = get8_packet(f);
-	}
-	f->vendor[len] = (char)'\0';
+	f->vendor[0] = (char)'\0';
+	if (!skip_packet_bytes(f, (uint32)len))
+		return error(f, VORBIS_invalid_setup);
 	// Local change to upstream: the comment list is read defensively.
 	//
 	// Upstream takes the count and every length off the disk unchecked, and
@@ -3698,12 +3740,11 @@ static int start_decoder(vorb *f) {
 	// base64 comment of a few hundred kilobytes, and that is the allocation
 	// that fails.
 	//
-	// The list is kept, because albumart.c is what reads the picture out of
-	// it. What changes is that running out of room costs a comment rather
-	// than the file: a comment that cannot be held becomes an empty entry,
-	// its bytes are read past so the framing flag after the list is still
-	// where it should be, and every slot inside comment_list_length holds a
-	// real string on every exit.
+	// What changes is that running out of room costs a comment rather than
+	// the file: a comment that cannot be held becomes an empty entry, its
+	// bytes are passed over so the framing flag after the list is still where
+	// it should be, and every slot inside comment_list_length holds a real
+	// string on every exit. With the limits above, that is every comment.
 	int declared_comments = get32_packet(f);
 	f->comment_list = NULL;
 	f->comment_list_length = 0;
@@ -3753,14 +3794,18 @@ static int start_decoder(vorb *f) {
 			}
 		}
 
+		if (!store) {
+			if (!skip_packet_bytes(f, (uint32)len)) {
+				return error(f, VORBIS_invalid_setup);
+			}
+			continue;
+		}
 		for (j = 0; j < len; ++j) {
 			int byte = get8_packet(f);
 			if (byte == EOP) {
 				return error(f, VORBIS_invalid_setup);
 			}
-			if (store) {
-				slot[j] = (char)byte;
-			}
+			slot[j] = (char)byte;
 		}
 	}
 

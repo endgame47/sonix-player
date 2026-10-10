@@ -2,9 +2,7 @@
 
 #include "src/system/core/utils.h"
 #include "src/system/decode/dr_flac.h"
-#include "src/system/decode/stb_vorbis_decl.h"
-
-#include <opusfile.h>
+#include "src/system/library/oggtags.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -143,35 +141,11 @@ static void flac_comments(void *user, drflac_metadata *meta) {
 	}
 }
 
-static bool read_opus(const char *path, collect_t *c) {
-	int err = 0;
-	OggOpusFile *of = op_open_file(path, &err);
-	if (!of) {
-		return false;
-	}
-	const OpusTags *tags = op_tags(of, -1);
-	if (tags) {
-		for (int i = 0; i < tags->comments; i++) {
-			if (tags->user_comments[i] && tags->comment_lengths[i] > 0) {
-				take_comment(c, tags->user_comments[i], (size_t)tags->comment_lengths[i]);
-			}
-		}
-	}
-	op_free(of);
-	return true;
-}
+// Long comments are pictures, never chapters: skipped unread.
+#define CHAPTER_TEXT_MAX (64 * 1024)
 
-static bool read_vorbis(const char *path, collect_t *c) {
-	int error = 0;
-	stb_vorbis *vorbis = stb_vorbis_open_filename(path, &error, NULL);
-	if (!vorbis) {
-		return false;
-	}
-	stb_vorbis_comment comment = stb_vorbis_get_comment(vorbis);
-	for (int i = 0; i < comment.comment_list_length; i++) {
-		take_comment(c, comment.comment_list[i], strlen(comment.comment_list[i]));
-	}
-	stb_vorbis_close(vorbis);
+static bool ogg_comment(void *user, const char *comment, size_t len) {
+	take_comment((collect_t *)user, comment, len);
 	return true;
 }
 
@@ -189,13 +163,8 @@ int vorbischap_read(const char *path, vorbischap_t *out, int max) {
 		return 0;
 	}
 	collect_t c = {0};
-	if (has_extension(path, ".opus")) {
-		read_opus(path, &c);
-	} else if (has_extension(path, ".ogg") || has_extension(path, ".oga")) {
-		// An .ogg holds Vorbis, or sometimes Opus.
-		if (!read_vorbis(path, &c)) {
-			read_opus(path, &c);
-		}
+	if (has_extension(path, ".opus") || has_extension(path, ".ogg") || has_extension(path, ".oga")) {
+		oggtags_walk(path, CHAPTER_TEXT_MAX, ogg_comment, NULL, &c);
 	} else if (has_extension(path, ".flac")) {
 		drflac *flac = drflac_open_file_with_metadata(path, flac_comments, &c, NULL);
 		if (flac) {

@@ -123,8 +123,8 @@ static bool folder_of(const char *feed_title, char *out, size_t size) {
 	}
 	char name[DL_NAME_MAX + 1];
 	podcastdl_safe_name(feed_title, "Podcast", name, sizeof(name));
-	snprintf(out, size, "%s/%s", base, name);
-	return true;
+	int n = snprintf(out, size, "%s/%s", base, name);
+	return n > 0 && (size_t)n < size;
 }
 
 bool podcastdl_path(const podcast_episode_t *episode, const char *feed_title, char *out, size_t size) {
@@ -345,7 +345,12 @@ bool podcastdl_start(const podcast_episode_t *episode, const char *feed_title, c
 		return false;
 	}
 	const char *slash = strrchr(job->path, '/');
-	snprintf(job->part, sizeof(job->part), "%s/.%s.part", job->folder, slash ? slash + 1 : job->path);
+	int n = snprintf(job->part, sizeof(job->part), "%s/.%s.part", job->folder, slash ? slash + 1 : job->path);
+	if (n < 0 || (size_t)n >= sizeof(job->part)) {
+		fprintf(stderr, "podcastdl: path too long for %s\n", job->path);
+		free(job);
+		return false;
+	}
 	snprintf(job->image, sizeof(job->image), "%s", feed_image && feed_image[0] ? feed_image : episode->image);
 
 	pthread_mutex_lock(&lock);
