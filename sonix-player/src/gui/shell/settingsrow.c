@@ -427,6 +427,49 @@ lv_obj_t *settingsrow_slider(lv_obj_t *parent, const char *name, int steps, lv_o
 // the space between the two.
 #define TOGGLE_RESERVED (68 + 16)
 
+// How far beyond its 68 x 36 a switch still takes a tap: a fingertip on this
+// panel is wider than the switch is tall.
+#define SWITCH_TOUCH_MARGIN 24
+
+// A tap, and only a tap, flips the switch. LVGL flips a checkable widget on
+// RELEASED, which also arrives at the end of a drag that started on it and that
+// no scroll claimed: a swipe-back, or a scroll that latched late. CLICKED is
+// the event a drag never produces: LVGL drops it once a scroll has started,
+// and the tap guard in main.c drops it once the finger has moved.
+static void switch_tap_cb(lv_event_t *e) {
+	lv_obj_t *sw = lv_event_get_user_data(e);
+	if (!sw || lv_obj_has_state(sw, LV_STATE_DISABLED)) {
+		return;
+	}
+	if (player_sheet_drag_active() || switcher_back_drag_active()) {
+		return;
+	}
+	if (lv_obj_has_state(sw, LV_STATE_CHECKED)) {
+		lv_obj_remove_state(sw, LV_STATE_CHECKED);
+	} else {
+		lv_obj_add_state(sw, LV_STATE_CHECKED);
+	}
+	lv_obj_send_event(sw, LV_EVENT_VALUE_CHANGED, NULL);
+}
+
+lv_obj_t *settingsrow_switch(lv_obj_t *parent, lv_event_cb_t cb) {
+	lv_obj_t *sw = lv_switch_create(parent);
+	lv_obj_set_size(sw, 68, 36);
+	// Not checkable: the state changes in switch_tap_cb instead of on RELEASED.
+	lv_obj_set_checkable(sw, false);
+	lv_obj_set_ext_click_area(sw, SWITCH_TOUCH_MARGIN);
+	// Shared theme styles rather than colours frozen at creation: a hand-set
+	// colour would keep the palette the row was built under, leaving off-toggles
+	// white after a switch to the dark theme.
+	lv_obj_add_style(sw, &theme_style_switch, LV_PART_MAIN);
+	lv_obj_add_style(sw, &theme_style_switch_checked, LV_PART_INDICATOR | LV_STATE_CHECKED);
+	lv_obj_add_event_cb(sw, switch_tap_cb, LV_EVENT_CLICKED, sw);
+	if (cb) {
+		lv_obj_add_event_cb(sw, cb, LV_EVENT_VALUE_CHANGED, NULL);
+	}
+	return sw;
+}
+
 lv_obj_t *settingsrow_toggle(lv_obj_t *parent, const char *name, lv_obj_t **switch_out, lv_event_cb_t cb) {
 	lv_obj_t *card = make_card(parent, name, NULL, ROW_HEIGHT);
 
@@ -444,15 +487,8 @@ lv_obj_t *settingsrow_toggle(lv_obj_t *parent, const char *name, lv_obj_t **swit
 	lv_obj_set_style_max_width(label, lv_pct(100), 0);
 	lv_obj_set_style_pad_right(label, TOGGLE_RESERVED, 0);
 
-	lv_obj_t *toggle = lv_switch_create(card);
-	lv_obj_set_size(toggle, 68, 36);
+	lv_obj_t *toggle = settingsrow_switch(card, cb);
 	lv_obj_align(toggle, LV_ALIGN_RIGHT_MID, 0, 0);
-	// Shared theme styles rather than colours frozen at creation: a hand-set
-	// colour would keep the palette the row was built under, leaving off-toggles
-	// white after a switch to the dark theme.
-	lv_obj_add_style(toggle, &theme_style_switch, LV_PART_MAIN);
-	lv_obj_add_style(toggle, &theme_style_switch_checked, LV_PART_INDICATOR | LV_STATE_CHECKED);
-	lv_obj_add_event_cb(toggle, cb, LV_EVENT_VALUE_CHANGED, NULL);
 
 	if (switch_out) {
 		*switch_out = toggle;
@@ -510,12 +546,8 @@ lv_obj_t *settingsrow_toggle_slider(lv_obj_t *parent, const char *name, int step
 	lv_obj_t *name_label = lv_obj_get_child(card, 0);
 	lv_obj_align(name_label, LV_ALIGN_TOP_LEFT, 0, 0);
 
-	lv_obj_t *toggle = lv_switch_create(card);
-	lv_obj_set_size(toggle, 68, 36);
+	lv_obj_t *toggle = settingsrow_switch(card, toggle_cb);
 	lv_obj_align(toggle, LV_ALIGN_TOP_RIGHT, 0, -4);
-	lv_obj_add_style(toggle, &theme_style_switch, LV_PART_MAIN);
-	lv_obj_add_style(toggle, &theme_style_switch_checked, LV_PART_INDICATOR | LV_STATE_CHECKED);
-	lv_obj_add_event_cb(toggle, toggle_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
 	lv_obj_t *value = lv_label_create(card);
 	lv_obj_add_style(value, &theme_style_text_dim, 0);
@@ -785,11 +817,7 @@ lv_obj_t *settingsrow_toggle_pills(lv_obj_t *parent, const char *title, lv_event
 	lv_label_set_long_mode(name, LV_LABEL_LONG_WRAP);
 	lv_obj_set_flex_grow(name, 1);
 
-	lv_obj_t *toggle = lv_switch_create(head);
-	lv_obj_set_size(toggle, 68, 36);
-	lv_obj_add_style(toggle, &theme_style_switch, LV_PART_MAIN);
-	lv_obj_add_style(toggle, &theme_style_switch_checked, LV_PART_INDICATOR | LV_STATE_CHECKED);
-	lv_obj_add_event_cb(toggle, toggle_cb, LV_EVENT_VALUE_CHANGED, NULL);
+	lv_obj_t *toggle = settingsrow_switch(head, toggle_cb);
 
 	lv_obj_t *pills = lv_obj_create(card);
 	lv_obj_set_size(pills, lv_pct(100), LV_SIZE_CONTENT);

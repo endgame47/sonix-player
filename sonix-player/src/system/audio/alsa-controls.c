@@ -9,6 +9,7 @@
 #include "src/system/device/sysinfo.h"
 
 #include <alsa/asoundlib.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -295,11 +296,54 @@ void alsa_list_controls(char *out, size_t out_size) {
 	snd_ctl_close(ctl);
 }
 
+// ---------------------------------------------------------------------------
+// The route re-init after mem (see alsa-controls.h)
+//
+// Its route write powers the HBC3000 and reloads it, a few hundred
+// milliseconds inside the driver, and until it is done the card must not be
+// opened. The gate is closed from the parking of the route before mem to the
+// end of that write.
+// ---------------------------------------------------------------------------
+static pthread_mutex_t reinit_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t reinit_cond = PTHREAD_COND_INITIALIZER;
+static bool reinit_running;
+static __thread bool reinit_thread; // true on the re-init thread itself
+
+void alsa_output_reinit_begin(void) {
+	pthread_mutex_lock(&reinit_lock);
+	reinit_running = true;
+	pthread_mutex_unlock(&reinit_lock);
+}
+
+void alsa_output_reinit_enter_thread(void) { reinit_thread = true; }
+
+void alsa_output_reinit_leave_thread(void) { reinit_thread = false; }
+
+void alsa_output_reinit_end(void) {
+	pthread_mutex_lock(&reinit_lock);
+	reinit_running = false;
+	pthread_cond_broadcast(&reinit_cond);
+	pthread_mutex_unlock(&reinit_lock);
+}
+
+void alsa_wait_output_reinit(void) {
+	if (reinit_thread) {
+		return;
+	}
+	pthread_mutex_lock(&reinit_lock);
+	while (reinit_running) {
+		pthread_cond_wait(&reinit_cond, &reinit_lock);
+	}
+	pthread_mutex_unlock(&reinit_lock);
+}
+
 int alsa_set_control(const char *name, long value) {
 	snd_ctl_t *ctl;
 	snd_ctl_elem_id_t *id;
 	snd_ctl_elem_value_t *elem;
 	int err;
+
+	alsa_wait_output_reinit();
 
 	err = snd_ctl_open(&ctl, "hw:0", 0);
 	if (err < 0) {
@@ -603,11 +647,10 @@ int get_dac_dop(void) { return current_dop < 0 ? 0 : current_dop; }
 // driver's two PM callbacks are empty returns. Volume, digital filter, DRE and
 // NOS all survive, so there is nothing to write again.
 //
-// What does go down is the HBC3000 audio bridge, whose suspend callback
-// disables it and whose resume is a no-op on this platform. That is handled
-// elsewhere: audio_force_output_reinit_after_resume() forces a real route
-// transition on the way out of "mem", which makes the machine driver run
-// hbc3000_enable() again.
+// What does go down is the HBC3000 audio bridge. Its suspend callback powers
+// it off and the card's suspend_pre resets the driver's route to 0, so the
+// first route write after "mem" is a real change and runs hbc3000_enable()
+// again: audio_start_output_reinit_after_resume() makes that write.
 //
 // Calling this would mean i2c traffic to the codec on a bit-banged bus whose
 // pins nothing reprograms at resume, for no gain.
@@ -681,6 +724,8 @@ static int write_output_route(int route) {
 // seconds and ending it in "write error: Input/output error". The
 // current_output cache is what keeps the route from being touched mid-track.
 void auto_set_output(void) {
+	alsa_wait_output_reinit();
+
 	// The CS43131 board: one route, no line-out flag, no transition to force.
 	if (alsa_board_is_cs43131()) {
 		int route = detect_output();
@@ -734,10 +779,27 @@ void auto_set_output(void) {
 }
 
 // Realigns the route cache after something else wrote "Output Port Switch"
-// directly (the re-init test after mem does, to force a real route change in
-// the kernel), so the next auto_set_output() sees the right route already
-// cached and does not rewrite it for nothing.
+// directly (the route parked before mem), so the cache never claims a route
+// the driver does not hold.
 void alsa_controls_note_output(int value) { current_output = value; }
+
+void alsa_controls_rewrite_output(void) {
+	alsa_wait_output_reinit();
+
+	int output = detect_output();
+	int flag = (lineout_on && output == 3) ? 1 : 0;
+
+	// The flag first: the driver reads it while applying route 3.
+	current_balance_lineout = -1;
+	if (alsa_set_control("Balance Lineout En", flag) >= 0) {
+		current_balance_lineout = flag;
+	}
+	current_output = -1;
+	if (alsa_set_control("Output Port Switch", output) >= 0) {
+		current_output = output;
+	}
+	printf("set output to %d after suspend (balanced line out %d)\n", output, flag);
+}
 
 // Raw CS43198 attenuation, 0-255, applied to both channels.
 void set_volume(long volume) {

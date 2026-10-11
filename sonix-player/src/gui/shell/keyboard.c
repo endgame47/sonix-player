@@ -268,9 +268,16 @@ static void kb_apply_layout(keyboard_t *kb) {
 		lv_obj_set_hidden(kb->letter_btn[i], true);
 	}
 
-	// Shift and delete bracket the bottom row, whatever the re-parenting above
-	// left them behind.
+	// The order inside each row, set key by key. lv_obj_set_parent() leaves a
+	// key that is already in the row it is given where it is, and the keys that
+	// move in go after it: from an alphabet with longer rows (Russian) back to a
+	// shorter one, the letters come out shuffled. Shift opens the bottom row and
+	// delete closes it.
 	lv_obj_move_to_index(kb->shift_btn, 0);
+	for (int i = 0; i < index; i++) {
+		int first = kb->key_row[i] == 2 ? 1 : 0; // after shift
+		lv_obj_move_to_index(kb->letter_btn[i], first + kb->key_col[i]);
+	}
 	lv_obj_move_to_index(kb->delete_btn, (int32_t)lv_obj_get_child_count(kb->rows[2]) - 1);
 
 	kb_refresh_caps(kb);
@@ -415,15 +422,18 @@ static void kb_refresh_caps(keyboard_t *kb) {
 static void kb_shift_press(keyboard_t *kb); // defined with the shift key, below
 
 // Commits the pending character: the multitap state resets and shift (one-shot
-// as on QWERTY, unless caps lock is on) is consumed. The character is already
-// in the field; committing only means it stops being replaced.
+// as on QWERTY, unless caps lock is on) is consumed by it. The character is
+// already in the field; committing only means it stops being replaced. With no
+// character pending there is nothing for shift to have applied to, and it
+// stays armed for the next one.
 static void kb_t9_commit(keyboard_t *kb) {
+	bool pending = kb->t9_last_key >= 0;
 	kb->t9_last_key = -1;
 	kb->t9_tap = 0;
 	if (kb->t9_timer) {
 		lv_timer_pause(kb->t9_timer);
 	}
-	if (kb->shift && !kb->caps) {
+	if (pending && kb->shift && !kb->caps) {
 		kb->shift = false;
 		kb_refresh_caps(kb);
 	}
@@ -517,6 +527,9 @@ static void kb_t9_shift_cb(lv_event_t *e) {
 		kb_refresh_caps(kb);
 		return;
 	}
+	// The character still cycling is done: shift is for the next one. Without
+	// this the next key's commit would spend the new shift on the old letter.
+	kb_t9_commit(kb);
 	kb_shift_press(kb);
 }
 

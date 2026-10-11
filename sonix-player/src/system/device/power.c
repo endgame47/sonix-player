@@ -324,13 +324,24 @@ static bool g_screen_view_hold; // see power_hold_screen_for_view
 // powered on from the charger alone.
 //
 // The two nodes under /sys/class/power_supply/usb/ the stock player writes are
-// not used at all: that supply is the AXP2101 PMIC, not the charger, and
-// writing them does nothing to charging.
+// not used at all: on the R3 Pro II that supply is the AXP2101 PMIC, not the
+// charger, and writing them does nothing to charging.
 #define STEP_CHARGING_NODE "/sys/class/power_supply/mp2731-charger/step_charging_enabled"
+
+// The open mp2731.ko keeps the limit itself: given the percentage once, it
+// reads the fuel gauge, stops the charge at the limit and restarts it 3 %
+// below the level the gauge settles at once charging stops, and keeps the
+// system out of suspend while the cable is in, so the limit holds whatever
+// user space is doing. Where these files are, the tick below leaves the
+// percentage to the driver and only forbids charging outright (DAC mode); the
+// stock driver has neither, and the tick does it all.
+#define DRIVER_LIMIT_NODE "/sys/class/power_supply/mp2731-charger/charge_limit_percent"
+#define DRIVER_HELD_NODE "/sys/class/power_supply/mp2731-charger/charge_limit_held"
 
 static const char *g_charge_node;	 // the writable node, NULL if there is none
 static int g_charge_limit = 100;	 // 100 = charge to full
 static bool g_charging_suspended;
+static bool g_driver_limit;			 // the driver keeps the limit (DRIVER_LIMIT_NODE)
 
 // Set while something has deliberately forbidden charging regardless of the
 // battery level -- DAC mode with the charger switched off. Kept separate from
@@ -352,8 +363,16 @@ static void find_charge_node(void) {
 	}
 
 	g_charge_node = STEP_CHARGING_NODE;
-	printf("power: charge limit will use %s\n", g_charge_node);
+	g_driver_limit = access(DRIVER_LIMIT_NODE, W_OK) == 0;
+	if (g_driver_limit) {
+		printf("power: charge limit kept by the driver through %s\n", DRIVER_LIMIT_NODE);
+	} else {
+		printf("power: charge limit will use %s\n", g_charge_node);
+	}
 }
+
+// Whether the driver is holding the charge at the limit right now.
+static bool driver_limit_held(void) { return read_long_from_file(DRIVER_HELD_NODE) == 1; }
 
 bool power_charge_limit_supported(void) {
 	find_charge_node();
@@ -362,7 +381,12 @@ bool power_charge_limit_supported(void) {
 
 int power_get_charge_limit(void) { return g_charge_limit; }
 
-bool power_charging_held(void) { return g_charging_suspended || axpcharge_holding(); }
+bool power_charging_held(void) {
+	if (g_driver_limit) {
+		return driver_limit_held() || axpcharge_holding();
+	}
+	return g_charging_suspended || axpcharge_holding();
+}
 
 static void charger_run(bool run);
 
@@ -383,6 +407,13 @@ void power_set_charge_limit(int percent) {
 		percent = 100;
 	}
 	g_charge_limit = percent;
+
+	find_charge_node();
+	static int written = -1;
+	if (g_driver_limit && percent != written) {
+		write_long_to_file(DRIVER_LIMIT_NODE, percent);
+		written = percent;
+	}
 }
 
 static void charger_run(bool run) {
@@ -403,7 +434,11 @@ static void apply_charge_limit(void) {
 	}
 
 	bool allow;
-	if (!usb_vbus_present()) {
+	if (g_driver_limit) {
+		// The percentage is the driver's: what is left here is the user's own
+		// choice to stop charging, and the cable going out undoes even that.
+		allow = !usb_vbus_present() || !g_charging_blocked;
+	} else if (!usb_vbus_present()) {
 		// No cable, nothing to hold off -- and this is the case that must not
 		// be got wrong. The bit survives the charger being unplugged, so a
 		// player that left it off would meet the next cable with a charger that
@@ -436,7 +471,7 @@ static void apply_charge_limit(void) {
 
 	charger_run(allow);
 	g_charging_suspended = !allow;
-	printf("power: charging %s\n", allow ? "on" : "held off at the limit");
+	printf("power: charging %s\n", allow ? "on" : g_driver_limit ? "off" : "held off at the limit");
 }
 
 // Forbids or allows charging outright, on top of whatever the percentage limit
@@ -1038,7 +1073,7 @@ static void suspend_to_ram(void) {
 		headset_suspend_finish();
 		headset_keys_wake();
 		// The route was parked and the DAC muted for a sleep that never began.
-		audio_force_output_reinit_after_resume();
+		audio_start_output_reinit_after_resume();
 		return;
 	}
 	fputs("mem", f);
@@ -1060,11 +1095,10 @@ static void suspend_to_ram(void) {
 	// starts again, like any other countdown, and the instant-wake counter below
 	// is what guards against a device that wakes itself in a loop.
 
-	// Before the first play opens a PCM: force the output route to re-init. The
-	// suspend powers the HBC3000 down and its kernel resume is a no-op, but the
-	// software route survives, so auto_set_output() would see "X == X" and skip
-	// hbc3000_enable(). A real X->Y->X on the mixer forces the chip's power-on
-	// again, without which the first play after a standby reboots the device.
+	// The route written again before the first play opens a PCM: on the R3 Pro
+	// II that powers the HBC3000 back up, without which the first play after a
+	// standby reboots the device. It runs in the background while the screen
+	// comes back; whatever reaches the card meanwhile waits for it.
 	//
 	// And this is the whole of what a resume owes the audio path. Volume, gain,
 	// digital filter, DRE and NOS are not rewritten because they are not lost:
@@ -1074,9 +1108,8 @@ static void suspend_to_ram(void) {
 	// on alsa_controls_reapply() in alsa-controls.c.
 	//
 	// After a refused suspend too: the route was parked and the DAC muted all
-	// the same, and left that way the next play goes to the parked socket in
-	// silence.
-	audio_force_output_reinit_after_resume();
+	// the same, and the card stays closed until the re-init has run.
+	audio_start_output_reinit_after_resume();
 	if (rc == 0) {
 
 		// And the same courtesy to the radio. The daemons came through the
@@ -1205,7 +1238,9 @@ static void suspend_if_idle(uint32_t now, bool playing) {
 	// nothing runs while the SoC is suspended -- a player asleep on the charger
 	// charges straight past the limit, and the release point three percent below
 	// it is never seen either. Reaching the limit does not lift this: the level
-	// falls again on its own, and only something still awake notices.
+	// falls again on its own, and only something still awake notices. (With the
+	// open mp2731.ko the driver keeps the limit, and the system awake for it, on
+	// its own.)
 	//
 	// With no limit set there is nothing to enforce, but the answer is the same,
 	// because a cable is the one case where sleeping saves nothing that matters.

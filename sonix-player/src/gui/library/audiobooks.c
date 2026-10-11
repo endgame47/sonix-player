@@ -1153,11 +1153,7 @@ static void build_toggle_pills(lv_obj_t *parent, const char *title, lv_event_cb_
 	lv_obj_add_style(name, &theme_style_text, 0);
 	lv_obj_set_style_text_font(name, &font_ui_24, 0);
 
-	lv_obj_t *toggle = lv_switch_create(head);
-	lv_obj_set_size(toggle, 68, 36);
-	lv_obj_add_style(toggle, &theme_style_switch, LV_PART_MAIN);
-	lv_obj_add_style(toggle, &theme_style_switch_checked, LV_PART_INDICATOR | LV_STATE_CHECKED);
-	lv_obj_add_event_cb(toggle, toggle_cb, LV_EVENT_VALUE_CHANGED, NULL);
+	lv_obj_t *toggle = settingsrow_switch(head, toggle_cb);
 
 	lv_obj_t *pills = lv_obj_create(card);
 	lv_obj_set_size(pills, lv_pct(100), LV_SIZE_CONTENT);

@@ -72,6 +72,13 @@ static void set_checked(lv_obj_t *sw, bool on) {
 
 void powersettings_apply(void) {
 	if (axpcharge_applies()) {
+		// The R1 has no percentage slider: a percentage limit saved on it
+		// becomes the 80 % switch.
+		if (config_get_int("power", "charge_limit", 100) < 100) {
+			config_set_int("power", "charge_limit", 100);
+			config_set_bool("power", "charge_limit_80", true);
+			config_save();
+		}
 		power_set_charge_limit(100);
 		axpcharge_set(config_get_bool("power", "charge_limit_80", false),
 					  config_get_bool("power", "charge_500ma", false));

@@ -65,6 +65,12 @@ lv_obj_t *settingsrow_slider(lv_obj_t *parent, const char *name, int steps, lv_o
 // The same card with a switch on the right instead of a value.
 lv_obj_t *settingsrow_toggle(lv_obj_t *parent, const char *name, lv_obj_t **switch_out, lv_event_cb_t cb);
 
+// A switch as every page draws it: 68 x 36 in the theme colours, with a touch
+// area larger than the switch. It changes on a tap, never at the end of a drag
+// or a scroll that started on it. cb, if given, gets LV_EVENT_VALUE_CHANGED
+// with the new state already set, as with a plain lv_switch.
+lv_obj_t *settingsrow_switch(lv_obj_t *parent, lv_event_cb_t cb);
+
 // Both on one card: the name and its switch on the top line, a stepped slider
 // (marks and all) with its value underneath. For an option whose "how long"
 // only means anything while it is on.

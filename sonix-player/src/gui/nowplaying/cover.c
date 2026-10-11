@@ -886,34 +886,20 @@ uint32_t cover_dominant_tone(const cover_image_t *cover) {
 	return (r << 16) | (g << 8) | b;
 }
 
-bool cover_blur_copy(const cover_image_t *src, cover_image_t *out) {
-	if (!src) {
-		if (out) {
-			memset(out, 0, sizeof(*out));
-		}
-		return false;
-	}
-	return cover_blur_fill(src, (int)src->dsc.header.w, (int)src->dsc.header.h, out);
-}
-
-bool cover_blur_fill(const cover_image_t *src, int out_w, int out_h, cover_image_t *out) {
-	if (!out) {
-		return false;
-	}
+// A packed cover opened back out to RGB888, the form the resampler and the
+// blur work in. The top bits are replicated into the low ones, so white comes
+// back as 255.
+static bool raw_from_cover(const cover_image_t *src, raw_image_t *out) {
 	memset(out, 0, sizeof(*out));
 	if (!src || !src->pixels) {
 		return false;
 	}
-
 	int w = (int)src->dsc.header.w;
 	int h = (int)src->dsc.header.h;
 	int stride = (int)src->dsc.header.stride / 2;
 	if (w < 2 || h < 2 || stride < w) {
 		return false;
 	}
-
-	// Back out to RGB888: the blur and the resampler both work there, and five
-	// and six bit channels have nowhere to put the intermediate values.
 	uint8_t *rgb = malloc((size_t)w * h * 3);
 	if (!rgb) {
 		return false;
@@ -929,6 +915,37 @@ bool cover_blur_fill(const cover_image_t *src, int out_w, int out_h, cover_image
 			drow[x * 3 + 2] = (uint8_t)((b5 << 3) | (b5 >> 2));
 		}
 	}
+	out->pixels = rgb;
+	out->w = w;
+	out->h = h;
+	return true;
+}
+
+bool cover_blur_copy(const cover_image_t *src, cover_image_t *out) {
+	if (!src) {
+		if (out) {
+			memset(out, 0, sizeof(*out));
+		}
+		return false;
+	}
+	return cover_blur_fill(src, (int)src->dsc.header.w, (int)src->dsc.header.h, out);
+}
+
+bool cover_blur_fill(const cover_image_t *src, int out_w, int out_h, cover_image_t *out) {
+	if (!out) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+
+	// Back out to RGB888: the blur and the resampler both work there, and five
+	// and six bit channels have nowhere to put the intermediate values.
+	raw_image_t opened;
+	if (!raw_from_cover(src, &opened)) {
+		return false;
+	}
+	uint8_t *rgb = opened.pixels;
+	int w = opened.w;
+	int h = opened.h;
 
 	if (out_w < 2 || out_h < 2) {
 		free(rgb);
@@ -1099,8 +1116,9 @@ typedef enum {
 	COVER_BUILD_FAILED, // a picture was found, none of them would decode
 } cover_build_t;
 
-static cover_build_t build_from_sources(const char *path, bool is_dir, const image_request_t *reqs, int n,
-										cover_image_t *outs) {
+// `used`, when given, is set to the candidate index the images came from.
+static cover_build_t build_from_sources_at(const char *path, bool is_dir, const image_request_t *reqs, int n,
+										   cover_image_t *outs, int *used) {
 	bool had_bytes = false;
 
 	// Noted for the crash handler and cleared on the way out, so a log that
@@ -1129,6 +1147,9 @@ static cover_build_t build_from_sources(const char *path, bool is_dir, const ima
 		albumart_free(&art);
 		if (ok) {
 			crumb_set_artwork(NULL);
+			if (used) {
+				*used = i;
+			}
 			return COVER_BUILD_OK;
 		}
 
@@ -1142,6 +1163,11 @@ static cover_build_t build_from_sources(const char *path, bool is_dir, const ima
 
 	crumb_set_artwork(NULL);
 	return had_bytes ? COVER_BUILD_FAILED : COVER_BUILD_NONE;
+}
+
+static cover_build_t build_from_sources(const char *path, bool is_dir, const image_request_t *reqs, int n,
+										cover_image_t *outs) {
+	return build_from_sources_at(path, is_dir, reqs, n, outs, NULL);
 }
 
 // ---------------------------------------------------------------------------
@@ -1297,7 +1323,9 @@ static uint64_t bytes_id(const uint8_t *data, size_t size) {
 	return h ? h : 1;
 }
 
-uint64_t cover_source_id(const char *filepath) {
+// `index` is set to the candidate the bytes came from (see cover_source_id()).
+static uint64_t source_id_uncached(const char *filepath, int *index) {
+	*index = -1;
 	if (!filepath || !filepath[0]) {
 		return 0;
 	}
@@ -1316,10 +1344,29 @@ uint64_t cover_source_id(const char *filepath) {
 		}
 		albumart_free(&art);
 		if (id) {
+			*index = i;
 			return id;
 		}
 	}
 	return 0;
+}
+
+// The player's cover cache, further down with the other tables.
+static uint64_t player_source_id(const char *filepath, int *index);
+static bool player_cover_load(uint64_t id, int w, int h, cover_image_t *out);
+static void player_cover_store(uint64_t id, int w, int h, const cover_image_t *img);
+
+// The backdrop made from a cover already scaled and packed, for a cover that
+// came out of the cache with no source decoded.
+static bool backdrop_from_cover(const cover_image_t *cover, int box_w, int box_h, cover_image_t *out) {
+	raw_image_t raw;
+	if (!raw_from_cover(cover, &raw)) {
+		memset(out, 0, sizeof(*out));
+		return false;
+	}
+	bool ok = make_backdrop(&raw, box_w, box_h, false, out);
+	raw_free(&raw);
+	return ok;
 }
 
 bool cover_load_player_images(const char *filepath, int cover_w, int cover_h, cover_image_t *cover_out,
@@ -1328,6 +1375,16 @@ bool cover_load_player_images(const char *filepath, int cover_w, int cover_h, co
 		memset(cover_out, 0, sizeof(*cover_out));
 	if (backdrop_out)
 		memset(backdrop_out, 0, sizeof(*backdrop_out));
+
+	// The cover from the cache, the backdrop made from it: no source decoded.
+	int source_index = -1;
+	uint64_t id = cover_out ? player_source_id(filepath, &source_index) : 0;
+	if (id && player_cover_load(id, cover_w, cover_h, cover_out)) {
+		if (backdrop_out) {
+			backdrop_from_cover(cover_out, backdrop_w, backdrop_h, backdrop_out);
+		}
+		return true;
+	}
 
 	// One decode feeds both images: the expensive part is the JPEG, not the
 	// scaling, so a track change decodes once rather than twice.
@@ -1345,7 +1402,8 @@ bool cover_load_player_images(const char *filepath, int cover_w, int cover_h, co
 		reqs[n++] = (image_request_t){.w = backdrop_w, .h = backdrop_h, .fit = COVER_FIT_COVER, .backdrop = true};
 	}
 
-	cover_build_t built = build_from_sources(filepath, false, reqs, n, results);
+	int used = -1;
+	cover_build_t built = build_from_sources_at(filepath, false, reqs, n, results, &used);
 	if (built == COVER_BUILD_NONE) {
 		// A podcast episode with no cover file beside it: fetch it now, on the
 		// loader thread, which can afford to wait on a network request, then
@@ -1354,9 +1412,16 @@ bool cover_load_player_images(const char *filepath, int cover_w, int cover_h, co
 		if (!podcastcache_ensure_cover(filepath)) {
 			return false;
 		}
-		built = build_from_sources(filepath, false, reqs, n, results);
+		built = build_from_sources_at(filepath, false, reqs, n, results, &used);
 	}
 	bool ok = (built == COVER_BUILD_OK);
+
+	// Kept only when the picture came from the source the id was taken from:
+	// a cover that fell back to another one would be stored under a key that
+	// does not describe it.
+	if (ok && id && cover_index >= 0 && used == source_index) {
+		player_cover_store(id, cover_w, cover_h, &results[cover_index]);
+	}
 
 	// A missing backdrop is survivable; the controls just stay plain.
 	if (cover_index >= 0)
@@ -1393,8 +1458,8 @@ void cover_free(cover_image_t *img) {
 // meaning nothing was found there.
 // ---------------------------------------------------------------------------
 
-// Only thumbnails are worth keeping on disk. The player's full-size cover is
-// decoded once per track change, which is not worth a megabyte of cache.
+// The largest thumbnail kept in the thumbs table; the player's own cover has a
+// table of its own (see the player's cover below).
 //
 // The album carousel sets the ceiling: it decodes at 210, and a carousel that
 // re-decoded every cover on every visit would be the one page that never got
@@ -1475,7 +1540,20 @@ static bool thumb_db_prepare_schema(sqlite3 *db) {
 					 " title TEXT,"
 					 " w INTEGER NOT NULL,"
 					 " h INTEGER NOT NULL,"
-					 " pixels BLOB)",
+					 " pixels BLOB);"
+					 // The player's cover, one row per picture and size, and
+					 // the picture of each track that carries its own (see
+					 // the player's cover below).
+					 "CREATE TABLE IF NOT EXISTS player_covers("
+					 " key TEXT PRIMARY KEY,"
+					 " w INTEGER NOT NULL,"
+					 " h INTEGER NOT NULL,"
+					 " used INTEGER NOT NULL,"
+					 " pixels BLOB NOT NULL);"
+					 "CREATE INDEX IF NOT EXISTS player_covers_used ON player_covers(used);"
+					 "CREATE TABLE IF NOT EXISTS player_cover_ids("
+					 " key TEXT PRIMARY KEY,"
+					 " id TEXT NOT NULL)",
 					 NULL, NULL, &err) == SQLITE_OK) {
 		return true;
 	}
@@ -1870,6 +1948,198 @@ void cover_book_store(const char *path, int box_w, int box_h, const cover_image_
 		}
 		sqlite3_step(stmt); // a failure here only costs opening the book again
 		sqlite3_finalize(stmt);
+	}
+	pthread_mutex_unlock(&thumb_db_lock);
+}
+
+// ---------------------------------------------------------------------------
+// the player's cover
+//
+// The finished cover is kept in player_covers under cover_source_id() and its
+// size. The id is a hash of the picture's bytes, so the tracks of a record
+// that carry the same picture share one row, and tracks that carry different
+// pictures get one row each. player_cover_ids keeps the id of each track whose
+// picture is embedded, keyed by the file's path, size and mtime, so a track
+// already seen is matched without reading its picture. A picture from a cover
+// file beside the track is hashed every time: replacing that file does not
+// change the track.
+//
+// The backdrop is not kept; it is made from the cover (backdrop_from_cover()).
+// ---------------------------------------------------------------------------
+
+// At 480x480 a row is 450 KB: the most recently shown covers are kept, the
+// rest deleted.
+#define PLAYER_COVER_MAX_ROWS 200
+#define PLAYER_ID_MAX_ROWS 20000
+#define PLAYER_ID_PRUNE_EVERY 256
+// Part of every cover key: raising it makes every stored cover a miss.
+#define PLAYER_COVER_EPOCH 1
+
+static uint64_t fnv1a(const char *text) {
+	uint64_t h = 1469598103934665603ULL;
+	for (const char *p = text; *p; p++) {
+		h ^= (uint8_t)*p;
+		h *= 1099511628211ULL;
+	}
+	return h;
+}
+
+static bool player_id_key(const char *path, char *out, size_t out_size) {
+	struct stat st;
+	if (!path || !path[0] || stat(path, &st) != 0) {
+		return false;
+	}
+	char material[700];
+	snprintf(material, sizeof(material), "pid|%s|%lld|%lld", path, (long long)st.st_mtime, (long long)st.st_size);
+	snprintf(out, out_size, "%016llx", (unsigned long long)fnv1a(material));
+	return true;
+}
+
+static bool player_id_lookup(const char *key, uint64_t *id) {
+	bool hit = false;
+	pthread_mutex_lock(&thumb_db_lock);
+	sqlite3_stmt *stmt = NULL;
+	if (thumb_db &&
+		sqlite3_prepare_v2(thumb_db, "SELECT id FROM player_cover_ids WHERE key = ?1", -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(stmt, 1, key, -1, SQLITE_STATIC);
+		if (sqlite3_step(stmt) == SQLITE_ROW) {
+			const char *text = (const char *)sqlite3_column_text(stmt, 0);
+			char *end = NULL;
+			unsigned long long value = text ? strtoull(text, &end, 16) : 0;
+			if (value && end && *end == '\0') {
+				*id = (uint64_t)value;
+				hit = true;
+			}
+		}
+		sqlite3_finalize(stmt);
+	}
+	pthread_mutex_unlock(&thumb_db_lock);
+	return hit;
+}
+
+// Every PLAYER_ID_PRUNE_EVERY stores the table is cut back to its newest
+// PLAYER_ID_MAX_ROWS rows. Called with the lock held.
+static void player_id_prune(void) {
+	static unsigned stores;
+	if (++stores % PLAYER_ID_PRUNE_EVERY) {
+		return;
+	}
+	sqlite3_stmt *stmt = NULL;
+	if (sqlite3_prepare_v2(thumb_db,
+						   "DELETE FROM player_cover_ids WHERE rowid IN"
+						   " (SELECT rowid FROM player_cover_ids ORDER BY rowid DESC LIMIT -1 OFFSET ?1)",
+						   -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_int(stmt, 1, PLAYER_ID_MAX_ROWS);
+		sqlite3_step(stmt);
+		sqlite3_finalize(stmt);
+	}
+}
+
+static void player_id_store(const char *key, uint64_t id) {
+	char text[24];
+	snprintf(text, sizeof(text), "%016llx", (unsigned long long)id);
+	pthread_mutex_lock(&thumb_db_lock);
+	sqlite3_stmt *stmt = NULL;
+	if (thumb_db && sqlite3_prepare_v2(thumb_db, "INSERT OR REPLACE INTO player_cover_ids(key, id) VALUES(?1, ?2)", -1,
+									   &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(stmt, 1, key, -1, SQLITE_STATIC);
+		sqlite3_bind_text(stmt, 2, text, -1, SQLITE_STATIC);
+		sqlite3_step(stmt); // a failure here only costs reading the picture again
+		sqlite3_finalize(stmt);
+		player_id_prune();
+	}
+	pthread_mutex_unlock(&thumb_db_lock);
+}
+
+// The id, and the candidate it came from (0 when it was found in the table,
+// which only holds embedded pictures).
+static uint64_t player_source_id(const char *filepath, int *index) {
+	char key[32];
+	bool keyed = player_id_key(filepath, key, sizeof(key));
+	uint64_t id = 0;
+	if (keyed && player_id_lookup(key, &id)) {
+		*index = 0;
+		return id;
+	}
+	id = source_id_uncached(filepath, index);
+	if (keyed && id && *index == 0) {
+		player_id_store(key, id);
+	}
+	return id;
+}
+
+uint64_t cover_source_id(const char *filepath) {
+	int index;
+	return player_source_id(filepath, &index);
+}
+
+static void player_cover_key(char *out, size_t out_size, uint64_t id, int w, int h) {
+	snprintf(out, out_size, "%016llx|%dx%d|%d", (unsigned long long)id, w, h, PLAYER_COVER_EPOCH);
+}
+
+static bool player_cover_load(uint64_t id, int w, int h, cover_image_t *out) {
+	memset(out, 0, sizeof(*out));
+	char key[64];
+	player_cover_key(key, sizeof(key), id, w, h);
+
+	bool hit = false;
+	pthread_mutex_lock(&thumb_db_lock);
+	sqlite3_stmt *stmt = NULL;
+	if (thumb_db && sqlite3_prepare_v2(thumb_db, "SELECT w, h, pixels FROM player_covers WHERE key = ?1", -1, &stmt,
+									   NULL) == SQLITE_OK) {
+		sqlite3_bind_text(stmt, 1, key, -1, SQLITE_STATIC);
+		if (sqlite3_step(stmt) == SQLITE_ROW) {
+			hit = image_from_column(stmt, 2, sqlite3_column_int(stmt, 0), sqlite3_column_int(stmt, 1), out);
+		}
+		sqlite3_finalize(stmt);
+	}
+	// Moved to the front of the queue the pruning deletes from.
+	if (hit && sqlite3_prepare_v2(thumb_db,
+								  "UPDATE player_covers SET used = (SELECT IFNULL(MAX(used), 0) + 1 FROM player_covers)"
+								  " WHERE key = ?1",
+								  -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(stmt, 1, key, -1, SQLITE_STATIC);
+		sqlite3_step(stmt);
+		sqlite3_finalize(stmt);
+	}
+	pthread_mutex_unlock(&thumb_db_lock);
+	return hit;
+}
+
+static void player_cover_store(uint64_t id, int w, int h, const cover_image_t *img) {
+	if (!img || !img->pixels) {
+		return;
+	}
+	char key[64];
+	player_cover_key(key, sizeof(key), id, w, h);
+	int iw = (int)img->dsc.header.w;
+	int ih = (int)img->dsc.header.h;
+	if ((int)img->dsc.header.stride != iw * 2) {
+		return; // image_from_column() reads rows back packed
+	}
+
+	pthread_mutex_lock(&thumb_db_lock);
+	sqlite3_stmt *stmt = NULL;
+	if (thumb_db && sqlite3_prepare_v2(thumb_db,
+									   "INSERT OR REPLACE INTO player_covers(key, w, h, used, pixels) VALUES(?1, ?2, ?3,"
+									   " (SELECT IFNULL(MAX(used), 0) + 1 FROM player_covers), ?4)",
+									   -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(stmt, 1, key, -1, SQLITE_STATIC);
+		sqlite3_bind_int(stmt, 2, iw);
+		sqlite3_bind_int(stmt, 3, ih);
+		sqlite3_bind_blob(stmt, 4, img->pixels, (int)((size_t)iw * ih * 2), SQLITE_STATIC);
+		sqlite3_step(stmt); // a failure here only costs a future decode
+		sqlite3_finalize(stmt);
+
+		// Everything older than the newest PLAYER_COVER_MAX_ROWS goes.
+		if (sqlite3_prepare_v2(thumb_db,
+							   "DELETE FROM player_covers WHERE used <="
+							   " (SELECT used FROM player_covers ORDER BY used DESC LIMIT 1 OFFSET ?1)",
+							   -1, &stmt, NULL) == SQLITE_OK) {
+			sqlite3_bind_int(stmt, 1, PLAYER_COVER_MAX_ROWS);
+			sqlite3_step(stmt);
+			sqlite3_finalize(stmt);
+		}
 	}
 	pthread_mutex_unlock(&thumb_db_lock);
 }

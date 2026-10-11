@@ -297,49 +297,60 @@ static double restart_fresh_pos;
 // ---------------------------------------------------------------------------
 // Re-initialising the output route after waking from mem.
 //
-// mem powers the HBC3000 (the FPGA audio bridge) down; its kernel resume is a
-// no-op (plat_data+0x48 == 0), so the hardware stays off -- but the software
-// route ("Output Port Switch") survives in kernel RAM. On the first play
-// auto_set_output() asks for the same route X as before mem: the machine driver
-// callback sees X==X, takes the "no change" shortcut and never reaches
-// hbc3000_enable() (the chip's real power-on/program-RAM step). hbc3000_start()
-// then runs on dead hardware, the AIC reset fails and the device reboots.
+// mem powers the HBC3000 (the FPGA audio bridge) off, and the card's
+// suspend_pre resets the driver's route to 0. The first route write after it
+// is therefore a real change, which runs hbc3000_enable(): power, the FPGA
+// configuration loaded over JTAG, the DAC powered up. A PCM opened before that
+// write starts the HBC3000 dead, the AIC reset fails and the device reboots.
 //
-// So after wake and before opening any PCM, a real X -> Y -> X transition is
-// forced on the actual ALSA control. Two different values make the kernel run
-// the full route change, which goes through hbc3000_enable() and powers the
-// chip back up. Nothing is listened to on Y: it is only the way to traverse the
-// re-init branch.
-//
-// Y has to be a different PORT, not merely a different number. Routes 1 and 2
-// are the two faces of the 3.5 mm socket and the driver reconfigures nothing
-// moving between them (see write_output_route in alsa-controls.c), so a Y of 2
-// for an X of 1 would traverse nothing and leave the HBC3000 off. There are two
-// ports, so the choice is between the balanced one and either of the
-// single-ended pair.
-void audio_force_output_reinit_after_resume(void) {
+// The write takes a few hundred milliseconds in the driver, so on the R3 Pro II
+// it runs on a low-priority thread while the screen comes back. The card is
+// closed to everything else (alsa_wait_output_reinit()) from the parking of
+// the route before mem until the write and the DAC level are done.
+// ---------------------------------------------------------------------------
+
+// On the thread that called alsa_output_reinit_enter_thread().
+static void output_reinit_now(void) {
+	long start = log_ms();
+	alsa_controls_rewrite_output();
+	// The DAC back once the real route is live again.
+	alsa_suspend_restore();
+	fprintf(stderr, "audio: output re-init after resume done in %ld ms\n", log_ms() - start);
+}
+
+static void *output_reinit_thread(void *unused) {
+	(void)unused;
+	alsa_output_reinit_enter_thread();
+	thread_be_low_priority("outreinit");
+	output_reinit_now();
+	alsa_output_reinit_leave_thread();
+	alsa_output_reinit_end();
+	return NULL;
+}
+
+void audio_start_output_reinit_after_resume(void) {
 	// No HBC3000 on the CS43131 board: nothing went down, nothing to re-init.
 	if (alsa_board_is_cs43131()) {
 		alsa_suspend_restore();
 		return;
 	}
-	// 1 = 3.5 mm line out, 2 = 3.5 mm headphone, 3 = 4.4 mm balanced.
-	int x = detect_output();
-	int y = output_reinit_partner(x);
-	fprintf(stderr, "audio: output re-init after resume, %d -> %d -> %d\n", x, y, x);
-#ifndef HOST_BUILD
-	alsa_set_control("Output Port Switch", y);
-	usleep(120 * 1000); // settle: how long the driver takes over a route change
-	alsa_set_control("Output Port Switch", x);
-	usleep(120 * 1000);
+	fprintf(stderr, "audio: output re-init after resume, route %d, in the background\n", detect_output());
 
-	// X was written by hand, bypassing the alsa-controls.c cache: realign it so
-	// the play's first auto_set_output() sees X==X and does not touch the route
-	// again with a stream already coming.
-	alsa_controls_note_output(x);
-#endif
-	// The DAC back once the real route is live again.
-	alsa_suspend_restore();
+	// Closed already by the parking before mem; closed here otherwise.
+	alsa_output_reinit_begin();
+	pthread_attr_t attr;
+	pthread_t thread;
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+	int err = pthread_create(&thread, &attr, output_reinit_thread, NULL);
+	pthread_attr_destroy(&attr);
+	if (err != 0) {
+		fprintf(stderr, "audio: no thread for the output re-init (%s); done here\n", strerror(err));
+		alsa_output_reinit_enter_thread();
+		output_reinit_now();
+		alsa_output_reinit_leave_thread();
+		alsa_output_reinit_end();
+	}
 }
 
 // The pop into the headphones as the R3 Pro II goes into mem.
@@ -350,27 +361,28 @@ void audio_force_output_reinit_after_resume(void) {
 // the route, the balanced line-out flag and DOP_EN, the codec's are before the
 // amplifier -- but a route change is the machine driver's own orderly sequence
 // (mute the old port, reconfigure, unmute the new one), and it is silent: the
-// re-init above runs one at every wake and nobody hears it.
+// route write at every wake runs the same sequence and nobody hears it.
 //
 // So before the suspend the route is moved to the other socket, the empty one.
 // The port in use is muted by the driver, and what goes down in mem is an
-// amplifier driving nothing. The wake needs nothing more: the re-init writes
-// the partner and then the real route, and the second write is a real change
-// from the parked one, which is the full sequence that powers the HBC3000 back.
+// amplifier driving nothing. The re-init above puts the real route back.
 //
-// Called with the PCM closed: audio_suspend_freeze() has run.
+// Called with the PCM closed: audio_suspend_freeze() has run. Closes the card
+// to everything but the re-init that follows the suspend, or the attempt.
 void audio_park_output_before_suspend(void) {
 	if (alsa_board_is_cs43131()) {
 		return; // no HBC3000, and no thump to take away
 	}
+	alsa_wait_output_reinit(); // the last wake's re-init, if still running
 	int x = detect_output();
 	if (x < 1 || x > 3) {
+		alsa_output_reinit_begin();
 		return; // not one of the analogue sockets
 	}
 	int y = output_reinit_partner(x);
 	// The DAC first: the route change mutes the old port, but the DAC feeding
 	// it would still be live when its supply goes. Silent until the wake has
-	// put the real route back (audio_force_output_reinit_after_resume()).
+	// put the real route back (audio_start_output_reinit_after_resume()).
 	alsa_suspend_mute();
 	// The balanced line-out flag with it: on the 4.4 mm socket headphone and
 	// line out are the same route, and a report of a pop has to say which.
@@ -378,10 +390,9 @@ void audio_park_output_before_suspend(void) {
 #ifndef HOST_BUILD
 	alsa_set_control("Output Port Switch", y);
 	usleep(120 * 1000); // the driver's mute and route change, before the power goes
-	// Written by hand like the re-init: the cache follows, so a suspend that
-	// fails after this puts the real route back at the next play.
 	alsa_controls_note_output(y);
 #endif
+	alsa_output_reinit_begin();
 }
 
 // True while the playback thread holds an open PCM handle. The suspend path
@@ -1297,6 +1308,9 @@ static void release_page_cache(void) {
 
 static snd_pcm_t *open_pcm_device_now(int channels, int sample_rate, int bits_per_sample, snd_pcm_uframes_t *period_size_out) {
 	snd_pcm_t *pcm_handle = NULL;
+
+	// Not on the card while the route re-init after mem is powering it up.
+	alsa_wait_output_reinit();
 
 	release_external_output();
 
