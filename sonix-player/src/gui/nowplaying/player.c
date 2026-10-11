@@ -1208,6 +1208,11 @@ static void cover_panel_visualizer_cb(lv_event_t *e) {
 	}
 }
 
+// Convert 24-bit RGB888 color to 16-bit RGB565 format. 
+static uint16_t rgb888_to_rgb565(lv_color_t color) {
+	return (uint16_t)(((color.red & 0xF8) << 8) | ((color.green & 0xFC) << 3) | (color.blue >> 3));
+}
+
 static void visualizer_timer_cb(lv_timer_t *timer) {
 	(void)timer;
 	if (!visualizer_visible || !visualizer_canvas || !visualizer_buf) {
@@ -1225,8 +1230,7 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 	// Fill the canvas with a dark background, which is the same colour as the panel behind it. 
 	lv_color_t visualizer_bg = lv_color_make(12, 5, 24);
 
-	// Convert RGB888 to RGB565.
-	packed = (uint16_t)(((visualizer_bg.red & 0xF8) << 8) | ((visualizer_bg.green & 0xFC) << 3) | (visualizer_bg.blue >> 3));
+	packed = rgb888_to_rgb565(visualizer_bg);
 
 	for (size_t i = 0; i < width * height; i++) {
     	colour[i] = packed;
@@ -1250,7 +1254,7 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 		int bar_top_limit = LV_MAX(0, baseline - max_height);
 		lv_color_t baseline_color = lv_color_make(35, 94, 116);
 
-		packed = (uint16_t)(((baseline_color.red & 0xF8) << 8) | ((baseline_color.green & 0xFC) << 3) | (baseline_color.blue >> 3));
+		packed = rgb888_to_rgb565(baseline_color);
 
 		for (int x = 0; x < width; x++) {
 			at = (size_t)baseline * width + x;
@@ -1288,7 +1292,7 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 						(uint8_t)(245.0f - 25.0f * position));
 					for (int x = x_start; x < x_end; x++) {
 						at = (size_t)y * width + x;
-						colour[at] = (uint16_t)(((color.red & 0xF8) << 8) | ((color.green & 0xFC) << 3) | (color.blue >> 3));
+						colour[at] = rgb888_to_rgb565(color);
 					}
 				}
 
@@ -1298,7 +1302,7 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 					lv_color_t reflection = lv_color_make(8, (uint8_t)(42.0f * fade), (uint8_t)(88.0f * fade));
 					for (int x = x_start; x < x_end; x++) {
 						at = (size_t)y * width + x;
-						colour[at] = (uint16_t)(((reflection.red & 0xF8) << 8) | ((reflection.green & 0xFC) << 3) | (reflection.blue >> 3));
+						colour[at] = rgb888_to_rgb565(reflection);
 					}
 				}
 			}
@@ -1308,7 +1312,7 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 				lv_color_t marker = lv_color_make(255, (uint8_t)(215.0f * brightness), 255);
 				for (int x = x_start; x < x_end; x++) {
 					at = (size_t)peak_y * width + x;
-					colour[at] = (uint16_t)(((marker.red & 0xF8) << 8) | ((marker.green & 0xFC) << 3) | (marker.blue >> 3));
+					colour[at] = rgb888_to_rgb565(marker);
 				}
 			}
 		}
@@ -1364,7 +1368,7 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 					int py = y + perpendicular_y * thickness;
 					if (px >= 0 && px < width && py >= 0 && py < height) {
 						at = (size_t)py * width + px;
-						colour[at] = (uint16_t)(((bar_color.red & 0xF8) << 8) | ((bar_color.green & 0xFC) << 3) | (bar_color.blue >> 3));
+						colour[at] = rgb888_to_rgb565(bar_color);
 					}
 				}
 			}
