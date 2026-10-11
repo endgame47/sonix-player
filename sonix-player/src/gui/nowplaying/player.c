@@ -1214,11 +1214,24 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 		return;
 	}
 
-	lv_canvas_fill_bg(visualizer_canvas, lv_color_make(12, 5, 24), LV_OPA_COVER);
-	
 	int width = (int)lv_obj_get_width(visualizer_canvas);
 	int height = (int)lv_obj_get_height(visualizer_canvas);
 	
+	uint16_t packed;
+	size_t at;
+
+	uint16_t *colour = (uint16_t *)visualizer_buf;
+
+	// Fill the canvas with a dark background, which is the same colour as the panel behind it. 
+	lv_color_t visualizer_bg = lv_color_make(12, 5, 24);
+
+	// Convert RGB888 to RGB565.
+	packed = (uint16_t)(((visualizer_bg.red & 0xF8) << 8) | ((visualizer_bg.green & 0xFC) << 3) | (visualizer_bg.blue >> 3));
+
+	for (size_t i = 0; i < width * height; i++) {
+    	colour[i] = packed;
+	}
+
 	float level = 0.0f;
 	float peak_level = 0.0f;
 	float spectrum[AUDIO_VISUALIZER_BINS] = {0};
@@ -1236,8 +1249,12 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 		int max_height = height * 48 / 100;
 		int bar_top_limit = LV_MAX(0, baseline - max_height);
 		lv_color_t baseline_color = lv_color_make(35, 94, 116);
+
+		packed = (uint16_t)(((baseline_color.red & 0xF8) << 8) | ((baseline_color.green & 0xFC) << 3) | (baseline_color.blue >> 3));
+
 		for (int x = 0; x < width; x++) {
-			lv_canvas_set_px(visualizer_canvas, x, baseline, baseline_color, LV_OPA_COVER);
+			at = (size_t)baseline * width + x;
+			colour[at] = packed;
 		}
 
 		// Each bin rises from the same baseline, with a dim reflection and a
@@ -1270,7 +1287,8 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 						(uint8_t)(225.0f - 195.0f * position),
 						(uint8_t)(245.0f - 25.0f * position));
 					for (int x = x_start; x < x_end; x++) {
-						lv_canvas_set_px(visualizer_canvas, x, y, color, LV_OPA_COVER);
+						at = (size_t)y * width + x;
+						colour[at] = (uint16_t)(((color.red & 0xF8) << 8) | ((color.green & 0xFC) << 3) | (color.blue >> 3));
 					}
 				}
 
@@ -1279,7 +1297,8 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 					float fade = 1.0f - (float)(y - baseline) / LV_MAX(1, reflection_height);
 					lv_color_t reflection = lv_color_make(8, (uint8_t)(42.0f * fade), (uint8_t)(88.0f * fade));
 					for (int x = x_start; x < x_end; x++) {
-						lv_canvas_set_px(visualizer_canvas, x, y, reflection, LV_OPA_COVER);
+						at = (size_t)y * width + x;
+						colour[at] = (uint16_t)(((reflection.red & 0xF8) << 8) | ((reflection.green & 0xFC) << 3) | (reflection.blue >> 3));
 					}
 				}
 			}
@@ -1288,7 +1307,8 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 				float brightness = 0.65f + 0.35f * peak_level;
 				lv_color_t marker = lv_color_make(255, (uint8_t)(215.0f * brightness), 255);
 				for (int x = x_start; x < x_end; x++) {
-					lv_canvas_set_px(visualizer_canvas, x, peak_y, marker, LV_OPA_COVER);
+					at = (size_t)peak_y * width + x;
+					colour[at] = (uint16_t)(((marker.red & 0xF8) << 8) | ((marker.green & 0xFC) << 3) | (marker.blue >> 3));
 				}
 			}
 		}
@@ -1343,7 +1363,8 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 					int px = x + perpendicular_x * thickness;
 					int py = y + perpendicular_y * thickness;
 					if (px >= 0 && px < width && py >= 0 && py < height) {
-						lv_canvas_set_px(visualizer_canvas, px, py, bar_color, LV_OPA_COVER);
+						at = (size_t)py * width + px;
+						colour[at] = (uint16_t)(((bar_color.red & 0xF8) << 8) | ((bar_color.green & 0xFC) << 3) | (bar_color.blue >> 3));
 					}
 				}
 			}
