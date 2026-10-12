@@ -85,6 +85,12 @@ typedef struct {
 // for a new file and be filled in later.
 void lastfm_note_playback(const lastfm_playback_t *now);
 
+// Last.fm's rule for a play that counts: a track of at least 30 seconds,
+// listened to for half its length or for four minutes, whichever comes first.
+// `listened` is time actually played, in seconds. The player's own play counts
+// (playcount.h) go by the same rule, whether Last.fm is in use or not.
+bool lastfm_play_counts(double length, double listened);
+
 // True while a request is on the wire, so the Wi-Fi is not parked under it.
 bool lastfm_network_wanted(void);
 

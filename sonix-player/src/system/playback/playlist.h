@@ -204,6 +204,10 @@ bool playlist_current_path(char *out, size_t out_size);
 // copies the next track's path into `out` and returns true; returns false
 // when playback should stop.
 bool playlist_advance_auto(char *out, size_t out_size);
+// The track playlist_advance_auto() would move to, without moving. False when
+// it would stop, or when what comes next is not decided yet (a new shuffle
+// deal).
+bool playlist_peek_auto(char *out, size_t out_size);
 
 // User-initiated next/prev, walking the playback order. Copy the new track's
 // path into `out`; return false only when the queue is empty.

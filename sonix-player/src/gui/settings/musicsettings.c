@@ -1,4 +1,5 @@
 #include "musicsettings.h"
+#include "musictiles.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -18,7 +19,6 @@
 #include "src/gui/settings/artistexceptions.h"
 #include "src/gui/settings/lastfmsettings.h"
 #include "src/gui/library/medialist.h"
-#include "src/gui/library/music.h"
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/switcher.h"
 #include "src/gui/shell/theme.h"
@@ -1245,6 +1245,7 @@ static lv_obj_t *detect_changes_switch;
 static lv_obj_t *display_screen;
 static lv_obj_t *library_screen;
 static lv_obj_t *album_view_switch;
+static lv_obj_t *album_head_switch;
 static lv_obj_t *quality_badges_switch;
 static lv_obj_t *go_to_current_switch;
 
@@ -1494,17 +1495,8 @@ static void album_view_cb(lv_event_t *e) {
 	medialist_set_album_view(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
 }
 
-// Which of Browse and Playlists the Music page puts on its sixth tile. Kept
-// here with the rest of the display options; the Music page reads it and paints
-// itself.
-static lv_obj_t *playlists_first_switch;
-
-bool musicsettings_playlists_first(void) { return config_get_bool("music", "playlists_first", false); }
-
-static void playlists_first_cb(lv_event_t *e) {
-	config_set_bool("music", "playlists_first", lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
-	config_save();
-	music_refresh_layout();
+static void album_head_cb(lv_event_t *e) {
+	medialist_set_album_head(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
 }
 
 static lv_obj_t *nowplaying_at_boot_switch;
@@ -1583,6 +1575,12 @@ static void coverflow_cb(lv_event_t *e) {
 	coverflow_set_enabled(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
 }
 
+static lv_obj_t *cover_accent_switch;
+
+static void cover_accent_cb(lv_event_t *e) {
+	player_cover_accent_set(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+}
+
 // ---------------------------------------------------------------------------
 // Which of the two arrangements the now-playing page uses
 //
@@ -1619,8 +1617,9 @@ static void layout_pick_cb(lv_event_t *e) {
 // Library
 //
 // How the library's lists are drawn: what an artist opens on, what a row says
-// under its title, and which tile the Music page leads with. Inside Display
-// options, which keeps what concerns the now-playing page and the rest.
+// under its title, and which tiles the Music page shows. A page of its own
+// beside Display options, which keeps what concerns the now-playing page and
+// the rest.
 // ---------------------------------------------------------------------------
 
 static void build_library_page(gui_config_t *cfg) {
@@ -1628,12 +1627,25 @@ static void build_library_page(gui_config_t *cfg) {
 	lv_obj_t *container = settingsrow_page(library_screen, cfg, "musicsettings_library");
 	settingsrow_title_corner_slots(settingsrow_page_title(library_screen), cfg, 0);
 
-	// On: an artist is a list of their records. Off: a flat list of their
-	// tracks, with the grouping button in the corner.
+	// Which tiles the Music page shows, and in what order.
+	musictiles_init(cfg);
+	settingsrow_add(container, "musicsettings_rearrange_main_page", NULL, switch_screen_cb, musictiles_screen);
+
+	// On: an artist, a genre or a year is a list of its records. Off: a flat
+	// list of its tracks, with the grouping button in the corner on an
+	// artist's.
 	settingsrow_toggle(container, "musicsettings_album_view", &album_view_switch, album_view_cb);
 	option_note(container, "musicsettings_artist_opens_albums_note");
 	if (medialist_album_view()) {
 		lv_obj_add_state(album_view_switch, LV_STATE_CHECKED);
+	}
+
+	// How an album's own page is laid out: the plain list, or the cover and
+	// what the record is at the top with the tracks under it.
+	settingsrow_toggle(container, "musicsettings_album_head", &album_head_switch, album_head_cb);
+	option_note(container, "musicsettings_album_head_note");
+	if (medialist_album_head()) {
+		lv_obj_add_state(album_head_switch, LV_STATE_CHECKED);
 	}
 
 	// Who a row is by, under its title, on the lists picked here.
@@ -1646,12 +1658,6 @@ static void build_library_page(gui_config_t *cfg) {
 	option_note(container, "musicsettings_show_artist_note");
 	artist_refresh();
 	theme_register_refresh(artist_refresh);
-
-	settingsrow_toggle(container, "musicsettings_playlists_first", &playlists_first_switch, playlists_first_cb);
-	option_note(container, "musicsettings_playlists_first_note");
-	if (musicsettings_playlists_first()) {
-		lv_obj_add_state(playlists_first_switch, LV_STATE_CHECKED);
-	}
 
 	// A small mark under a track's title saying what the file is. It comes from
 	// what the scan wrote down, so a library indexed by an older build wears no
@@ -1669,9 +1675,6 @@ static void build_display_page(gui_config_t *cfg) {
 	display_screen = lv_obj_create(NULL);
 	lv_obj_t *container = settingsrow_page(display_screen, cfg, "musicsettings_display_options");
 	settingsrow_title_corner_slots(settingsrow_page_title(display_screen), cfg, 0);
-
-	build_library_page(cfg);
-	settingsrow_add(container, "musicsettings_library", NULL, switch_screen_cb, library_screen);
 
 	// Whose name goes under the title on the now-playing page, in the control
 	// centre and on the screensaver: the album's artist, as the record is
@@ -1719,6 +1722,13 @@ static void build_display_page(gui_config_t *cfg) {
 	// stream from a phone and an audiobook all get the standard one whatever
 	// this says. Studio asks for less and takes all of them.
 	option_note(container, "musicsettings_local_only_note");
+
+	// The sleeve's colour as the accent of the other two arrangements too.
+	settingsrow_toggle(container, "musicsettings_cover_accent", &cover_accent_switch, cover_accent_cb);
+	option_note(container, "musicsettings_cover_accent_note");
+	if (player_cover_accent()) {
+		lv_obj_add_state(cover_accent_switch, LV_STATE_CHECKED);
+	}
 
 	// Whether a start with a remembered track lands on the now-playing page
 	// rather than on the home screen. Read once, at startup (main.c).
@@ -1872,8 +1882,8 @@ void musicsettings_init(gui_config_t *cfg) {
 	lv_obj_t *container = settingsrow_page(musicsettings_screen, cfg, "music");
 
 	// The pages of behaviour first: how the index is built, what playback does
-	// around a track, how the lists look, and Last.fm, which only reports what
-	// was played. Then the sound, from the widest tool to the narrowest, and the
+	// around a track, how the pages and the lists look, and Last.fm, which
+	// only reports what was played. Then the sound, from the widest tool to the narrowest, and the
 	// DAC's own switches at the end.
 	artistexceptions_init(cfg, organize_touched);
 	build_scan_page(cfg);
@@ -1884,6 +1894,9 @@ void musicsettings_init(gui_config_t *cfg) {
 
 	build_display_page(cfg);
 	settingsrow_add(container, "musicsettings_display_options", NULL, switch_screen_cb, display_screen);
+
+	build_library_page(cfg);
+	settingsrow_add(container, "musicsettings_library", NULL, switch_screen_cb, library_screen);
 
 	lastfmsettings_init(cfg);
 	settingsrow_add(container, "lastfm", NULL, switch_screen_cb, lastfmsettings_screen());

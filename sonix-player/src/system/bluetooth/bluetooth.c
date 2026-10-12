@@ -121,6 +121,9 @@ typedef enum {
 	// The name the adapter answers with. Carried in g_local_name rather than in
 	// the job: a name is longer than `text` holds.
 	JOB_SET_NAME,
+	// A paired device's name on this player: the device is the job's mac, the
+	// name is in g_alias_name for the same reason as above.
+	JOB_SET_ALIAS,
 	JOB_SET_CODEC, // text: the codec to switch to
 	JOB_VOLUME,	   // arg_int: percent, for AVRCP absolute volume
 	JOB_RX_INFO,   // re-read what a device streaming to this one is sending
@@ -165,6 +168,8 @@ static bt_op_t g_op = BT_OP_IDLE;
 static char g_op_name[BT_NAME_MAX];
 
 static char g_local_name[BT_NAME_MAX] = "HiBy Music";
+// The name a JOB_SET_ALIAS gives its device.
+static char g_alias_name[BT_NAME_MAX];
 
 // A2DP. There is deliberately no on/off switch here, as in the stock player:
 // connected headphones are the output, and a switch that could send the music
@@ -3030,6 +3035,17 @@ static void *bluetooth_worker(void *arg) {
 				break;
 			}
 
+			case JOB_SET_ALIAS: {
+				pthread_mutex_lock(&lock);
+				char alias[BT_NAME_MAX];
+				snprintf(alias, sizeof(alias), "%s", g_alias_name);
+				pthread_mutex_unlock(&lock);
+				fprintf(stderr, "bluetooth: renaming %s to '%s'\n", job.mac, alias);
+				btstack_set_device_alias(job.mac, alias);
+				refresh_devices();
+				break;
+			}
+
 			case JOB_SET_CODEC:
 				do_set_codec(job.text);
 				break;
@@ -3331,6 +3347,38 @@ void bluetooth_pair(const char *mac) { post_device_job(JOB_PAIR, mac); }
 void bluetooth_connect(const char *mac) { post_device_job(JOB_CONNECT, mac); }
 void bluetooth_disconnect(const char *mac) { post_device_job(JOB_DISCONNECT, mac); }
 void bluetooth_forget(const char *mac) { post_device_job(JOB_FORGET, mac); }
+
+bool bluetooth_rename(const char *mac, const char *name) {
+	if (!mac || !mac[0] || !name) {
+		return false;
+	}
+
+	// Trimmed like the player's own name. Empty is allowed: bluez then gives
+	// the device back the name it announces itself.
+	char wanted[BT_NAME_MAX];
+	snprintf(wanted, sizeof(wanted), "%s", name);
+	size_t length = strlen(wanted);
+	while (length > 0 && (wanted[length - 1] == ' ' || wanted[length - 1] == '\t')) {
+		wanted[--length] = '\0';
+	}
+	const char *start = wanted;
+	while (*start == ' ' || *start == '\t') {
+		start++;
+	}
+
+	pthread_mutex_lock(&lock);
+	snprintf(g_alias_name, sizeof(g_alias_name), "%s", start);
+	bool enabled = g_enabled;
+	pthread_mutex_unlock(&lock);
+	if (!enabled) {
+		return false; // bluez is not running, and the name lives in bluez
+	}
+
+	job_t job = {.type = JOB_SET_ALIAS};
+	snprintf(job.mac, sizeof(job.mac), "%s", mac);
+	post_job(&job);
+	return true;
+}
 
 // The connected audio device. A phone that is only the SonixLink remote is
 // connected too, and is not it.

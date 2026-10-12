@@ -14,6 +14,7 @@
 #include "src/system/audio/audio.h"
 #include "src/system/core/lang.h"
 #include "src/system/lastfm/lastfm.h"
+#include "src/system/library/playcount.h"
 #include "src/system/net/wifi.h"
 #include "src/system/playback/audiobook.h"
 #include "src/system/playback/device_state.h"
@@ -309,14 +310,25 @@ static void login_finished(const lastfm_status_t *st) {
 
 static void tick_cb(lv_timer_t *t) {
 	(void)t;
-	if (lastfm_active()) {
-		char file[512];
-		audio_get_current_file(file, sizeof(file));
+	char file[512];
+	audio_get_current_file(file, sizeof(file));
+	bool playing = audio_get_status() == AUDIO_STATUS_PLAYING;
+	double position = 0.0, duration = 0.0;
+	audio_get_progress(&position, &duration);
+	bool skip = radio_is_active() || audiobook_is_playing() || podcastcache_is_episode(file);
 
+	// The player's own count of plays, by the same rule, whether Last.fm is in
+	// use or not.
+	playcount_playback_t counted = {
+		.playing = playing, .file = file, .position = position, .duration = duration, .skip = skip};
+	playcount_note_playback(&counted);
+
+	if (lastfm_active()) {
 		lastfm_playback_t now = {0};
 		now.file = file;
-		now.playing = audio_get_status() == AUDIO_STATUS_PLAYING;
-		audio_get_progress(&now.position, &now.duration);
+		now.playing = playing;
+		now.position = position;
+		now.duration = duration;
 
 		// Tags only once device_state has read them for this very file.
 		const char *tags_file = NULL;
@@ -326,7 +338,7 @@ static void tick_cb(lv_timer_t *t) {
 		now.title = tags ? m->title : "";
 		now.album = tags ? m->album : "";
 
-		now.skip = radio_is_active() || audiobook_is_playing() || podcastcache_is_episode(file);
+		now.skip = skip;
 		lastfm_note_playback(&now);
 	}
 

@@ -37,6 +37,16 @@ typedef enum {
 } topbar_library_t;
 void topbar_set_library_check(topbar_library_t state);
 
+// The bar in `bg` with its glyphs and type in `ink` while `screen` is the page
+// shown, for a page painted in a colour of its own. Pass false with the same
+// screen to give the bar back its theme colours; a call naming another screen
+// than the one recorded changes nothing.
+void topbar_tint_on_screen(lv_obj_t *screen, bool on, lv_color_t bg, lv_color_t ink);
+
+// Which page is being shown, so the tint above follows it. Called as each page
+// is loaded.
+void topbar_page_shown(lv_obj_t *screen);
+
 // Shows or hides the status bar. Pages that want the full screen height (the
 // player, with its artwork flush to the top) hide it on entry.
 void topbar_set_hidden(bool hidden);

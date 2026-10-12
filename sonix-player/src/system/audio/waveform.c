@@ -90,6 +90,11 @@ static char computing[1024]; // what the worker picked up
 static char have_path[1024]; // what `have_bars` belongs to
 static uint8_t have_bars[WAVEFORM_BARS];
 static bool have_answer;
+// The columns of the track being worked out that are already done, so the page
+// can draw them while the rest of the file is still being read.
+static char partial_path[1024]; // what `partial_bars` belongs to
+static uint8_t partial_bars[WAVEFORM_BARS];
+static int partial_count; // how many of them, from the left
 
 static long now_ms(void) {
 	struct timespec ts;
@@ -370,6 +375,55 @@ static void drop_close(wave_drop_t *d, double fraction) {
 	d->fd = -1;
 }
 
+// Power to amplitude, then scaled against the loudest column rather than
+// against full scale: a quiet recording drawn against 0 dBFS is a line, and
+// what a waveform is for is the shape of the track and not its level.
+//
+// The first `count` columns only: while the file is still being read, the
+// columns done so far are scaled against the loudest of them, and the answer
+// for the whole track is the same sum taken over all of them.
+static void shape_bars(const uint64_t *power, const uint32_t *counted, int count, uint8_t *bars) {
+	uint32_t level[WAVEFORM_BARS];
+	uint32_t loudest = 1;
+	for (int i = 0; i < count; i++) {
+		level[i] = counted[i] ? utils_isqrt64(power[i] / counted[i]) : 0;
+		if (level[i] > loudest) {
+			loudest = level[i];
+		}
+	}
+
+	for (int i = 0; i < count; i++) {
+		uint32_t norm = level[i] * WAVE_SCALE / loudest; // 0..WAVE_SCALE
+
+		// Halfway between the level and its square root, which is a curve of
+		// about 0.7. Mean power alone leaves a quiet verse at a tenth
+		// the height of the chorus and unreadable; the square root alone lifts
+		// it so far that the track has no dynamics left to look at.
+		uint32_t curved = (norm + utils_isqrt64((uint64_t)norm * WAVE_SCALE)) / 2;
+		if (curved > WAVE_SCALE) {
+			curved = WAVE_SCALE;
+		}
+		bars[i] = (uint8_t)(curved * WAVE_CEILING / WAVE_SCALE);
+	}
+}
+
+// Hands the columns finished so far to the page. A job that starts again on
+// the same track, after the audio side stopped it, only replaces what is shown
+// once it has got further than the last attempt did.
+static void publish_partial(const char *path, const uint64_t *power, const uint32_t *counted, int count) {
+	uint8_t bars[WAVEFORM_BARS];
+	shape_bars(power, counted, count, bars);
+
+	pthread_mutex_lock(&lock);
+	bool same = strcmp(partial_path, path) == 0;
+	if (!same || count > partial_count) {
+		snprintf(partial_path, sizeof(partial_path), "%s", path);
+		memcpy(partial_bars, bars, (size_t)count);
+		partial_count = count;
+	}
+	pthread_mutex_unlock(&lock);
+}
+
 static wave_build_t build(const char *path, uint8_t *bars) {
 	decode_format_t format = decode_detect_format(path);
 
@@ -438,6 +492,7 @@ static wave_build_t build(const char *path, uint8_t *bars) {
 	uint64_t done = 0;
 	int column = 0;
 	uint64_t next_edge = (total + WAVEFORM_BARS - 1) / WAVEFORM_BARS;
+	int published = 0; // columns already handed to the page
 
 	wave_build_t result = WAVE_BUILD_OK;
 	while (done < total) {
@@ -521,6 +576,13 @@ static wave_build_t build(const char *path, uint8_t *bars) {
 		}
 		done += got;
 		drop_behind(&drop, (double)done / (double)total, false);
+
+		// Every column before the one being filled is finished: the page can
+		// have them now, rather than once the whole file has been read.
+		if (column > published) {
+			published = column;
+			publish_partial(path, power, counted, published);
+		}
 	}
 
 	free(buffer);
@@ -530,31 +592,7 @@ static wave_build_t build(const char *path, uint8_t *bars) {
 		return result;
 	}
 
-	// Power to amplitude, then scaled against the loudest column rather than
-	// against full scale: a quiet recording drawn against 0 dBFS is a line, and
-	// what a waveform is for is the shape of the track and not its level.
-	uint32_t level[WAVEFORM_BARS];
-	uint32_t loudest = 1;
-	for (int i = 0; i < WAVEFORM_BARS; i++) {
-		level[i] = counted[i] ? utils_isqrt64(power[i] / counted[i]) : 0;
-		if (level[i] > loudest) {
-			loudest = level[i];
-		}
-	}
-
-	for (int i = 0; i < WAVEFORM_BARS; i++) {
-		uint32_t norm = level[i] * WAVE_SCALE / loudest; // 0..WAVE_SCALE
-
-		// Halfway between the level and its square root, which is a curve of
-		// about 0.7. Mean power alone leaves a quiet verse at a tenth
-		// the height of the chorus and unreadable; the square root alone lifts
-		// it so far that the track has no dynamics left to look at.
-		uint32_t curved = (norm + utils_isqrt64((uint64_t)norm * WAVE_SCALE)) / 2;
-		if (curved > WAVE_SCALE) {
-			curved = WAVE_SCALE;
-		}
-		bars[i] = (uint8_t)(curved * WAVE_CEILING / WAVE_SCALE);
-	}
+	shape_bars(power, counted, WAVEFORM_BARS, bars);
 	return WAVE_BUILD_OK;
 }
 
@@ -666,9 +704,9 @@ void waveform_start(void) {
 	}
 }
 
-bool waveform_get(const char *path, uint8_t *out) {
+int waveform_get(const char *path, uint8_t *out) {
 	if (!path || !path[0] || !out) {
-		return false;
+		return 0;
 	}
 
 	pthread_mutex_lock(&lock);
@@ -677,9 +715,16 @@ bool waveform_get(const char *path, uint8_t *out) {
 		snprintf(wanted, sizeof(wanted), "%s", path);
 		pthread_cond_signal(&wake);
 	}
-	bool ready = have_answer && strcmp(have_path, path) == 0;
-	if (ready) {
-		memcpy(out, have_bars, WAVEFORM_BARS);
+	int ready = 0;
+	if (strcmp(have_path, path) == 0) {
+		// Settled: the whole shape, or the answer that there is none.
+		if (have_answer) {
+			memcpy(out, have_bars, WAVEFORM_BARS);
+			ready = WAVEFORM_BARS;
+		}
+	} else if (partial_count > 0 && strcmp(partial_path, path) == 0) {
+		memcpy(out, partial_bars, (size_t)partial_count);
+		ready = partial_count;
 	}
 	pthread_mutex_unlock(&lock);
 

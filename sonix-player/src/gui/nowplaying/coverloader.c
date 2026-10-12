@@ -13,6 +13,9 @@
 typedef struct {
 	char path[512];
 	int size;
+	// Above zero: the picture is made from the player's cover at this size
+	// (cover_load_shared) rather than as a list thumbnail.
+	int share_w, share_h;
 
 	uint32_t generation; // bumped by every request and every release
 	bool pending;		 // asked for, not started
@@ -201,6 +204,7 @@ static void *worker(void *arg) {
 		char path[sizeof(slot->path)];
 		memcpy(path, slot->path, sizeof(path));
 		int size = slot->size;
+		int share_w = slot->share_w, share_h = slot->share_h;
 		uint32_t generation = slot->generation;
 
 		slot->pending = false;
@@ -208,7 +212,8 @@ static void *worker(void *arg) {
 		pthread_mutex_unlock(&lock);
 
 		cover_image_t image;
-		bool found = cover_thumb_load(path, false, size, &image);
+		bool found = share_w > 0 ? cover_load_shared(path, share_w, share_h, size, &image)
+								  : cover_thumb_load(path, false, size, &image);
 
 		pthread_mutex_lock(&lock);
 		slot->running = false;
@@ -278,6 +283,28 @@ void coverloader_request(int slot_index, const char *path, int size) {
 
 	snprintf(slot->path, sizeof(slot->path), "%s", path);
 	slot->size = size;
+	slot->share_w = 0;
+	slot->share_h = 0;
+	slot->pending = true;
+
+	pthread_cond_signal(&wakeup);
+	pthread_mutex_unlock(&lock);
+}
+
+void coverloader_request_shared(int slot_index, const char *path, int size, int player_w, int player_h) {
+	if (slot_index < 0 || slot_index >= COVERLOADER_SLOTS || !path) {
+		return;
+	}
+
+	pthread_mutex_lock(&lock);
+
+	slot_t *slot = &slots[slot_index];
+	discard(slot);
+
+	snprintf(slot->path, sizeof(slot->path), "%s", path);
+	slot->size = size;
+	slot->share_w = player_w;
+	slot->share_h = player_h;
 	slot->pending = true;
 
 	pthread_cond_signal(&wakeup);

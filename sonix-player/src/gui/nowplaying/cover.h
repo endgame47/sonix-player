@@ -9,10 +9,24 @@
 
 // A cover picture already decoded and scaled to the size it is drawn at, in
 // the display's own pixel format, so drawing it costs nothing more than a blit.
+//
+// The player's cover and an album page's head also carry the picture's colour,
+// read from the thumbnail database or worked out once on the loader thread and
+// written there (see cover_load_player_images, cover_load_shared), so the page
+// that shows the picture does not work it out again every time it opens.
 typedef struct {
 	lv_image_dsc_t dsc;	 // hand this straight to lv_image_set_src()
 	uint8_t *pixels;	 // pixel buffer referenced by dsc.data
+	bool has_tone;		 // the three below are filled in
+	uint32_t tone;		 // cover_page_tone() at COVER_PAGE_LIGHT_FROM: the sleeve's colour,
+	int16_t tone_luma;	 // its brightness as a whole,
+	bool tone_light;	 // and whether a page in it is a light one
 } cover_image_t;
+
+// How bright a sleeve has to be for a page in its colour to be a light one,
+// written in dark ink. The colour kept with a picture is worked out at this
+// threshold.
+#define COVER_PAGE_LIGHT_FROM 150
 
 // Where the on-disk thumbnail cache lives -- normally a hidden folder on the
 // card, which is what the stock player does too (it keeps its own JPEGs under
@@ -113,6 +127,37 @@ bool cover_blur_fill(const cover_image_t *src, int out_w, int out_h, cover_image
 // warm white rather than a colour squeezed out of rounding noise. Zero when
 // there is nothing to look at.
 uint32_t cover_dominant_tone(const cover_image_t *cover);
+
+// How bright a sleeve looks as a whole, 0..255 (Rec. 601 luma of its average),
+// or -1 when there is nothing to look at. cover_dominant_tone() says what colour
+// a sleeve is and always answers at full strength; this says whether it is a
+// dark record or a light one, for a page that takes the sleeve's colour and
+// has to choose the ink to write on it in.
+int cover_mean_luma(const cover_image_t *cover);
+
+// The colour a page painted in the sleeve's colours takes, as 0xRRGGBB in
+// *tone, without the push to full strength that a light needs and a painted
+// surface does not. One family of the sleeve's hues rather than an average of
+// all of them, so a two-colour sleeve gives one of its two colours and not the
+// mud between them. *luma is cover_mean_luma(), and *light says whether the
+// page should be a light one: a sleeve at least light_from bright, or one
+// mostly of a bright yellow, which only darkens to olive. False when there is
+// nothing to look at.
+bool cover_page_tone(const cover_image_t *cover, int light_from, uint32_t *tone, int *luma, bool *light);
+
+// A colour from cover_page_tone() at full strength, the way
+// cover_dominant_tone() answers: for a mark drawn over a dark backdrop, where
+// the colour of a painted page would be too faint to read. A colour that is
+// hardly a colour at all comes back the same warm white.
+uint32_t cover_tone_stretched(uint32_t tone);
+
+// A square picture of `size` made from the player's own cover of `filepath`
+// (player_w x player_h, the size the now-playing page draws it at). The player's
+// table of covers is asked first, so a record already played comes back
+// without its file being read; otherwise the cover is decoded at the player's
+// size and kept there, so the player finds it the first time the record plays.
+// What an album's page puts at its head. Runs on the loader thread.
+bool cover_load_shared(const char *filepath, int player_w, int player_h, int size, cover_image_t *out);
 
 void cover_free(cover_image_t *img);
 

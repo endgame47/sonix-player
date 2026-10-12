@@ -388,8 +388,10 @@ COLOR_ICONS = [
     ("artist.png", "menu_artist", SECTION_ICON_SIZE),
     ("album_artist.png", "menu_album_artist", SECTION_ICON_SIZE),
     ("genre.png", "menu_genre", SECTION_ICON_SIZE),
+    ("year.png", "menu_year", SECTION_ICON_SIZE),
+    ("favourites.png", "menu_favourites", SECTION_ICON_SIZE),
+    ("most-played.png", "menu_most_played", SECTION_ICON_SIZE),
     ("explorer.png", "menu_explorer", SECTION_ICON_SIZE),
-    # The tile Explorer swaps with when playlists are put first.
     ("playlist.png", "menu_playlist", SECTION_ICON_SIZE),
     ("streaming.png", "menu_streaming", MAIN_MENU_ICON_SIZE),
     ("wireless.png", "menu_wireless", MAIN_MENU_ICON_SIZE),

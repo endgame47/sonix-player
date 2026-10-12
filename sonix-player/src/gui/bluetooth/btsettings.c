@@ -11,6 +11,7 @@
 #include "src/gui/fonts/fonts.h"
 #include "src/gui/shell/gui.h"
 #include "src/gui/shell/icons.h"
+#include "src/gui/shell/keyboard.h"
 #include "src/gui/shell/popover.h"
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/spinner.h"
@@ -208,6 +209,126 @@ static void forget_action(void *user) {
 	bluetooth_forget(menu_mac);
 }
 
+// ---------------------------------------------------------------------------
+// Renaming a device
+//
+// The name a paired device is shown under on this player, kept by bluez with
+// the pairing. A sheet over the page with the field and the keyboard, as for
+// the player's own name. Emptied, the field gives the device back the name it
+// announces itself.
+// ---------------------------------------------------------------------------
+
+#define RENAME_CANCEL_SIZE 56
+
+static lv_obj_t *rename_layer;
+static lv_obj_t *rename_field;
+static keyboard_t *rename_keyboard;
+// The device being renamed. Its own copy: the popover's can change under the
+// sheet if another row's menu is opened from behind it.
+static char rename_mac[BT_MAC_MAX];
+
+static void rename_layer_hide(void) {
+	if (rename_layer) {
+		lv_obj_set_hidden(rename_layer, true);
+	}
+	back_btn_force_hidden(false);
+}
+
+static void rename_cancel_cb(lv_event_t *e) {
+	(void)e;
+	rename_layer_hide();
+}
+
+static void rename_accept_cb(lv_event_t *e) {
+	(void)e;
+	const char *typed = lv_textarea_get_text(rename_field);
+	rename_layer_hide();
+	if (bluetooth_rename(rename_mac, typed ? typed : "")) {
+		toast_success("bt_name_changed");
+	} else {
+		toast_error("bt_bluetooth_off");
+	}
+}
+
+static void rename_action(void *user) {
+	(void)user;
+	if (!rename_layer) {
+		return;
+	}
+	snprintf(rename_mac, sizeof(rename_mac), "%s", menu_mac);
+
+	// The field starts with the name the list shows.
+	const char *current = "";
+	bt_device_t devices[BT_MAX_DEVICES];
+	int count = bluetooth_get_paired(devices, BT_MAX_DEVICES);
+	for (int i = 0; i < count; i++) {
+		if (strcmp(devices[i].mac, rename_mac) == 0) {
+			current = devices[i].name;
+			break;
+		}
+	}
+	lv_textarea_set_text(rename_field, current);
+	keyboard_reset(rename_keyboard);
+	lv_obj_set_hidden(rename_layer, false);
+	lv_obj_move_foreground(rename_layer);
+	// The sheet has its own close in the corner, and the chevron under it would
+	// leave the page without putting the keyboard away.
+	back_btn_force_hidden(true);
+}
+
+static void build_rename_layer(gui_config_t *cfg) {
+	rename_layer = lv_obj_create(btsettings_screen);
+	lv_obj_set_size(rename_layer, lv_pct(100), lv_pct(100));
+	lv_obj_align(rename_layer, LV_ALIGN_TOP_LEFT, 0, 0);
+	lv_obj_add_style(rename_layer, &theme_style_screen, 0);
+	lv_obj_set_style_bg_opa(rename_layer, LV_OPA_COVER, 0);
+	lv_obj_set_style_border_width(rename_layer, 0, 0);
+	lv_obj_set_style_radius(rename_layer, 0, 0);
+	lv_obj_set_style_pad_all(rename_layer, 0, 0);
+	lv_obj_set_scrollable(rename_layer, false);
+	lv_obj_set_hidden(rename_layer, true);
+
+	lv_obj_t *heading = lv_label_create(rename_layer);
+	lv_label_set_text(heading, tr("rename"));
+	lv_obj_add_style(heading, &theme_style_text, 0);
+	lv_obj_set_style_text_font(heading, &font_ui_24, 0);
+	lv_obj_align(heading, LV_ALIGN_TOP_LEFT, cfg->padding, cfg->padding + cfg->top_bar_height + 10);
+
+	lv_obj_t *cancel = lv_btn_create(rename_layer);
+	lv_obj_set_size(cancel, RENAME_CANCEL_SIZE, RENAME_CANCEL_SIZE);
+	lv_obj_align(cancel, LV_ALIGN_TOP_RIGHT, -cfg->padding, cfg->padding + cfg->top_bar_height);
+	lv_obj_set_style_bg_opa(cancel, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_border_width(cancel, 0, 0);
+	lv_obj_set_style_shadow_width(cancel, 0, 0);
+	lv_obj_set_style_pad_all(cancel, 0, 0);
+	lv_obj_add_event_cb(cancel, rename_cancel_cb, LV_EVENT_CLICKED, NULL);
+
+	lv_obj_t *cancel_icon = lv_image_create(cancel);
+	lv_image_set_src(cancel_icon, &icon_close);
+	lv_obj_add_style(cancel_icon, &theme_style_icon, 0);
+	lv_obj_center(cancel_icon);
+
+	rename_field = lv_textarea_create(rename_layer);
+	lv_textarea_set_one_line(rename_field, true);
+	// One under bluez's own limit, so a name that fits the field is a name the
+	// device keeps whole.
+	lv_textarea_set_max_length(rename_field, BT_NAME_MAX - 1);
+	lv_textarea_set_placeholder_text(rename_field, tr("name"));
+	lv_obj_set_size(rename_field, cfg->screen_width - 2 * cfg->padding, 62);
+	lv_obj_set_scrollbar_mode(rename_field, LV_SCROLLBAR_MODE_OFF);
+	lv_obj_align(rename_field, LV_ALIGN_TOP_LEFT, cfg->padding, cfg->padding + cfg->top_bar_height + 60);
+	lv_obj_add_style(rename_field, &theme_style_card, 0);
+	lv_obj_set_style_radius(rename_field, 12, 0);
+	lv_obj_set_style_border_width(rename_field, 0, 0);
+	lv_obj_set_style_shadow_width(rename_field, 0, 0);
+	lv_obj_set_style_pad_all(rename_field, 14, 0);
+	lv_obj_set_style_text_font(rename_field, &font_ui_24, 0);
+	keyboard_style_caret(rename_field);
+
+	rename_keyboard =
+		keyboard_create(rename_layer, cfg->screen_width, 316, rename_field, NULL, "ok", rename_accept_cb, NULL);
+}
+
 static void row_free_cb(lv_event_t *e) { free(lv_event_get_user_data(e)); }
 
 static void remember_mac(const char *mac) { snprintf(menu_mac, sizeof(menu_mac), "%s", mac); }
@@ -216,15 +337,17 @@ static void show_device_menu(lv_obj_t *anchor, bool connected) {
 	if (connected) {
 		static const popover_item_t items[] = {
 			{"disconnect", disconnect_action, NULL},
+			{"rename", rename_action, NULL},
 			{"bt_forget", forget_action, NULL},
 		};
-		popover_show(anchor, items, 2);
+		popover_show(anchor, items, 3);
 	} else {
 		static const popover_item_t items[] = {
 			{"connect", connect_action, NULL},
+			{"rename", rename_action, NULL},
 			{"bt_forget", forget_action, NULL},
 		};
-		popover_show(anchor, items, 2);
+		popover_show(anchor, items, 3);
 	}
 }
 
@@ -607,6 +730,10 @@ static void screen_loaded_cb(lv_event_t *e) {
 
 static void screen_unloaded_cb(lv_event_t *e) {
 	(void)e;
+	// A sheet left open would greet the next visit.
+	if (rename_layer && !lv_obj_is_hidden(rename_layer)) {
+		rename_layer_hide();
+	}
 	lv_timer_pause(poll_timer);
 	bluetooth_set_discoverable(false);
 	if (bluetooth_scan_running()) {
@@ -707,6 +834,8 @@ void btsettings_init(gui_config_t *cfg) {
 	lv_obj_add_event_cb(btsettings_screen, switched_elsewhere_cb, LV_EVENT_REFRESH, NULL);
 	lv_obj_add_event_cb(btsettings_screen, screen_unloaded_cb, LV_EVENT_SCREEN_UNLOADED, NULL);
 	switcher_attach_back_gesture(btsettings_screen);
+
+	build_rename_layer(cfg);
 
 	refresh_status_label();
 	rebuild_lists();

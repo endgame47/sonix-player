@@ -137,6 +137,10 @@ bool btstack_trust(const char *address, bool on);
 // Adapter1.RemoveDevice: forgets the pairing and the link key.
 bool btstack_remove(const char *address);
 
+// The name this player shows a device under, kept by bluez with the pairing.
+// An empty alias gives the device back the name it announces itself.
+bool btstack_set_device_alias(const char *address, const char *alias);
+
 // ---------------------------------------------------------------------------
 // the audio path
 //

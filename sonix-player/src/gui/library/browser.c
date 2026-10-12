@@ -27,6 +27,7 @@
 #include "src/gui/shell/switcher.h"
 #include "src/gui/shell/theme.h"
 #include "src/system/library/cue.h"
+#include "src/system/library/folderorder.h"
 #include "src/system/playback/device_state.h"
 #include "src/gui/shell/toast.h"
 #include "src/system/playback/playlist.h"
@@ -124,6 +125,7 @@ static gui_config_t *config;
 typedef struct {
 	uint32_t name_offset; // what the row says
 	uint32_t file_offset; // what gets appended to the folder path
+	folder_place_t place; // where a track sits on its record
 	uint8_t is_dir;
 } entry_t;
 
@@ -210,6 +212,7 @@ static bool listing_add(listing_t *list, const char *name, const char *file, boo
 	}
 
 	list->entries[list->count].is_dir = is_dir ? 1 : 0;
+	memset(&list->entries[list->count].place, 0, sizeof(list->entries[list->count].place));
 	list->count++;
 
 	return true;
@@ -219,7 +222,9 @@ static bool listing_add(listing_t *list, const char *name, const char *file, boo
 // selection's gatherer both sort, each its own listing.
 static __thread const char *sort_pool;
 
-// Directories sort before files, otherwise alphabetical (case-insensitive).
+// Directories sort before files. Tracks go in the order of their record, by
+// disc and track number (folderorder.h), and whatever that does not decide is
+// alphabetical (case-insensitive).
 //
 // By the file and not by the label, which are the same string for everything
 // except a cue track -- and there the label starts with a track number, where
@@ -231,6 +236,11 @@ static int entry_cmp(const void *a, const void *b) {
 
 	if (ea->is_dir != eb->is_dir) {
 		return ea->is_dir ? -1 : 1;
+	}
+
+	int by_place = folderorder_cmp(&ea->place, &eb->place);
+	if (by_place) {
+		return by_place;
 	}
 
 	const char *fa = sort_pool + ea->file_offset;
@@ -1087,6 +1097,40 @@ static uint32_t ready_seq;
 
 static bool is_playable_file(const char *name);
 
+// Where each track of the listing sits on its record, for entry_cmp. The same
+// answer playlist_load_folder() gets for the queue, so the queue a tap starts
+// runs down the list as it is shown.
+static void listing_place_tracks(const char *path, listing_t *list) {
+	size_t files = 0;
+	for (size_t i = 0; i < list->count; i++) {
+		files += list->entries[i].is_dir ? 0 : 1;
+	}
+	if (files == 0) {
+		return;
+	}
+
+	const char **names = malloc(files * sizeof(*names));
+	size_t *index = malloc(files * sizeof(*index));
+	folder_place_t *places = malloc(files * sizeof(*places));
+	if (names && index && places) {
+		size_t n = 0;
+		for (size_t i = 0; i < list->count; i++) {
+			if (!list->entries[i].is_dir) {
+				names[n] = list->pool + list->entries[i].file_offset;
+				index[n] = i;
+				n++;
+			}
+		}
+		folderorder_places(path, names, n, true, places);
+		for (size_t i = 0; i < n; i++) {
+			list->entries[index[i]].place = places[i];
+		}
+	}
+	free(names);
+	free(index);
+	free(places);
+}
+
 // Reads one directory into `out`, sorted: its folders and what can be played
 // in it, as the browser lists them. `sheets` is a buffer for parsing its cue
 // sheets (NULL leaves them unsplit) and `claims` room for CUE_CLAIM_MAX names.
@@ -1228,6 +1272,8 @@ static bool list_directory(const char *path, listing_t *out, cue_sheet_t *sheets
 	if (skipped > 0) {
 		fprintf(stderr, "browser: '%s' holds more than %d entries, %zu not shown\n", path, MAX_ENTRIES, skipped);
 	}
+
+	listing_place_tracks(path, out);
 
 	sort_pool = out->pool;
 	qsort(out->entries, out->count, sizeof(*out->entries), entry_cmp);

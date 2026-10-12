@@ -16,6 +16,14 @@ IFACE=${WLBT_IFACE:-wlan0}
 MODDIR=${WLBT_MODDIR:-/module_driver}
 FWSRC=${WLBT_FWSRC:-/lib/firmware/wifi_bcm}
 FWDIR=/tmp/brcmfmac
+SCAN_ASSOC_TIME=${BRCMFMAC_SCAN_ASSOC_TIME:-20}
+case "$SCAN_ASSOC_TIME" in
+	1[0-9]|2[0-9]|3[0-9]|40) ;;
+	*)
+		echo "wlbt-wifi: invalid BRCMFMAC_SCAN_ASSOC_TIME '$SCAN_ASSOC_TIME'; using 20" >&2
+		SCAN_ASSOC_TIME=20
+		;;
+esac
 MAC_SCRIPT=/etc/init.d/S43wifi_bcm_init_config
 
 [ -e $RADIO/wifi_power ] || exit 0
@@ -48,7 +56,7 @@ wifi_up() {
 	echo -n $FWDIR > /sys/module/firmware_class/parameters/path
 
 	[ -d /sys/module/brcmutil ] || insmod $MODDIR/brcmutil.ko || return 1
-	[ -d /sys/module/brcmfmac ] || insmod $MODDIR/brcmfmac.ko || return 1
+	[ -d /sys/module/brcmfmac ] || insmod $MODDIR/brcmfmac.ko scan_assoc_time="$SCAN_ASSOC_TIME" || return 1
 
 	# The interface appears once the firmware is in the chip, after insmod
 	# returns.

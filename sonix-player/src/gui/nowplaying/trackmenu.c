@@ -391,7 +391,7 @@ static void details_fill(const char *file, const song_metadata_t *tags, int bits
 	details_add_row("trackmenu_title", tags->title[0] ? tags->title : (slash ? slash + 1 : file));
 	details_add_row("trackmenu_artist", tags->artist);
 	details_add_row("trackmenu_album_artist", tags->album_artist);
-	details_add_row("albums", tags->album);
+	details_add_row("trackmenu_album", tags->album);
 	details_add_row("genre", tags->genre);
 
 	if (tags->year > 0) {

@@ -22,9 +22,10 @@
 // Browser rows use slots 0..9; the library index pages (medialist.c) use
 // 12..23 for the name lists and 24..35 for the track lists; the search page
 // takes 36..59 -- its twelve track hits and twelve album hits; the audiobook
-// list takes 60..71 for its twelve rows; one artist's records take 72..83; and the
-// album carousel takes 84..89 -- so the pools never trample each other's requests.
-#define COVERLOADER_SLOTS 90
+// list takes 60..71 for its twelve rows; one artist's records take 72..83; the
+// album carousel takes 84..89; and the cover at the head of an album's tracks
+// takes 90 -- so the pools never trample each other's requests.
+#define COVERLOADER_SLOTS 91
 #define COVERLOADER_SEARCH_BASE 36
 #define COVERLOADER_SEARCH_COUNT 24
 #define COVERLOADER_AUDIOBOOKS_BASE 60
@@ -36,12 +37,23 @@
 // never more than six at a time, and only while its page is the one on screen.
 #define COVERLOADER_COVERFLOW_BASE 84
 
+// The big cover above an album's tracks, when the album page is laid out with
+// one (Music > Display options > Library). One picture, the size of most of the
+// screen's width.
+#define COVERLOADER_ALBUM_HEAD 90
+
 // Starts the worker. Safe to call more than once.
 void coverloader_start(void);
 
 // Asks for the artwork of `path` at `size` pixels, for `slot`. Returns
 // immediately. Any earlier request on this slot is abandoned.
 void coverloader_request(int slot, const char *path, int size);
+
+// The same, with the picture made from the player's own cover of the file at
+// player_w x player_h and scaled to `size` (cover_load_shared): the player's
+// table of covers serves it, and is filled by it. What an album's head asks
+// with.
+void coverloader_request_shared(int slot, const char *path, int size, int player_w, int player_h);
 
 // Forgets the slot: anything pending is abandoned and anything already decoded
 // for it is freed.

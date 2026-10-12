@@ -28,6 +28,7 @@
 #include "src/gui/shell/theme.h"
 #include "src/gui/shell/confirm.h"
 #include "src/gui/shell/toast.h"
+#include "src/gui/shell/topbar.h"
 
 lv_obj_t *medialist_screen;
 lv_obj_t *medialist_tracks_screen;
@@ -82,6 +83,54 @@ lv_obj_t *medialist_albums_screen;
 // How often finished artwork is collected while any is pending.
 #define THUMB_POLL_MS 150
 
+// Inside a record of more than one disc, a heading above the first track of
+// each: "Disc 2". This is the height it adds above that track's row.
+#define DISC_HEAD_PITCH 44
+// The gap between a heading and the row under it.
+#define DISC_HEAD_BELOW 12
+// More changes of disc than this is not a box set but tags in disarray, and a
+// list of headings with a track or two under each reads worse than none.
+#define DISC_HEAD_MAX 64
+// An album with more tracks than this is somebody's "Unknown album" holding
+// half the card: it gets neither headings nor track numbers.
+#define ALBUM_PLACES_MAX 3000
+
+// The head an album's page opens with in the alternative layout: the cover as
+// large as the width allows, and under it the title, the artist, the genre and
+// the year. It scrolls away with the rows.
+#define HEAD_COVER_SIZE 300
+#define HEAD_GAP 24		// between the head and the first row (or heading)
+#define HEAD_TITLE_LINES 2
+// The three ways to start the record, in a row under the year: shuffle, play
+// and one track at random into the queue -- what circle-play offers on the
+// other lists, out where the thumb is. Play is a filled pill with its name on
+// it, the other two bare glyphs either side.
+#define HEAD_BTN_SIDE 56
+#define HEAD_PLAY_HEIGHT 56
+#define HEAD_PLAY_PAD 40 // what the pill keeps either side of its word
+#define HEAD_BTN_GAP 20
+
+// Behind selection mode's buttons, while the head's cover can be under them:
+// the page's colour, part see-through, over a blur of whatever it covers.
+#define SEL_BLUR_RADIUS 18
+#define SEL_BLUR_PAD 6
+
+// The page in the sleeve's colour: one of the sleeve's colours
+// (cover_page_tone), at the brightness of the sleeve as a whole pushed away
+// from the middle, so the ink is never on a grey of its own colour. A light
+// sleeve makes a light page written in near-black, anything else a dark one
+// written in white.
+#define TINT_LIGHT_FROM COVER_PAGE_LIGHT_FROM // a sleeve this bright or brighter makes a light page
+#define TINT_LIGHT_MIN 180
+#define TINT_LIGHT_MAX 225
+#define TINT_DARK_MIN 28
+#define TINT_DARK_MAX 90
+#define TINT_SAT_MAX 176 // the most saturation a page keeps, out of 256
+// The track number that takes the place of the cover on each row of that
+// layout: one picture at the top says whose record it is, and the twelve
+// beneath it would only say it again.
+#define TRACKNO_WIDTH 44
+
 // ---------------------------------------------------------------------------
 // The A-Z strip
 //
@@ -129,6 +178,7 @@ typedef struct {
 typedef struct {
 	lv_obj_t *button;
 	lv_obj_t *icon;
+	lv_obj_t *number; // the track number, where the cover is, in the album head layout; NULL on name rows
 	lv_obj_t *text;	 // title and badge, stacked, so one does not sit on the other
 	lv_obj_t *label;
 	lv_obj_t *detail;	// the line under the title: the badge and the artist
@@ -158,6 +208,7 @@ typedef struct {
 	lv_obj_t *reverse_btn; // Favourites: the list reversed (newest first)
 	lv_obj_t *play_btn;	   // the circle-play corner button
 	lv_obj_t *play_menu;   // and the card it opens, one per screen
+	lv_obj_t *play_menu_random_album; // ...whose "albums in random order" row comes and goes
 	lv_obj_t *sort_btn;	   // A-Z / Z-A
 	lv_obj_t *sort_icon;
 	lv_obj_t *album_btn;   // tracks screen only: group an artist's tracks by album
@@ -209,6 +260,41 @@ typedef struct {
 	// so reopening the same list puts the user back where they were.
 	char signature[600];
 	int saved_scroll;
+
+	// Inside one album: what sits above the rows and between them. The rows
+	// are still the list's rows one for one -- row i is track i of the queue a
+	// tap starts -- and these only move them further down the page. See
+	// row_y().
+	int head_height;	  // the album head and the gap under it; 0 with no head
+	lv_obj_t *head;		  // the head: cover, title, artist, genre and year
+	lv_obj_t *head_cover;
+	lv_obj_t *head_title;
+	lv_obj_t *head_artist;
+	lv_obj_t *head_meta;
+	lv_obj_t *head_buttons[3]; // shuffle, play, a track into the queue
+	// Behind the heading row while the head is scrolled under it. With the head
+	// up, the list runs to the top of the page so the cover can stand level
+	// with the chevron, and the rows would otherwise pass under the heading.
+	lv_obj_t *head_bar;
+	lv_obj_t *sel_blur; // behind the corner in selection mode, over the cover
+	// The page in the sleeve's colours (see TINT_LIGHT_FROM), and those colours.
+	bool tinted;
+	lv_color_t tint_bg;		 // the page
+	lv_color_t tint_ink;	 // what is written on it
+	lv_color_t tint_dim;	 // ...the quieter lines
+	lv_color_t tint_card;	 // a row
+	lv_color_t tint_pressed; // a row under a finger, and the two small buttons
+	int head_title_top;	  // where the head's title starts, from the top of the list
+	bool head_titled;	  // the page heading shows the album's name: its title has scrolled away
+	bool head_cover_requested;
+	bool head_cover_settled;
+	bool head_has_cover;
+	cover_image_t head_image;
+	int *disc_first;	  // the first row of each disc, on a record of more than one
+	uint16_t *disc_no;	  // ...and which disc that row begins
+	lv_obj_t **disc_heads; // ...and the heading above it
+	int disc_count;
+	uint16_t *track_no;	  // each row's track number, in the head layout; NULL otherwise
 
 	// The A-Z strip down the right edge and the letter it shows in the middle
 	// of the screen while a finger is on it. index_row[] is the strip read from
@@ -300,6 +386,11 @@ static bool go_to_current;
 static bool show_artist;
 static int artist_lists = MEDIALIST_ARTIST_ALL;
 
+// "Alternative album view": an album's tracks open under a head with its cover,
+// title, artist, genre and year, and the rows carry track numbers instead of
+// covers. Off by default.
+static bool album_head;
+
 // Both are read on first use rather than in medialist_init(): the music
 // settings page is built before it (see gui_init), so a switch built from these
 // at init time would show the default rather than what the user chose, and then
@@ -315,6 +406,7 @@ static void load_view_settings(void) {
 	quality_badges = config_get_int("library", "quality_badges", 0) != 0;
 	show_artist = config_get_int("library", "show_artist", 0) != 0;
 	go_to_current = config_get_int("library", "go_to_current", 0) != 0;
+	album_head = config_get_int("library", "album_head", 0) != 0;
 	artist_lists = (int)config_get_int("library", "artist_lists", artist_lists);
 }
 
@@ -454,6 +546,12 @@ static void model_clear(panel_t *p) {
 
 static void index_rebuild(panel_t *p, bool enabled, bool descending);
 static void row_drop_thumb(panel_t *p, row_t *row);
+static void album_places_load(panel_t *p);
+static bool panel_is_album(const panel_t *p);
+static bool head_poll(panel_t *p);
+static int body_height(const panel_t *p);
+static int row_y(const panel_t *p, int index);
+static int row_at_y(const panel_t *p, int y);
 
 typedef struct {
 	panel_t *panel;
@@ -496,7 +594,12 @@ static void panel_refresh_stale(panel_t *p) {
 	for (int i = 0; i < ROW_POOL; i++) {
 		p->rows[i].index = -2;
 	}
-	lv_obj_set_height(p->body, p->count ? p->count * ROW_PITCH : ROW_PITCH);
+	// The album may have gained or lost a disc, and its numbers came from the
+	// rows that were there before.
+	if (panel_is_album(p)) {
+		album_places_load(p);
+	}
+	lv_obj_set_height(p->body, body_height(p));
 	if (p->count == 0) {
 		lv_obj_set_hidden(p->empty, false);
 	} else {
@@ -633,6 +736,65 @@ static bool load_row_cb(const char *name, const char *path, const char *artist, 
 
 static int row_slot(panel_t *p, const row_t *row) { return p->slot_base + (int)(row - p->rows); }
 
+// ---------------------------------------------------------------------------
+// Where a row sits
+//
+// A row is ROW_PITCH below the one before it, and that is the whole of it on
+// every list but one album's tracks, which may have the album head above the
+// first row and a disc heading above the first track of each disc. Everything
+// that turns a row into a height on the page, or a height back into a row,
+// goes through these two, so the headings cannot drift from the rows.
+// ---------------------------------------------------------------------------
+
+// How many disc headings sit above row `index`, its own included.
+static int disc_heads_through(const panel_t *p, int index) {
+	int n = 0;
+	while (n < p->disc_count && p->disc_first[n] <= index) {
+		n++;
+	}
+	return n;
+}
+
+// The top of row `index` on the page. `index` may be p->count: the end of the
+// last row, gap included.
+static int row_y(const panel_t *p, int index) {
+	return p->head_height + index * ROW_PITCH + disc_heads_through(p, index) * DISC_HEAD_PITCH;
+}
+
+// The row whose top is at or above `y`: the one a viewport starting at `y`
+// opens on, or the one under a finger at `y`. Clamped to the list.
+static int row_at_y(const panel_t *p, int y) {
+	if (p->count <= 0) {
+		return 0;
+	}
+	int index;
+	if (p->disc_count == 0) {
+		index = y < p->head_height ? 0 : (y - p->head_height) / ROW_PITCH;
+	} else {
+		int lo = 0;
+		int hi = p->count - 1;
+		while (lo < hi) {
+			int mid = lo + (hi - lo + 1) / 2;
+			if (row_y(p, mid) <= y) {
+				lo = mid;
+			} else {
+				hi = mid - 1;
+			}
+		}
+		index = lo;
+	}
+	return index > p->count - 1 ? p->count - 1 : index;
+}
+
+// The height of everything the list scrolls over.
+static int body_height(const panel_t *p) { return p->count > 0 ? row_y(p, p->count) : p->head_height + ROW_PITCH; }
+
+// One album's tracks, read from the index: the one list that can have a head
+// and disc headings.
+static bool panel_is_album(const panel_t *p) {
+	return !p->from_paths && p->kind == LIBRARY_LIST_TRACKS && p->filter == LIBRARY_FILTER_ALBUM;
+}
+
 // What a row shows before its artwork arrives, or instead of it. One glyph per
 // kind of name, rather than the same icon on every row: these lists are about
 // what kind of name they hold, and the glyph says that without reading the
@@ -647,6 +809,7 @@ static const lv_image_dsc_t *glyph_for(const panel_t *p) {
 	case LIBRARY_LIST_ALBUM_ARTISTS:
 		return &icon_artist_album;
 	case LIBRARY_LIST_GENRES:
+	case LIBRARY_LIST_YEARS:
 		return &icon_genre;
 	case LIBRARY_LIST_ALBUMS:
 		return &icon_album;
@@ -667,12 +830,14 @@ static void row_show_glyph(panel_t *p, row_t *row) {
 // and so do tracks.
 static bool panel_shows_icons(const panel_t *p) {
 	if (p->is_tracks) {
-		return true;
+		// Under the album head the rows carry their track numbers instead.
+		return p->track_no == NULL;
 	}
 	switch (p->kind) {
 	case LIBRARY_LIST_ARTISTS:
 	case LIBRARY_LIST_ALBUM_ARTISTS:
 	case LIBRARY_LIST_GENRES:
+	case LIBRARY_LIST_YEARS:
 		return false;
 	default:
 		return true;
@@ -720,6 +885,7 @@ static char np_album_value[300];
 static char np_artist[256];
 static char np_album_artist[256];
 static char np_genre[128];
+static char np_year[12];
 
 static void np_cache_refresh(void) {
 	device_state_t state;
@@ -730,6 +896,11 @@ static void np_cache_refresh(void) {
 	snprintf(np_artist, sizeof(np_artist), "%s", state.metadata.artist);
 	snprintf(np_album_artist, sizeof(np_album_artist), "%s", state.metadata.album_artist);
 	snprintf(np_genre, sizeof(np_genre), "%s", state.metadata.genre);
+	if (state.metadata.year > 0) {
+		snprintf(np_year, sizeof(np_year), "%d", state.metadata.year);
+	} else {
+		np_year[0] = '\0';
+	}
 	if (!np_path[0] || !library_track_album_value(np_path, np_album_value, sizeof(np_album_value))) {
 		np_album_value[0] = '\0';
 	}
@@ -776,6 +947,8 @@ static bool entry_is_now_playing(panel_t *p, int index) {
 		return np_album_artist[0] && strcmp(name, np_album_artist) == 0;
 	case LIBRARY_LIST_GENRES:
 		return np_genre[0] && strcmp(name, np_genre) == 0;
+	case LIBRARY_LIST_YEARS:
+		return np_year[0] && strcmp(name, np_year) == 0;
 	default:
 		return false;
 	}
@@ -785,10 +958,22 @@ static void row_update_playmark(panel_t *p, row_t *row) {
 	if (!row->playmark) {
 		return;
 	}
-	if (entry_is_now_playing(p, row->index)) {
+	bool playing = entry_is_now_playing(p, row->index);
+	if (playing) {
 		lv_obj_set_hidden(row->playmark, false);
 	} else {
 		lv_obj_set_hidden(row->playmark, true);
+	}
+	// The playing track's number in the accent as well, the way its cover
+	// would otherwise sit beside the mark.
+	if (row->number) {
+		if (p->tinted) {
+			lv_obj_set_style_text_color(row->number, playing ? p->tint_ink : p->tint_dim, 0);
+		} else if (playing) {
+			lv_obj_set_style_text_color(row->number, theme()->accent, 0);
+		} else {
+			lv_obj_remove_local_style_prop(row->number, LV_STYLE_TEXT_COLOR, 0);
+		}
 	}
 }
 
@@ -848,18 +1033,18 @@ static void row_update_quality(panel_t *p, row_t *row, const char *path) {
 }
 
 // Whether this list is one "Show artist" is on for: all the tracks, the albums
-// and the tracks inside one, a genre's albums and tracks, the favourites, or a
-// playlist. Not an artist's own lists, where the name is the page's title
+// and the tracks inside one, a year's or a genre's albums and tracks, the
+// favourites, or a playlist. Not an artist's own lists, where the name is the page's title
 // already, and not the name lists, whose rows are artists or genres themselves.
 static bool panel_shows_artist(const panel_t *p) {
 	if (!show_artist || p->from_paths) {
 		return false;
 	}
-	if (p->kind == LIBRARY_LIST_TRACKS && p->filter == LIBRARY_FILTER_NONE) {
+	if ((p->kind == LIBRARY_LIST_TRACKS && p->filter == LIBRARY_FILTER_NONE) || p->kind == LIBRARY_LIST_MOST_PLAYED) {
 		return (artist_lists & MEDIALIST_ARTIST_TRACKS) != 0;
 	}
-	if ((p->kind == LIBRARY_LIST_ALBUMS && p->filter == LIBRARY_FILTER_NONE) ||
-		(p->kind == LIBRARY_LIST_TRACKS && p->filter == LIBRARY_FILTER_ALBUM)) {
+	if ((p->kind == LIBRARY_LIST_ALBUMS && (p->filter == LIBRARY_FILTER_NONE || p->filter == LIBRARY_FILTER_YEAR)) ||
+		(p->kind == LIBRARY_LIST_TRACKS && (p->filter == LIBRARY_FILTER_ALBUM || p->filter == LIBRARY_FILTER_YEAR))) {
 		return (artist_lists & MEDIALIST_ARTIST_ALBUMS) != 0;
 	}
 	if ((p->kind == LIBRARY_LIST_TRACKS || p->kind == LIBRARY_LIST_ALBUMS) && p->filter == LIBRARY_FILTER_GENRE) {
@@ -908,15 +1093,15 @@ static void play_menu_hide(void);
 static library_filter_t filter_for(library_list_t kind);
 
 // The lists rows can be chosen on: tracks, albums, artists, album artists, a
-// playlist and the favourites, read from the index. Not genres, and not a list
-// handed in as paths.
+// playlist, the favourites and the most played, read from the index. Not
+// genres, and not a list handed in as paths.
 static bool panel_selectable(const panel_t *p) {
 	if (p->from_paths) {
 		return false;
 	}
 	return p->kind == LIBRARY_LIST_TRACKS || p->kind == LIBRARY_LIST_ALBUMS || p->kind == LIBRARY_LIST_ARTISTS ||
 		   p->kind == LIBRARY_LIST_ALBUM_ARTISTS || p->kind == LIBRARY_LIST_PLAYLIST ||
-		   p->kind == LIBRARY_LIST_FAVOURITES;
+		   p->kind == LIBRARY_LIST_FAVOURITES || p->kind == LIBRARY_LIST_MOST_PLAYED;
 }
 
 // What a row stands for in the selection: its position on a playlist, which
@@ -947,7 +1132,7 @@ static void row_update_selection(panel_t *p, row_t *row, const char *name, const
 	char buf[16];
 	bool chosen = p->selecting && sel_find(p, row_key(p, row->index, name, path, buf, sizeof(buf))) >= 0;
 	if (chosen) {
-		lv_obj_set_style_image_recolor(row->check, theme()->accent, 0);
+		lv_obj_set_style_image_recolor(row->check, p->tinted ? p->tint_ink : theme()->accent, 0);
 		lv_obj_set_hidden(row->check, false);
 	} else {
 		lv_obj_set_hidden(row->check, true);
@@ -1019,6 +1204,8 @@ static void sel_buttons_show(panel_t *p, bool on) {
 	show_if(p->sel_close_btn, on);
 }
 
+static void head_bar_update(panel_t *p);
+
 static void selection_stop(panel_t *p) {
 	if (!p->selecting) {
 		return;
@@ -1036,6 +1223,7 @@ static void selection_stop(panel_t *p) {
 	sel_buttons_show(p, false);
 	settingsrow_title_corner_slots(p->title_label, p->cfg, p->corner_slots);
 	rows_update_selection(p);
+	head_bar_update(p);
 }
 
 static void selection_start(panel_t *p) {
@@ -1058,6 +1246,7 @@ static void selection_start(panel_t *p) {
 	settingsrow_title_corner_slots(p->title_label, p->cfg, 4);
 	lv_obj_move_foreground(p->corner);
 	rows_update_selection(p);
+	head_bar_update(p);
 }
 
 // Chooses the row at `index`, or lets it go. Letting go of the last one leaves
@@ -1449,7 +1638,7 @@ static void row_bind(panel_t *p, row_t *row, int index) {
 	}
 
 	lv_obj_set_hidden(row->button, false);
-	lv_obj_set_y(row->button, index * ROW_PITCH);
+	lv_obj_set_y(row->button, row_y(p, index));
 	// An album row is named by its value -- name and key, see library.h -- and
 	// only the name is for reading.
 	char shown[sizeof(((winrow_t *)0)->name)];
@@ -1468,6 +1657,18 @@ static void row_bind(panel_t *p, row_t *row, int index) {
 	} else {
 		lv_obj_set_hidden(row->icon, true);
 	}
+	if (row->number) {
+		if (p->track_no) {
+			char number[8] = "";
+			if (p->track_no[index] > 0) {
+				snprintf(number, sizeof(number), "%u", (unsigned)p->track_no[index]);
+			}
+			lv_label_set_text(row->number, number);
+			lv_obj_set_hidden(row->number, false);
+		} else {
+			lv_obj_set_hidden(row->number, true);
+		}
+	}
 	row_update_playmark(p, row);
 	row_update_detail(p, row, index, path);
 	row_update_selection(p, row, name, path);
@@ -1476,6 +1677,10 @@ static void row_bind(panel_t *p, row_t *row, int index) {
 // Requests artwork for the visible rows and collects what the worker has
 // finished. Same loop as the browser's thumbs_update.
 static void thumbs_update(panel_t *p) {
+	if (head_poll(p)) {
+		lv_timer_resume(thumb_timer);
+	}
+
 	// No icons, no covers: loading thumbnails that would land in a hidden
 	// image is work for the worker and nothing else.
 	if (!panel_shows_icons(p)) {
@@ -1566,7 +1771,7 @@ static void window_update(panel_t *p) {
 		scroll = 0;
 	}
 
-	int first = (scroll / ROW_PITCH) - 1;
+	int first = row_at_y(p, scroll) - 1;
 	if (first + ROW_POOL > p->count) {
 		first = p->count - ROW_POOL;
 	}
@@ -1698,7 +1903,7 @@ static void model_remove(panel_t *p, int index) {
 		p->rows[i].index = -2;
 	}
 
-	lv_obj_set_height(p->body, p->count ? p->count * ROW_PITCH : ROW_PITCH);
+	lv_obj_set_height(p->body, body_height(p));
 	if (p->count == 0) {
 		lv_obj_set_hidden(p->empty, false);
 	}
@@ -1856,7 +2061,7 @@ static void index_go(panel_t *p, int slot) {
 		return;
 	}
 
-	lv_obj_scroll_to_y(p->list, row * ROW_PITCH, LV_ANIM_OFF);
+	lv_obj_scroll_to_y(p->list, row_y(p, row), LV_ANIM_OFF);
 	p->saved_scroll = lv_obj_get_scroll_y(p->list);
 	window_update(p);
 }
@@ -2151,10 +2356,13 @@ static void index_build(panel_t *p, gui_config_t *cfg) {
 	index_guard_note(p);
 }
 
+static void head_follow(panel_t *p);
+
 static void scroll_cb(lv_event_t *e) {
 	panel_t *p = lv_event_get_user_data(e);
 	p->saved_scroll = lv_obj_get_scroll_y(p->list);
 	index_flash(p);
+	head_follow(p);
 	window_update(p);
 }
 
@@ -2172,6 +2380,8 @@ static library_filter_t filter_for(library_list_t kind) {
 		return LIBRARY_FILTER_ALBUM_ARTIST;
 	case LIBRARY_LIST_GENRES:
 		return LIBRARY_FILTER_GENRE;
+	case LIBRARY_LIST_YEARS:
+		return LIBRARY_FILTER_YEAR;
 	default:
 		return LIBRARY_FILTER_NONE;
 	}
@@ -2276,10 +2486,10 @@ static void row_clicked_cb(lv_event_t *e) {
 		return;
 	}
 
-	// An artist or a genre: its records, or its tracks when the album view is
-	// off. An album: the tracks.
+	// An artist, a genre or a year: its records, or its tracks when the album
+	// view is off. An album: the tracks.
 	bool grouped = p->kind == LIBRARY_LIST_ARTISTS || p->kind == LIBRARY_LIST_ALBUM_ARTISTS ||
-				   p->kind == LIBRARY_LIST_GENRES;
+				   p->kind == LIBRARY_LIST_GENRES || p->kind == LIBRARY_LIST_YEARS;
 	bool artist_row = p->kind == LIBRARY_LIST_ARTISTS || p->kind == LIBRARY_LIST_ALBUM_ARTISTS;
 	if (grouped && (medialist_album_view() || (artist_row && artist_records))) {
 		medialist_open(name, LIBRARY_LIST_ALBUMS, filter_for(p->kind), name);
@@ -2379,7 +2589,7 @@ static void drop_line_show(panel_t *p, int before_index) {
 		lv_obj_set_parent(drop_line, p->body);
 	}
 	lv_obj_set_size(drop_line, lv_obj_get_width(p->body) - 2 * ROW_PAD, 4);
-	lv_obj_set_pos(drop_line, ROW_PAD, before_index * ROW_PITCH - ROW_GAP / 2 - 2);
+	lv_obj_set_pos(drop_line, ROW_PAD, row_y(p, before_index) - ROW_GAP / 2 - 2);
 	lv_obj_set_hidden(drop_line, false);
 	lv_obj_move_foreground(drop_line);
 }
@@ -2394,15 +2604,7 @@ static void drop_line_hide(void) {
 static int index_under(const panel_t *p, lv_coord_t y) {
 	lv_area_t body;
 	lv_obj_get_coords(p->body, &body);
-	int inside = (int)(y - body.y1);
-	int index = inside / ROW_PITCH;
-	if (index < 0) {
-		index = 0;
-	}
-	if (index > p->count - 1) {
-		index = p->count - 1;
-	}
-	return index;
+	return row_at_y(p, (int)(y - body.y1));
 }
 
 // Marks the row being carried, so the user can see which one they have. Runs
@@ -2507,7 +2709,7 @@ static void grip_cb(lv_event_t *e) {
 	}
 	if (step != 0) {
 		int scroll = lv_obj_get_scroll_y(p->list);
-		int limit = p->count * ROW_PITCH - lv_obj_get_height(p->list);
+		int limit = body_height(p) - lv_obj_get_height(p->list);
 		if (limit < 0) {
 			limit = 0;
 		}
@@ -2764,7 +2966,8 @@ static library_index_t *menu_tracks_open(panel_t *p) {
 	window_update(p);
 
 	library_index_t *ix = NULL;
-	if (p->kind == LIBRARY_LIST_TRACKS || p->kind == LIBRARY_LIST_FAVOURITES || p->kind == LIBRARY_LIST_PLAYLIST) {
+	if (p->kind == LIBRARY_LIST_TRACKS || p->kind == LIBRARY_LIST_FAVOURITES || p->kind == LIBRARY_LIST_PLAYLIST ||
+		p->kind == LIBRARY_LIST_MOST_PLAYED) {
 		ix = library_index_clone(p->ix);
 	} else if (p->kind == LIBRARY_LIST_ALBUMS) {
 		ix = library_index_open(LIBRARY_LIST_TRACKS, p->filter, p->filter_value[0] ? p->filter_value : NULL,
@@ -2786,6 +2989,12 @@ static library_index_t *menu_tracks_open(panel_t *p) {
 // to be the end of, and a leftover name from an earlier list would send the
 // chaining off after the wrong one.
 static void stamp_last_album(const panel_t *p) {
+	// One album's tracks end on that album, as they do when a row of it is
+	// tapped (row_clicked_cb).
+	if (p->kind == LIBRARY_LIST_TRACKS && p->filter == LIBRARY_FILTER_ALBUM && !p->from_paths) {
+		playlist_set_album(p->filter_value);
+		return;
+	}
 	const char *name = NULL;
 	if (p->kind == LIBRARY_LIST_ALBUMS && p->count > 0 && row_at((panel_t *)p, p->count - 1, &name, NULL) && name &&
 		name[0]) {
@@ -2874,12 +3083,9 @@ static void play_menu_sequence_cb(lv_event_t *e) {
 	play_artist(p, false);
 }
 
-// One of the artist's tracks, chosen at random, put after what is playing.
+// One of the list's tracks, chosen at random, put after what is playing.
 // Reads the one row it needs out of the handle rather than the whole list.
-static void play_menu_random_track_cb(lv_event_t *e) {
-	(void)e;
-	panel_t *p = play_menu_panel;
-	play_menu_hide();
+static void queue_random_track(panel_t *p) {
 	if (!p) {
 		return;
 	}
@@ -2907,8 +3113,36 @@ static void play_menu_random_track_cb(lv_event_t *e) {
 
 	if (path[0] && playlist_insert_next(path)) {
 		device_state_queue_changed();
-		toast_success("added_to_the_queue");
+		// Said in full: "added to the queue" alone, after a button that stands
+		// beside Play under an album's cover, reads as the whole album added.
+		toast_success("medialist_random_track_queued");
 	}
+}
+
+static void play_menu_random_track_cb(lv_event_t *e) {
+	(void)e;
+	panel_t *p = play_menu_panel;
+	play_menu_hide();
+	queue_random_track(p);
+}
+
+// One of the records on screen at random, its tracks in order, and the records
+// after it at random too (device_state_play_random_album). In order, whatever
+// the mode was: a mode changed while it plays then carries on to the records
+// after it, as any mode does.
+static void play_menu_random_album_cb(lv_event_t *e) {
+	(void)e;
+	panel_t *p = play_menu_panel;
+	play_menu_hide();
+	if (!p || p->kind != LIBRARY_LIST_ALBUMS) {
+		return;
+	}
+	playlist_set_mode(PLAYBACK_MODE_NORMAL);
+	if (!device_state_play_random_album(p->filter, p->filter_value[0] ? p->filter_value : NULL)) {
+		return;
+	}
+	player_refresh_now_playing();
+	switch_screen(player_screen);
 }
 
 static void play_menu_dismiss_cb(lv_event_t *e) {
@@ -2968,6 +3202,7 @@ static void play_menu_build(panel_t *p) {
 
 	play_menu_row(card, "medialist_play_in_random_order", play_menu_shuffle_cb);
 	play_menu_row(card, "medialist_play_in_sequence", play_menu_sequence_cb);
+	p->play_menu_random_album = play_menu_row(card, "medialist_play_albums_in_random_order", play_menu_random_album_cb);
 	play_menu_row(card, "medialist_queue_random_track", play_menu_random_track_cb);
 }
 
@@ -2979,6 +3214,12 @@ static void play_menu_clicked_cb(lv_event_t *e) {
 	if (!p->play_menu) {
 		play_menu_build(p);
 	}
+	// Records in random order only where there are records to choose between,
+	// and only with the option that plays one record after another: without it
+	// the choice would be one record at random and then silence.
+	bool random_albums = p->kind == LIBRARY_LIST_ALBUMS && !p->from_paths && p->count >= 2 &&
+						 device_state_album_chaining();
+	lv_obj_set_hidden(p->play_menu_random_album, !random_albums);
 	play_menu_panel = p;
 	lv_obj_set_hidden(p->play_menu, false);
 	lv_obj_move_foreground(p->play_menu);
@@ -3190,6 +3431,19 @@ static void screen_loaded_cb(lv_event_t *e) {
 	}
 }
 
+// Rounds the blur behind selection mode's buttons to the pill's own corners.
+//
+// LVGL 9.6 hands the backdrop blur the corner radius of a rectangle
+// descriptor it has not filled in yet (lv_obj.c, LV_EVENT_DRAW_MAIN), so the
+// blur always comes out square and its corners show past the pill's rounded
+// ones. The blur task is put right here as it is added, before it is drawn.
+static void sel_blur_round_cb(lv_event_t *e) {
+	lv_draw_blur_dsc_t *blur = lv_draw_task_get_blur_dsc(lv_event_get_draw_task(e));
+	if (blur) {
+		blur->corner_radius = lv_obj_get_style_radius(lv_event_get_current_target(e), LV_PART_MAIN);
+	}
+}
+
 static void build_panel(panel_t *p, gui_config_t *cfg, bool is_tracks, int slot_base) {
 	p->cfg = cfg;
 	p->is_tracks = is_tracks;
@@ -3217,6 +3471,48 @@ static void build_panel(panel_t *p, gui_config_t *cfg, bool is_tracks, int slot_
 	lv_obj_set_scroll_dir(p->list, LV_DIR_VER);
 	lv_obj_set_scrollbar_mode(p->list, LV_SCROLLBAR_MODE_AUTO);
 	lv_obj_add_event_cb(p->list, scroll_cb, LV_EVENT_SCROLL, p);
+
+	// The bar behind the heading row for an album under its head (see
+	// head_follow). Only the track lists have albums.
+	p->head_bar = NULL;
+	if (is_tracks) {
+		p->head_bar = lv_obj_create(p->screen);
+		lv_obj_remove_style_all(p->head_bar);
+		lv_obj_add_style(p->head_bar, &theme_style_screen, 0);
+		lv_obj_set_style_bg_opa(p->head_bar, LV_OPA_COVER, 0);
+		lv_obj_set_size(p->head_bar, cfg->screen_width, content_top - cfg->top_bar_height);
+		lv_obj_align(p->head_bar, LV_ALIGN_TOP_LEFT, 0, cfg->top_bar_height);
+		lv_obj_set_scrollable(p->head_bar, false);
+		// It takes the presses on it, so a row passing under the heading is not
+		// tapped through it; the page's own gestures still start there.
+		lv_obj_set_clickable(p->head_bar, true);
+		player_sheet_attach_drag(p->head_bar, true);
+		switcher_attach_back_gesture(p->head_bar);
+		lv_obj_set_hidden(p->head_bar, true);
+	}
+
+	// What selection mode's buttons stand on over an album's cover (see
+	// head_bar_update): the size of the four of them, a little more round.
+	p->sel_blur = NULL;
+	if (is_tracks) {
+		int shelf = CORNER_MAX_BUTTONS * CORNER_BUTTON_SIZE + (CORNER_MAX_BUTTONS - 1) * CORNER_GAP;
+		p->sel_blur = lv_obj_create(p->screen);
+		lv_obj_remove_style_all(p->sel_blur);
+		lv_obj_add_style(p->sel_blur, &theme_style_screen, 0);
+		lv_obj_set_style_bg_opa(p->sel_blur, LV_OPA_40, 0);
+		lv_obj_set_style_radius(p->sel_blur, LV_RADIUS_CIRCLE, 0);
+		lv_obj_set_send_draw_task_events(p->sel_blur, true);
+		lv_obj_add_event_cb(p->sel_blur, sel_blur_round_cb, LV_EVENT_DRAW_TASK_ADDED, NULL);
+		lv_obj_set_style_blur_radius(p->sel_blur, SEL_BLUR_RADIUS, 0);
+		lv_obj_set_style_blur_backdrop(p->sel_blur, true, 0);
+		lv_obj_set_style_blur_quality(p->sel_blur, LV_BLUR_QUALITY_SPEED, 0);
+		lv_obj_set_size(p->sel_blur, shelf + 2 * SEL_BLUR_PAD, CORNER_BUTTON_SIZE + 2 * SEL_BLUR_PAD);
+		lv_obj_align(p->sel_blur, LV_ALIGN_TOP_RIGHT, -cfg->padding + SEL_BLUR_PAD,
+					 cfg->padding + cfg->top_bar_height - SEL_BLUR_PAD);
+		lv_obj_set_scrollable(p->sel_blur, false);
+		lv_obj_set_clickable(p->sel_blur, false);
+		lv_obj_set_hidden(p->sel_blur, true);
+	}
 
 	p->body = lv_obj_create(p->list);
 	lv_obj_set_width(p->body, width);
@@ -3323,6 +3619,21 @@ static void build_panel(panel_t *p, gui_config_t *cfg, bool is_tracks, int slot_
 		row->icon = lv_image_create(row->button);
 		lv_obj_set_size(row->icon, THUMB_SIZE, THUMB_SIZE);
 		lv_image_set_inner_align(row->icon, LV_IMAGE_ALIGN_CENTER);
+
+		// Beside the icon, and only one of the two showing at a time: an
+		// album's track numbers in the head layout, the cover everywhere
+		// else.
+		row->number = NULL;
+		if (is_tracks) {
+			row->number = lv_label_create(row->button);
+			lv_label_set_text(row->number, "");
+			lv_obj_set_width(row->number, TRACKNO_WIDTH);
+			lv_obj_set_style_text_align(row->number, LV_TEXT_ALIGN_CENTER, 0);
+			lv_obj_add_style(row->number, &theme_style_text_dim, 0);
+			lv_obj_set_style_text_font(row->number, &font_ui_24, 0);
+			lv_obj_set_clickable(row->number, false);
+			lv_obj_set_hidden(row->number, true);
+		}
 
 		// The title, and under it the quality badge and the artist. A column
 		// rather than the label alone: with those in the row itself they would
@@ -3459,6 +3770,680 @@ static void build_panel(panel_t *p, gui_config_t *cfg, bool is_tracks, int slot_
 }
 
 // ---------------------------------------------------------------------------
+// One album: the disc headings and the album head
+// ---------------------------------------------------------------------------
+
+static void disc_heads_clear(panel_t *p) {
+	for (int i = 0; i < p->disc_count; i++) {
+		if (p->disc_heads && p->disc_heads[i]) {
+			lv_obj_delete(p->disc_heads[i]);
+		}
+	}
+	free(p->disc_heads);
+	free(p->disc_first);
+	free(p->disc_no);
+	p->disc_heads = NULL;
+	p->disc_first = NULL;
+	p->disc_no = NULL;
+	p->disc_count = 0;
+	free(p->track_no);
+	p->track_no = NULL;
+}
+
+// Every heading put back above the first row of its disc. Their places move
+// with the album head, so this runs whenever the head is built or taken away.
+static void disc_heads_place(panel_t *p) {
+	for (int i = 0; i < p->disc_count; i++) {
+		lv_obj_t *head = p->disc_heads[i];
+		int line = lv_font_get_line_height(lv_obj_get_style_text_font(head, 0));
+		lv_obj_set_pos(head, ROW_PAD, row_y(p, p->disc_first[i]) - DISC_HEAD_BELOW - line);
+	}
+}
+
+// Reads where every track of the album sits on its record and, on a record of
+// more than one disc, puts a heading above the first track of each. With the
+// album head on, the track numbers are kept for the rows as well.
+//
+// Nothing here changes which rows the list has or their order: the rows are
+// the handle's, and a heading is only space above one of them. When the index
+// and the list disagree about how many tracks the album has -- a scan between
+// the two reads -- the list stays plain rather than putting a heading over the
+// wrong row.
+static void album_places_load(panel_t *p) {
+	disc_heads_clear(p);
+	if (p->count <= 0 || p->count > ALBUM_PLACES_MAX) {
+		return;
+	}
+
+	uint16_t *disc = malloc((size_t)p->count * sizeof(*disc));
+	uint16_t *track = malloc((size_t)p->count * sizeof(*track));
+	if (!disc || !track ||
+		library_album_places(p->filter_value, disc, track, p->count) != p->count) {
+		free(disc);
+		free(track);
+		return;
+	}
+
+	int runs = 1;
+	for (int i = 1; i < p->count; i++) {
+		if (disc[i] != disc[i - 1]) {
+			runs++;
+		}
+	}
+
+	if (runs >= 2 && runs <= DISC_HEAD_MAX) {
+		p->disc_first = malloc((size_t)runs * sizeof(*p->disc_first));
+		p->disc_no = malloc((size_t)runs * sizeof(*p->disc_no));
+		p->disc_heads = calloc((size_t)runs, sizeof(*p->disc_heads));
+		if (p->disc_first && p->disc_no && p->disc_heads) {
+			int n = 0;
+			for (int i = 0; i < p->count; i++) {
+				if (i == 0 || disc[i] != disc[i - 1]) {
+					p->disc_first[n] = i;
+					p->disc_no[n] = disc[i];
+					n++;
+				}
+			}
+			for (int i = 0; i < runs; i++) {
+				char text[64];
+				snprintf(text, sizeof(text), "%s %u", tr("medialist_disc"), (unsigned)p->disc_no[i]);
+				lv_obj_t *head = lv_label_create(p->body);
+				lv_label_set_text(head, text);
+				lv_obj_add_style(head, &theme_style_text_dim, 0);
+				lv_obj_set_style_text_font(head, &font_ui_20_bold, 0);
+				if (p->tinted) {
+					lv_obj_set_style_text_color(head, p->tint_dim, 0);
+				}
+				lv_obj_set_clickable(head, false);
+				p->disc_heads[i] = head;
+				p->disc_count = i + 1;
+			}
+			disc_heads_place(p);
+		} else {
+			free(p->disc_first);
+			free(p->disc_no);
+			free(p->disc_heads);
+			p->disc_first = NULL;
+			p->disc_no = NULL;
+			p->disc_heads = NULL;
+		}
+	}
+	free(disc);
+
+	if (album_head) {
+		p->track_no = track;
+	} else {
+		free(track);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The page in the sleeve's colours
+// ---------------------------------------------------------------------------
+
+static void local_color(lv_obj_t *obj, lv_style_prop_t prop, lv_style_selector_t selector, bool on, lv_color_t color) {
+	if (!obj) {
+		return;
+	}
+	if (on) {
+		lv_style_value_t value = {.color = color};
+		lv_obj_set_local_style_prop(obj, prop, value, selector);
+	} else {
+		lv_obj_remove_local_style_prop(obj, prop, selector);
+	}
+}
+
+static int tint_luma(lv_color_t c) { return (c.red * 299 + c.green * 587 + c.blue * 114) / 1000; }
+
+// Works the page's colours out of the sleeve on the head. False when there is
+// no sleeve to take them from.
+static bool tint_from_cover(panel_t *p) {
+	if (!p->head_has_cover) {
+		return false;
+	}
+	// Kept with the picture by the loader, so an album opened before does not
+	// have its colours worked out again.
+	uint32_t tone;
+	int luma;
+	bool light;
+	if (p->head_image.has_tone) {
+		tone = p->head_image.tone;
+		luma = p->head_image.tone_luma;
+		light = p->head_image.tone_light;
+	} else if (!cover_page_tone(&p->head_image, TINT_LIGHT_FROM, &tone, &luma, &light)) {
+		return false;
+	}
+
+	int r = (int)((tone >> 16) & 0xFF), g = (int)((tone >> 8) & 0xFF), b = (int)(tone & 0xFF);
+
+	// A light page is never darker than its colour: a yellow taken down to
+	// the sleeve's brightness turns to mustard.
+	int now = (r * 299 + g * 587 + b * 114) / 1000;
+	int want = light ? LV_CLAMP(TINT_LIGHT_MIN, LV_MAX(luma, now), TINT_LIGHT_MAX)
+					 : LV_CLAMP(TINT_DARK_MIN, luma * 3 / 4, TINT_DARK_MAX);
+
+	// To that brightness without moving the hue: down by a plain ratio, up by
+	// walking every channel the same fraction of the way to white.
+	if (now > want && now > 0) {
+		r = r * want / now;
+		g = g * want / now;
+		b = b * want / now;
+	} else if (now < want && now < 255) {
+		int step = (want - now) * 255 / (255 - now);
+		r += (255 - r) * step / 255;
+		g += (255 - g) * step / 255;
+		b += (255 - b) * step / 255;
+	}
+
+	// And no more saturated than TINT_SAT_MAX: a sleeve of pure red or green
+	// at full strength is a poster, not a page to read a track list on. The
+	// strongest channel stays where it is and the others come up towards it.
+	int hi = LV_MAX(r, LV_MAX(g, b));
+	int lo = LV_MIN(r, LV_MIN(g, b));
+	if (hi > 0 && (hi - lo) * 256 > hi * TINT_SAT_MAX) {
+		int keep = TINT_SAT_MAX * hi; // the spread wanted, times 256
+		int spread = (hi - lo) * 256;
+		r = hi - (hi - r) * keep / spread;
+		g = hi - (hi - g) * keep / spread;
+		b = hi - (hi - b) * keep / spread;
+	}
+
+	p->tint_bg = lv_color_make((uint8_t)LV_CLAMP(0, r, 255), (uint8_t)LV_CLAMP(0, g, 255), (uint8_t)LV_CLAMP(0, b, 255));
+	// The ink from the colour actually reached, not from the plan: the two
+	// agree, and if they ever did not the text would still be readable.
+	p->tint_ink = tint_luma(p->tint_bg) >= TINT_LIGHT_FROM ? lv_color_hex(0x161616) : lv_color_white();
+	p->tint_dim = lv_color_mix(p->tint_ink, p->tint_bg, 166);
+	p->tint_card = lv_color_mix(p->tint_ink, p->tint_bg, 22);
+	p->tint_pressed = lv_color_mix(p->tint_ink, p->tint_bg, 48);
+	return true;
+}
+
+// The head's own parts, in the sleeve's colours or the theme's.
+static void head_paint(panel_t *p) {
+	if (!p->head) {
+		return;
+	}
+	bool t = p->tinted;
+	local_color(p->head_title, LV_STYLE_TEXT_COLOR, 0, t, p->tint_ink);
+	if (p->head_artist) {
+		// The artist in the accent, as the theme has it, or in the ink.
+		lv_obj_set_style_text_color(p->head_artist, t ? p->tint_ink : theme()->accent, 0);
+	}
+	local_color(p->head_meta, LV_STYLE_TEXT_COLOR, 0, t, p->tint_dim);
+
+	for (int i = 0; i < 3; i++) {
+		lv_obj_t *button = p->head_buttons[i];
+		if (!button) {
+			continue;
+		}
+		lv_obj_t *inside = lv_obj_get_child(button, 0);
+		if (i == 1) {
+			// Filled: the accent with white type, or the ink with the page's
+			// colour cut out of it.
+			lv_obj_set_style_bg_color(button, t ? p->tint_ink : theme()->accent, 0);
+			lv_obj_set_style_text_color(inside, t ? p->tint_bg : lv_color_white(), 0);
+		} else {
+			local_color(inside, LV_STYLE_IMAGE_RECOLOR, 0, t, p->tint_ink);
+		}
+	}
+}
+
+// Everything on the page that is not drawn fresh for each album -- the screen,
+// the heading, the pooled rows, the corner, the chevron -- in the sleeve's
+// colours while p->tinted, and back in the theme's when it is not.
+static void page_paint(panel_t *p) {
+	bool t = p->tinted;
+	local_color(p->screen, LV_STYLE_BG_COLOR, 0, t, p->tint_bg);
+	local_color(p->head_bar, LV_STYLE_BG_COLOR, 0, t, p->tint_bg);
+	local_color(p->title_label, LV_STYLE_TEXT_COLOR, 0, t, p->tint_ink);
+
+	for (int i = 0; i < ROW_POOL; i++) {
+		row_t *row = &p->rows[i];
+		local_color(row->button, LV_STYLE_BG_COLOR, 0, t, p->tint_card);
+		local_color(row->button, LV_STYLE_BG_COLOR, LV_STATE_PRESSED, t, p->tint_pressed);
+		local_color(row->label, LV_STYLE_TEXT_COLOR, 0, t, p->tint_ink);
+		local_color(row->artist, LV_STYLE_TEXT_COLOR, 0, t, p->tint_dim);
+		local_color(row->playmark, LV_STYLE_BG_COLOR, 0, t, p->tint_ink);
+		if (row->menu_btn) {
+			local_color(lv_obj_get_child(row->menu_btn, 0), LV_STYLE_IMAGE_RECOLOR, 0, t, p->tint_ink);
+		}
+		row_update_playmark(p, row); // the number's colour depends on the mark
+		if (!lv_obj_is_hidden(row->check)) {
+			lv_obj_set_style_image_recolor(row->check, t ? p->tint_ink : theme()->accent, 0);
+		}
+	}
+
+	for (int i = 0; i < p->disc_count; i++) {
+		local_color(p->disc_heads[i], LV_STYLE_TEXT_COLOR, 0, t, p->tint_dim);
+	}
+
+	// Selection mode's buttons are the corner's only ones on this page.
+	lv_obj_t *corner[] = {p->sel_queue_btn, p->sel_fav_btn,	  p->sel_add_btn,
+						  p->sel_unfav_btn, p->sel_unlist_btn, p->sel_close_btn};
+	for (size_t i = 0; i < sizeof(corner) / sizeof(corner[0]); i++) {
+		if (corner[i]) {
+			local_color(lv_obj_get_child(corner[i], 0), LV_STYLE_IMAGE_RECOLOR, 0, t, p->tint_ink);
+		}
+	}
+
+	local_color(p->sel_blur, LV_STYLE_BG_COLOR, 0, t, p->tint_bg);
+
+	back_btn_tint_on_screen(p->screen, t, p->tint_ink);
+
+	// The status bar a shade darker than the page, as the theme's own is, with
+	// its ink worked out for that shade.
+	lv_color_t bar = lv_color_darken(p->tint_bg, LV_OPA_20);
+	lv_color_t bar_ink = tint_luma(bar) >= TINT_LIGHT_FROM ? lv_color_hex(0x161616) : lv_color_white();
+	topbar_tint_on_screen(p->screen, t, bar, bar_ink);
+
+	head_paint(p);
+}
+
+// ---------------------------------------------------------------------------
+// The album head
+// ---------------------------------------------------------------------------
+
+// Where the list starts: under the heading row as on every other page, or with
+// the head up at the top of the page, under the status bar only, so the cover
+// stands level with the chevron.
+static void list_place(panel_t *p, bool under_status_bar_only) {
+	int top = under_status_bar_only ? (int)p->cfg->top_bar_height : settingsrow_content_top(p->cfg);
+	lv_obj_set_size(p->list, p->cfg->screen_width, p->cfg->screen_height - top);
+	lv_obj_align(p->list, LV_ALIGN_TOP_LEFT, 0, top);
+}
+
+// Takes the head away, gives the page heading back the album's name it was
+// keeping empty and the page back its theme colours.
+static void head_clear(panel_t *p) {
+	coverloader_release(COVERLOADER_ALBUM_HEAD);
+	if (p->head) {
+		lv_obj_delete(p->head); // the picture goes before its pixels do
+		p->head = NULL;
+		p->head_cover = NULL;
+		p->head_title = NULL;
+		p->head_artist = NULL;
+		p->head_meta = NULL;
+		for (int i = 0; i < 3; i++) {
+			p->head_buttons[i] = NULL;
+		}
+		lv_label_set_text(p->title_label, p->title);
+		list_place(p, false);
+	}
+	if (p->head_bar) {
+		lv_obj_set_hidden(p->head_bar, true);
+	}
+	if (p->sel_blur) {
+		lv_obj_set_hidden(p->sel_blur, true);
+	}
+	if (p->tinted) {
+		p->tinted = false;
+		page_paint(p);
+	}
+	if (p->head_has_cover) {
+		cover_free(&p->head_image);
+		p->head_has_cover = false;
+	}
+	p->head_cover_requested = false;
+	p->head_cover_settled = false;
+	p->head_height = 0;
+	p->head_title_top = 0;
+	p->head_titled = false;
+}
+
+// The head is in the theme's colours, which are hand-set on the artist and the
+// play button, so it is painted again after a change of theme.
+static void head_theme_refresh(void) {
+	if (panel_tracks.head) {
+		head_paint(&panel_tracks);
+	}
+}
+
+// One line of the head: centred, `width` wide, cut with dots after `lines`
+// lines.
+static lv_obj_t *head_line(lv_obj_t *parent, int width, const char *text, const lv_font_t *font, int lines) {
+	lv_obj_t *label = lv_label_create(parent);
+	lv_label_set_text(label, text);
+	lv_obj_set_width(label, LV_PCT(100));
+	lv_obj_set_style_text_font(label, font, 0);
+	lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+	lv_obj_set_clickable(label, false);
+
+	// As many lines as the text needs, up to `lines`: a fixed height of two
+	// would leave a blank line under every short title.
+	lv_point_t size;
+	lv_text_get_size(&size, text, font, 0, 0, width, LV_TEXT_FLAG_NONE);
+	int line = lv_font_get_line_height(font);
+	int needed = line > 0 ? (size.y + line - 1) / line : 1;
+	if (needed < 1) {
+		needed = 1;
+	}
+	if (needed > lines) {
+		needed = lines;
+	}
+	lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+	lv_obj_set_height(label, needed * line);
+	return label;
+}
+
+static void play_artist(panel_t *p, bool shuffled);
+static void queue_random_track(panel_t *p);
+static void show_corner(lv_obj_t *btn, bool shown);
+
+// The head's three buttons, each one of the circle-play menu's choices.
+static void head_shuffle_cb(lv_event_t *e) {
+	if (player_sheet_drag_active() || switcher_back_drag_active()) {
+		return;
+	}
+	play_artist(lv_event_get_user_data(e), true);
+}
+
+static void head_play_cb(lv_event_t *e) {
+	if (player_sheet_drag_active() || switcher_back_drag_active()) {
+		return;
+	}
+	play_artist(lv_event_get_user_data(e), false);
+}
+
+static void head_queue_cb(lv_event_t *e) {
+	if (player_sheet_drag_active() || switcher_back_drag_active()) {
+		return;
+	}
+	queue_random_track(lv_event_get_user_data(e));
+}
+
+// A bare glyph: shuffle, and a track into the queue. Pressed, it dims.
+static lv_obj_t *head_glyph_button(lv_obj_t *parent, const lv_image_dsc_t *glyph, lv_event_cb_t cb, panel_t *p) {
+	lv_obj_t *button = lv_btn_create(parent);
+	lv_obj_set_size(button, HEAD_BTN_SIDE, HEAD_BTN_SIDE);
+	lv_obj_set_style_bg_opa(button, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_border_width(button, 0, 0);
+	lv_obj_set_style_shadow_width(button, 0, 0);
+	lv_obj_set_style_pad_all(button, 0, 0);
+	lv_obj_set_style_opa(button, LV_OPA_50, LV_STATE_PRESSED);
+	lv_obj_set_event_bubble(button, true); // a swipe across it still scrolls or goes back
+	lv_obj_add_event_cb(button, cb, LV_EVENT_CLICKED, p);
+
+	lv_obj_t *image = lv_image_create(button);
+	lv_image_set_src(image, glyph);
+	lv_obj_add_style(image, &theme_style_icon, 0);
+	lv_obj_set_style_image_recolor_opa(image, LV_OPA_COVER, 0);
+	lv_obj_set_clickable(image, false);
+	lv_obj_center(image);
+	return button;
+}
+
+// Play: a filled pill with the word on it, as wide as the word needs.
+static lv_obj_t *head_play_button(lv_obj_t *parent, lv_event_cb_t cb, panel_t *p) {
+	lv_obj_t *button = lv_btn_create(parent);
+	lv_obj_set_size(button, LV_SIZE_CONTENT, HEAD_PLAY_HEIGHT);
+	lv_obj_set_style_bg_opa(button, LV_OPA_COVER, 0);
+	lv_obj_set_style_radius(button, LV_RADIUS_CIRCLE, 0);
+	lv_obj_set_style_border_width(button, 0, 0);
+	lv_obj_set_style_shadow_width(button, 0, 0);
+	lv_obj_set_style_pad_hor(button, HEAD_PLAY_PAD, 0);
+	lv_obj_set_style_pad_ver(button, 0, 0);
+	lv_obj_set_style_opa(button, LV_OPA_70, LV_STATE_PRESSED);
+	lv_obj_set_event_bubble(button, true);
+	lv_obj_add_event_cb(button, cb, LV_EVENT_CLICKED, p);
+
+	lv_obj_t *label = lv_label_create(button);
+	lv_label_set_text(label, tr("medialist_play"));
+	lv_obj_set_style_text_font(label, &font_ui_24_bold, 0);
+	lv_obj_set_clickable(label, false);
+	lv_obj_center(label);
+	return button;
+}
+
+// The head above an album's tracks: its cover, title, artist, genre and year,
+// and the three ways to start it. Built for the album being opened and thrown
+// away with it.
+static void head_build(panel_t *p) {
+	head_clear(p);
+
+	library_album_info_t info;
+	library_album_info(p->filter_value, &info);
+
+	int width = (int)p->cfg->screen_width - 2 * (int)p->cfg->padding;
+
+	// The list up to the status bar, so the head starts on the chevron's row.
+	// The heading and the corner are brought over it, and the bar that covers
+	// the rows going under them sits between.
+	list_place(p, true);
+	lv_obj_move_foreground(p->head_bar);
+	lv_obj_move_foreground(p->title_label);
+	lv_obj_move_foreground(p->corner);
+
+	p->head = lv_obj_create(p->body);
+	lv_obj_remove_style_all(p->head);
+	lv_obj_set_size(p->head, width, LV_SIZE_CONTENT);
+	lv_obj_set_pos(p->head, 0, 0);
+	lv_obj_set_flex_flow(p->head, LV_FLEX_FLOW_COLUMN);
+	lv_obj_set_flex_align(p->head, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+	lv_obj_set_style_pad_row(p->head, 6, 0);
+	// The top of the cover level with the top of the chevron, which stands
+	// centred in a corner button's height below the page's padding.
+	lv_obj_set_style_pad_top(p->head,
+							 (int)p->cfg->padding + (CORNER_BUTTON_SIZE - (int)icon_chevron_left.header.h) / 2, 0);
+	lv_obj_set_style_pad_bottom(p->head, HEAD_GAP, 0);
+	lv_obj_set_scrollable(p->head, false);
+	// A part of the page, not a control: a swipe that starts on the cover
+	// scrolls the list, pulls the player in or goes back like one on a row.
+	lv_obj_set_clickable(p->head, false);
+	lv_obj_set_event_bubble(p->head, true);
+
+	// The album glyph on a card until the picture arrives, and for good when
+	// the record has none.
+	p->head_cover = lv_image_create(p->head);
+	lv_obj_set_size(p->head_cover, HEAD_COVER_SIZE, HEAD_COVER_SIZE);
+	lv_obj_add_style(p->head_cover, &theme_style_card, 0);
+	lv_obj_set_style_pad_all(p->head_cover, 0, 0);
+	lv_image_set_inner_align(p->head_cover, LV_IMAGE_ALIGN_CENTER);
+	lv_image_set_src(p->head_cover, &icon_album_big);
+	lv_obj_add_style(p->head_cover, &theme_style_icon, 0);
+	lv_obj_set_style_image_recolor_opa(p->head_cover, LV_OPA_COVER, 0);
+	lv_obj_set_clickable(p->head_cover, false);
+	lv_obj_set_style_margin_bottom(p->head_cover, 10, 0);
+
+	p->head_title = head_line(p->head, width, p->title, &font_ui_28, HEAD_TITLE_LINES);
+	lv_obj_add_style(p->head_title, &theme_style_text, 0);
+
+	if (info.artist[0]) {
+		p->head_artist = head_line(p->head, width, info.artist, &font_ui_24, 1);
+	}
+
+	char meta[200] = "";
+	if (info.genre[0] && info.year > 0) {
+		snprintf(meta, sizeof(meta), "%s \xC2\xB7 %d", info.genre, info.year);
+	} else if (info.genre[0]) {
+		snprintf(meta, sizeof(meta), "%s", info.genre);
+	} else if (info.year > 0) {
+		snprintf(meta, sizeof(meta), "%d", info.year);
+	}
+	if (meta[0]) {
+		p->head_meta = head_line(p->head, width, meta, &font_ui_20, 1);
+		lv_obj_add_style(p->head_meta, &theme_style_text_dim, 0);
+	}
+
+	lv_obj_t *buttons = lv_obj_create(p->head);
+	lv_obj_remove_style_all(buttons);
+	lv_obj_set_size(buttons, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+	lv_obj_set_flex_flow(buttons, LV_FLEX_FLOW_ROW);
+	lv_obj_set_flex_align(buttons, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+	lv_obj_set_style_pad_column(buttons, HEAD_BTN_GAP, 0);
+	lv_obj_set_style_margin_top(buttons, 12, 0);
+	lv_obj_set_scrollable(buttons, false);
+	lv_obj_set_clickable(buttons, false);
+	lv_obj_set_event_bubble(buttons, true);
+	p->head_buttons[0] = head_glyph_button(buttons, &icon_shuffle, head_shuffle_cb, p);
+	p->head_buttons[1] = head_play_button(buttons, head_play_cb, p);
+	p->head_buttons[2] = head_glyph_button(buttons, &icon_list_queue, head_queue_cb, p);
+	head_paint(p);
+
+	// The real height of all that, for the rows to start under. The screen may
+	// never have been laid out yet -- it is built hidden -- so it is laid out
+	// here rather than read as whatever LVGL started the objects at.
+	lv_obj_update_layout(p->head);
+	p->head_height = lv_obj_get_height(p->head);
+	p->head_title_top = lv_obj_get_y(p->head_title);
+
+	// The page heading stays empty while the head's own title is on screen,
+	// and takes the album's name once it has scrolled under the heading row
+	// (head_follow).
+	p->head_titled = false;
+	lv_label_set_text(p->title_label, "");
+
+	// The cover of the first track, which is what the Albums list shows for
+	// the record too.
+	// Made from the player's own cover of that track, so a record already
+	// played comes straight from the player's table, and one shown here first
+	// is in it when it plays.
+	char path[512];
+	if (row_path_copy(p, 0, path, sizeof(path))) {
+		int player_w = 0, player_h = 0;
+		player_cover_box(&player_w, &player_h);
+		if (player_w > 0 && player_h > 0) {
+			coverloader_request_shared(COVERLOADER_ALBUM_HEAD, path, HEAD_COVER_SIZE, player_w, player_h);
+		} else {
+			coverloader_request(COVERLOADER_ALBUM_HEAD, path, HEAD_COVER_SIZE);
+		}
+		p->head_cover_requested = true;
+	} else {
+		p->head_cover_settled = true;
+	}
+}
+
+// Collects the head's picture once the worker has it, and paints the page in
+// its colours. True while it is still coming.
+static bool head_poll(panel_t *p) {
+	if (!p->head || !p->head_cover_requested || p->head_cover_settled) {
+		return false;
+	}
+	bool finished = false;
+	cover_image_t image;
+	if (coverloader_take(COVERLOADER_ALBUM_HEAD, &image, &finished)) {
+		p->head_image = image;
+		p->head_has_cover = true;
+		p->head_cover_settled = true;
+		lv_obj_remove_style(p->head_cover, &theme_style_icon, 0);
+		lv_obj_set_style_image_recolor_opa(p->head_cover, LV_OPA_TRANSP, 0);
+		lv_obj_set_style_bg_opa(p->head_cover, LV_OPA_TRANSP, 0);
+		lv_image_set_src(p->head_cover, &p->head_image.dsc);
+		if (tint_from_cover(p)) {
+			p->tinted = true;
+			page_paint(p);
+		}
+		return false;
+	}
+	if (finished) {
+		p->head_cover_settled = true; // no artwork: the glyph stays, and the theme's colours
+		return false;
+	}
+	return true;
+}
+
+// The heading row follows the head: empty while the head's title is below it,
+// the album's name and a bar behind it from the moment the title reaches the
+// row -- before it can run under the chevron.
+static void head_follow(panel_t *p) {
+	if (!p->head) {
+		return;
+	}
+	int row = settingsrow_content_top(p->cfg) - (int)p->cfg->top_bar_height;
+	bool past = lv_obj_get_scroll_y(p->list) > p->head_title_top - row;
+	if (past == p->head_titled) {
+		return;
+	}
+	p->head_titled = past;
+	lv_label_set_text(p->title_label, past ? p->title : "");
+	head_bar_update(p);
+}
+
+// The bar is up while the title has gone under the heading row. Below that
+// point the head's cover can be under the corner, and while rows are being
+// chosen the corner is full of selection mode's buttons: a blur goes behind
+// them, so they read over the picture without hiding it.
+static void head_bar_update(panel_t *p) {
+	if (!p->head_bar) {
+		return;
+	}
+	bool bar = p->head && p->head_titled;
+	lv_obj_set_hidden(p->head_bar, !bar);
+	if (p->sel_blur) {
+		bool blur = p->head && p->selecting && !bar;
+		lv_obj_set_hidden(p->sel_blur, !blur);
+		if (blur) {
+			lv_obj_move_foreground(p->sel_blur);
+			lv_obj_move_foreground(p->corner);
+		}
+	}
+}
+
+// Takes away whatever the last list put above and between its rows.
+static void album_extras_clear(panel_t *p) {
+	head_clear(p);
+	disc_heads_clear(p);
+}
+
+// Builds them for the list now loaded: disc headings on a record of more than
+// one disc, and the head when the alternative album view is on. The head
+// first, because the headings are placed under it.
+static void album_extras_build(panel_t *p) {
+	if (!panel_is_album(p)) {
+		return;
+	}
+	if (album_head) {
+		head_build(p);
+	}
+	album_places_load(p);
+
+	// Building the head moves the list up to the status bar. On a list that
+	// was scrolled to its end, LVGL pulls the scroll back to fit, and the
+	// scroll event binds rows before the head has a height or the rows their
+	// track numbers: they land at the top, over the cover. row_bind() leaves a
+	// row whose index has not changed where it is, so every row is bound again
+	// now that the head and the discs are known.
+	for (int i = 0; i < ROW_POOL; i++) {
+		p->rows[i].index = -2;
+	}
+}
+
+bool medialist_album_head(void) {
+	load_view_settings();
+	return album_head;
+}
+
+void medialist_set_album_head(bool on) {
+	load_view_settings();
+	if (album_head == on) {
+		return;
+	}
+	album_head = on;
+	config_set_int("library", "album_head", on ? 1 : 0);
+	config_save();
+
+	// An album left open behind the settings is laid out again, so going back
+	// to it shows the change rather than the layout it was opened with.
+	panel_t *p = &panel_tracks;
+	if (!p->rows[0].button || !panel_is_album(p) || !p->ix) {
+		return;
+	}
+	for (int i = 0; i < ROW_POOL; i++) {
+		row_drop_thumb(p, &p->rows[i]);
+		p->rows[i].index = -2;
+	}
+	// circle-play only without the head, whose buttons stand in for it.
+	show_corner(p->play_btn, !on);
+	p->corner_slots = on ? 0 : 1;
+	settingsrow_title_corner_slots(p->title_label, p->cfg, p->corner_slots);
+	album_extras_clear(p);
+	album_extras_build(p);
+	lv_obj_set_height(p->body, body_height(p));
+	lv_obj_scroll_to_y(p->list, 0, LV_ANIM_OFF);
+	p->saved_scroll = 0;
+	window_update(p);
+}
+
+// ---------------------------------------------------------------------------
 // opening
 // ---------------------------------------------------------------------------
 
@@ -3518,10 +4503,11 @@ void medialist_open(const char *title, library_list_t kind, library_filter_t fil
 	// Which of the three screens this list belongs on. Tracks are always the
 	// last level; an album list narrowed to one artist or genre is the middle
 	// one; everything else is where a walk starts.
-	bool tracks_like =
-		(kind == LIBRARY_LIST_TRACKS || kind == LIBRARY_LIST_FAVOURITES || kind == LIBRARY_LIST_PLAYLIST);
-	bool artist_albums = kind == LIBRARY_LIST_ALBUMS && (filter == LIBRARY_FILTER_ARTIST ||
-														 filter == LIBRARY_FILTER_ALBUM_ARTIST || filter == LIBRARY_FILTER_GENRE);
+	bool tracks_like = (kind == LIBRARY_LIST_TRACKS || kind == LIBRARY_LIST_FAVOURITES ||
+						kind == LIBRARY_LIST_PLAYLIST || kind == LIBRARY_LIST_MOST_PLAYED);
+	bool artist_albums =
+		kind == LIBRARY_LIST_ALBUMS && (filter == LIBRARY_FILTER_ARTIST || filter == LIBRARY_FILTER_ALBUM_ARTIST ||
+										filter == LIBRARY_FILTER_GENRE || filter == LIBRARY_FILTER_YEAR);
 	panel_t *p = tracks_like ? &panel_tracks : (artist_albums ? &panel_artist_albums : &panel_names);
 	p->kind = kind;
 	// A playlist is a query like any other, and the query's value is its
@@ -3569,13 +4555,20 @@ void medialist_open(const char *title, library_list_t kind, library_filter_t fil
 	bool want_album = artist_tracks || artist_records_page;
 	// The circle-play menu, wherever "play all of this" is a question worth
 	// asking: an artist's records, an artist's tracks, all the records, all the
-	// tracks, the favourites, a playlist, inside one album. Not on the name lists,
-	// where a row is not a set of tracks.
+	// tracks, the favourites, the most played, a playlist, inside one album. Not
+	// on the name lists, where a row is not a set of tracks.
 	bool want_play = artist_albums || (kind == LIBRARY_LIST_ALBUMS && filter == LIBRARY_FILTER_NONE) ||
 					 kind == LIBRARY_LIST_FAVOURITES || kind == LIBRARY_LIST_PLAYLIST ||
+					 kind == LIBRARY_LIST_MOST_PLAYED ||
 					 (kind == LIBRARY_LIST_TRACKS &&
 					  (filter == LIBRARY_FILTER_NONE || filter == LIBRARY_FILTER_ARTIST ||
 					   filter == LIBRARY_FILTER_ALBUM_ARTIST || filter == LIBRARY_FILTER_ALBUM));
+
+	// One album under the head: the head's own buttons are the circle-play
+	// menu's choices, so the corner does not offer them a second time.
+	if (album_head && kind == LIBRARY_LIST_TRACKS && filter == LIBRARY_FILTER_ALBUM) {
+		want_play = false;
+	}
 
 	bool want_sort = sortable;
 	bool want_reverse = kind == LIBRARY_LIST_FAVOURITES;
@@ -3640,13 +4633,25 @@ void medialist_open(const char *title, library_list_t kind, library_filter_t fil
 	// newest belongs on top.
 	bool desc = (sortable && sort_desc) || (kind == LIBRARY_LIST_FAVOURITES && fav_reversed);
 
+	// Most played starts out empty for a reason of its own: nothing has been
+	// listened to long enough yet, not a library still to scan. Its note is
+	// wrapped inside the page, since a translation can run wider than the
+	// screen; the usual one keeps the width of its own lines.
+	bool most_played = kind == LIBRARY_LIST_MOST_PLAYED;
+	lv_label_set_text(p->empty, tr(most_played ? "medialist_most_played_empty" : "library_empty_note"));
+	lv_obj_set_width(p->empty, most_played ? lv_pct(90) : LV_SIZE_CONTENT);
+
 	p->from_paths = false;
 	p->list_order = order;
 	p->list_desc = desc;
 	p->ix = library_index_open(kind, filter, filter_value, order, desc);
 	p->count = library_index_count(p->ix);
 
-	lv_obj_set_height(p->body, p->count ? p->count * ROW_PITCH : ROW_PITCH);
+	// One album: the head, when it is on, and the disc headings.
+	album_extras_clear(p);
+	album_extras_build(p);
+
+	lv_obj_set_height(p->body, body_height(p));
 	if (p->count == 0) {
 		lv_obj_set_hidden(p->empty, false);
 	} else {
@@ -3663,6 +4668,13 @@ void medialist_open(const char *title, library_list_t kind, library_filter_t fil
 								   kind == LIBRARY_LIST_ALBUM_ARTISTS);
 	index_rebuild(p, p->index_wanted, sortable && sort_is_desc(kind));
 
+	// The list's real height before anything is worked out from it. Until its
+	// screen has been shown once nothing has laid it out, and the height LVGL
+	// reports is the few dozen pixels every object starts at: a row centred on
+	// that would sit at the top of the page, under the heading.
+	lv_obj_update_layout(p->list);
+	int view_height = lv_obj_get_height(p->list);
+
 	// The same list resumes at its old scroll position; a different one
 	// starts at the top -- unless it opens on what is playing.
 	int target_scroll = same_list ? p->saved_scroll : 0;
@@ -3670,17 +4682,18 @@ void medialist_open(const char *title, library_list_t kind, library_filter_t fil
 	if (current >= 0) {
 		// In the middle of the screen rather than at the top, so the rows
 		// around it show where in the list it is.
-		target_scroll = current * ROW_PITCH - (lv_obj_get_height(p->list) - ROW_PITCH) / 2;
+		target_scroll = row_y(p, current) - (view_height - ROW_HEIGHT) / 2;
 		if (target_scroll < 0) {
 			target_scroll = 0;
 		}
 	}
-	int max_scroll = p->count * ROW_PITCH - lv_obj_get_height(p->list);
+	int max_scroll = body_height(p) - view_height;
 	if (target_scroll > max_scroll) {
 		target_scroll = max_scroll > 0 ? max_scroll : 0;
 	}
 	lv_obj_scroll_to_y(p->list, target_scroll, LV_ANIM_OFF);
 	p->saved_scroll = target_scroll;
+	head_follow(p);
 	window_update(p);
 
 	if (open_replacing) {
@@ -3707,6 +4720,8 @@ void medialist_open_paths(const char *title, const char *const *paths, const cha
 	// a playlist between visits, so always start at the top.
 	snprintf(p->signature, sizeof(p->signature), "paths|%s", title ? title : "");
 
+	// No album head and no disc headings on a list handed in.
+	album_extras_clear(p);
 	lv_label_set_text(p->title_label, title ? title : "");
 
 	// A list handed in as paths has an order of its own -- the one whoever
@@ -3741,7 +4756,9 @@ void medialist_open_paths(const char *title, const char *const *paths, const cha
 		}
 	}
 
-	lv_obj_set_height(p->body, p->count ? p->count * ROW_PITCH : ROW_PITCH);
+	lv_obj_set_height(p->body, body_height(p));
+	lv_label_set_text(p->empty, tr("library_empty_note"));
+	lv_obj_set_width(p->empty, LV_SIZE_CONTENT);
 	if (p->count == 0) {
 		lv_obj_set_hidden(p->empty, false);
 	} else {
@@ -3813,6 +4830,7 @@ void medialist_init(gui_config_t *cfg) {
 	lv_timer_t *index_timer = lv_timer_create(index_timer_cb, 200, NULL);
 	power_pause_in_standby(index_timer);
 	theme_register_refresh(index_theme_refresh);
+	theme_register_refresh(head_theme_refresh);
 }
 
 // ---------------------------------------------------------------------------

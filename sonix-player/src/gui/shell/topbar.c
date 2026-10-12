@@ -108,6 +108,32 @@ static lv_timer_t *jack_timer;
 // moved, and new colours are not a new reading.
 static int last_battery_percent = -2;
 static int last_battery_charging = -1;
+
+// A page painted in a colour of its own -- an album in its sleeve's -- has the
+// bar in that colour too, a shade darker as the theme's own bar is, with the
+// glyphs and the type in the ink worked out for it. Only while that page is
+// the one shown: `tint_page` is the page being shown, set as it is loaded.
+//
+// The glyphs and the labels wear two styles added after the theme's, empty
+// until a tint is in force, so a glyph whose colour means something -- the
+// gold jack, the codec on the Bluetooth glyph, the volume warning -- keeps it:
+// those are set on the object itself and win over any style.
+static lv_obj_t *tint_screen;
+static lv_obj_t *tint_page;
+static lv_color_t tint_bg;
+static lv_color_t tint_ink;
+static bool tint_active;
+static lv_style_t tint_text_style;
+static lv_style_t tint_icon_style;
+
+// The battery shell's colour: the ink, or the theme's, and quieter when the
+// level is not known.
+static lv_color_t shell_color(bool known) {
+	if (tint_active) {
+		return known ? tint_ink : lv_color_mix(tint_ink, tint_bg, 140);
+	}
+	return known ? theme()->text_primary : theme()->text_secondary;
+}
 static lv_timer_t *clock_timer;
 static lv_timer_t *radio_timer;
 
@@ -142,14 +168,14 @@ static void update_battery_indicator(int percent, bool charging) {
 	if (percent < 0) {
 		// Unknown level: empty shell, with nothing to fill in.
 		lv_obj_set_hidden(bat_fill, true);
-		lv_obj_set_style_image_recolor(bat_shell, theme()->text_secondary, 0);
+		lv_obj_set_style_image_recolor(bat_shell, shell_color(false), 0);
 		lv_label_set_text(bat_label, "--%");
 		return;
 	}
 
 	lv_label_set_text_fmt(bat_label, "%d%%", percent);
 
-	lv_obj_set_style_image_recolor(bat_shell, theme()->text_primary, 0);
+	lv_obj_set_style_image_recolor(bat_shell, shell_color(true), 0);
 
 	if (charging) {
 		lv_obj_set_hidden(bat_fill, true);
@@ -978,6 +1004,19 @@ void topbar_init(gui_config_t *cfg) {
 	topbar_refresh_clock();
 	topbar_set_clock_position((int)config_get_int("screen", "clock_pos", TOPBAR_CLOCK_CENTER));
 
+	// The tint's two styles, after the theme's so that they win over it; empty
+	// until a tinted page is shown (topbar_tint_on_screen).
+	lv_style_init(&tint_text_style);
+	lv_style_init(&tint_icon_style);
+	lv_obj_t *tinted_icons[] = {vol_icon, hp_icon, play_icon, library_icon, sonixlink_icon, bt_icon, wifi_icon};
+	for (size_t i = 0; i < sizeof(tinted_icons) / sizeof(tinted_icons[0]); i++) {
+		lv_obj_add_style(tinted_icons[i], &tint_icon_style, 0);
+	}
+	lv_obj_t *tinted_labels[] = {vol_label, bat_label, clock_label};
+	for (size_t i = 0; i < sizeof(tinted_labels) / sizeof(tinted_labels[0]); i++) {
+		lv_obj_add_style(tinted_labels[i], &tint_text_style, 0);
+	}
+
 	// Ten seconds keeps the minute from ever looking stale and costs nothing.
 	clock_timer = lv_timer_create(clock_timer_cb, 10000, NULL);
 	power_pause_in_standby(clock_timer); // a clock nobody can see is pure drain
@@ -1044,6 +1083,57 @@ void topbar_set_battery_percent(bool shown) {
 	} else {
 		lv_obj_set_hidden(bat_label, true);
 	}
+}
+
+// Puts the bar in the tint or back in the theme, for the page now shown.
+static void tint_apply(void) {
+	if (!top_bar) {
+		return;
+	}
+	bool active = tint_screen && tint_page == tint_screen;
+	if (active == tint_active && !active) {
+		return;
+	}
+	tint_active = active;
+
+	if (active) {
+		lv_obj_set_style_bg_color(top_bar, tint_bg, 0);
+		lv_style_set_text_color(&tint_text_style, tint_ink);
+		lv_style_set_image_recolor(&tint_icon_style, tint_ink);
+		lv_style_set_image_recolor_opa(&tint_icon_style, LV_OPA_COVER);
+	} else {
+		lv_obj_remove_local_style_prop(top_bar, LV_STYLE_BG_COLOR, 0);
+		lv_style_remove_prop(&tint_text_style, LV_STYLE_TEXT_COLOR);
+		lv_style_remove_prop(&tint_icon_style, LV_STYLE_IMAGE_RECOLOR);
+		lv_style_remove_prop(&tint_icon_style, LV_STYLE_IMAGE_RECOLOR_OPA);
+	}
+	lv_obj_report_style_change(&tint_text_style);
+	lv_obj_report_style_change(&tint_icon_style);
+
+	// The shell carries its colour on itself; it is painted now, and the next
+	// poll paints the whole indicator again.
+	lv_obj_set_style_image_recolor(bat_shell, shell_color(last_battery_percent >= 0), 0);
+	last_battery_percent = -2;
+}
+
+void topbar_tint_on_screen(lv_obj_t *screen, bool on, lv_color_t bg, lv_color_t ink) {
+	if (on) {
+		tint_screen = screen;
+		tint_bg = bg;
+		tint_ink = ink;
+		tint_active = false; // apply again even if it was on: the colours are new
+	} else if (tint_screen == screen) {
+		tint_screen = NULL;
+	}
+	if (!tint_page) {
+		tint_page = lv_screen_active();
+	}
+	tint_apply();
+}
+
+void topbar_page_shown(lv_obj_t *screen) {
+	tint_page = screen;
+	tint_apply();
 }
 
 void topbar_bring_to_front(void) {

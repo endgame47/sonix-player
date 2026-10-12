@@ -18,10 +18,11 @@
 //
 // Where it comes from: a worker decodes the file once, at the lowest priority
 // the scheduler has, and the answer is kept in a file on the card so it is only
-// ever done once per track. Until it is ready the caller draws whatever it
-// draws for "not known yet" -- there is no placeholder here, because a flat
-// line and a quiet track look the same and only the caller knows which it is
-// showing.
+// ever done once per track. The columns are handed out as the decode finishes
+// them, so the shape fills in from the left while the track plays. Where a
+// column is not ready the caller draws whatever it draws for "not known yet"
+// -- there is no placeholder here, because a flat line and a quiet track look
+// the same and only the caller knows which it is showing.
 //
 // The decode is real work and the device has one core, so the worker is
 // deliberately timid: SCHED_IDLE, one track at a time, and dropped the moment
@@ -47,13 +48,19 @@ void waveform_set_cache_dir(const char *sd_root);
 void waveform_start(void);
 
 // The track the player is showing. Answers from the cache at once when it has
-// it, and otherwise puts the worker to work on it and returns false until it is
-// done. Calling it with a different path abandons whatever was being computed:
-// nobody is going to look at the old one.
+// it, and otherwise puts the worker to work on it. Calling it with a different
+// path abandons whatever was being computed: nobody is going to look at the old
+// one.
+//
+// Returns how many columns of `out` are filled, from the left: WAVEFORM_BARS
+// for the whole shape, fewer while the worker is still reading the file -- the
+// columns done so far, scaled against the loudest of them, so the page can draw
+// the shape as it is worked out -- and 0 when nothing is known yet or the file
+// has no shape.
 //
 // `out` is WAVEFORM_BARS bytes. Safe to call from the interface thread; it does
 // no file work of its own once the cache has been read.
-bool waveform_get(const char *path, uint8_t *out);
+int waveform_get(const char *path, uint8_t *out);
 
 // Whether the worker is busy on `path` right now, so the page can say "working
 // on it" rather than "there is nothing here".

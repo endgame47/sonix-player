@@ -1274,13 +1274,17 @@ static void start_play(const lastfm_playback_t *now, double t) {
 	take_tags(now);
 }
 
-static void qualify(void) {
-	double length = play.track.duration;
-	if (play.scrobbled || play.skip || !play.track.artist[0] || !play.track.title[0] || length < SCROBBLE_MIN_LENGTH) {
-		return;
+bool lastfm_play_counts(double length, double listened) {
+	if (length < SCROBBLE_MIN_LENGTH) {
+		return false;
 	}
 	double enough = length / 2 < SCROBBLE_ENOUGH ? length / 2 : SCROBBLE_ENOUGH;
-	if (play.listened < enough) {
+	return listened >= enough;
+}
+
+static void qualify(void) {
+	if (play.scrobbled || play.skip || !play.track.artist[0] || !play.track.title[0] ||
+		!lastfm_play_counts(play.track.duration, play.listened)) {
 		return;
 	}
 	play.scrobbled = true;

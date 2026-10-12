@@ -28,6 +28,7 @@
 #include "src/system/image/art_shrink.h"
 #include "src/system/core/config.h"
 #include "src/system/library/cue.h"
+#include "src/system/library/folderorder.h"
 #include "src/system/playback/playlist.h"
 // SQLite is vendored: this header, not the system's.
 #include "src/system/db/sqlite3.h"
@@ -1994,6 +1995,7 @@ static void route_bye(client_t *c) {
 typedef struct {
 	char *label; // what the row says
 	char *file;	 // the name inside the folder: the real one, or the sheet's virtual one
+	folder_place_t place; // where a track sits on its record
 	bool dir;
 } browse_entry_t;
 
@@ -2033,6 +2035,7 @@ static bool browse_add(browse_list_t *l, const char *label, const char *file, bo
 	browse_entry_t *e = &l->items[l->count];
 	e->label = strdup(label);
 	e->file = strdup(file);
+	memset(&e->place, 0, sizeof(e->place));
 	e->dir = dir;
 	if (!e->label || !e->file) {
 		free(e->label);
@@ -2058,6 +2061,10 @@ static int browse_cmp(const void *a, const void *b) {
 	if (ea->dir != eb->dir) {
 		return ea->dir ? -1 : 1;
 	}
+	int by_place = folderorder_cmp(&ea->place, &eb->place);
+	if (by_place) {
+		return by_place;
+	}
 	int by_track = 0;
 	if (cue_order_tracks(ea->file, eb->file, &by_track)) {
 		return by_track;
@@ -2067,7 +2074,38 @@ static int browse_cmp(const void *a, const void *b) {
 
 #define BROWSE_CLAIMS 32
 
-static void browse_read(const char *path, browse_list_t *out) {
+// The record order of the folder's tracks, as the player's own browser has it
+// (browser.c, listing_place_tracks): the list the app shows and the queue a
+// tap there starts run in the same order.
+static void browse_place_tracks(const char *path, browse_list_t *list) {
+	if (list->count <= 0) {
+		return;
+	}
+	const char **names = malloc((size_t)list->count * sizeof(*names));
+	int *index = malloc((size_t)list->count * sizeof(*index));
+	folder_place_t *places = malloc((size_t)list->count * sizeof(*places));
+	if (names && index && places) {
+		size_t n = 0;
+		for (int i = 0; i < list->count; i++) {
+			if (!list->items[i].dir) {
+				names[n] = list->items[i].file;
+				index[n] = i;
+				n++;
+			}
+		}
+		folderorder_places(path, names, n, true, places);
+		for (size_t i = 0; i < n; i++) {
+			list->items[index[i]].place = places[i];
+		}
+	}
+	free(names);
+	free(index);
+	free(places);
+}
+
+// `path` is the folder as the filesystem resolves it, `indexed` the same folder
+// spelled under the root as the player and its index spell it.
+static void browse_read(const char *path, const char *indexed, browse_list_t *out) {
 	DIR *dir = opendir(path);
 	if (!dir) {
 		return;
@@ -2137,6 +2175,7 @@ static void browse_read(const char *path, browse_list_t *out) {
 	}
 	free(claims);
 	closedir(dir);
+	browse_place_tracks(indexed, out);
 	qsort(out->items, (size_t)out->count, sizeof(*out->items), browse_cmp);
 }
 
@@ -2187,7 +2226,7 @@ static void route_browse(client_t *c, const char *query) {
 
 	browse_list_t list;
 	memset(&list, 0, sizeof(list));
-	browse_read(real, &list);
+	browse_read(real, shown, &list);
 
 	buf_t j;
 	memset(&j, 0, sizeof(j));

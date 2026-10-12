@@ -45,6 +45,12 @@ void back_btn_player_mode(bool in_player);
 // always-dark artwork backdrop, so it goes white regardless of the theme.
 void back_btn_over_cover(bool over_cover);
 
+// The chevron in `color` while `screen` is the page on screen, for a page that
+// paints itself in a colour of its own and needs the arrow to stay readable on
+// it. Pass false with the same screen to give the chevron back its theme
+// colour; a call naming another screen than the one recorded changes nothing.
+void back_btn_tint_on_screen(lv_obj_t *screen, bool on, lv_color_t color);
+
 // Horizontal offset for the chevron, so it can ride whatever is being
 // dragged (the player sheet's slide uses it; the page swipe-back does its
 // own). 0 puts it back in place.

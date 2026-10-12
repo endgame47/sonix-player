@@ -58,6 +58,11 @@ typedef enum {
 player_layout_t player_layout_get(void);
 void player_layout_set(player_layout_t layout);
 
+// Whether the Standard and Studio arrangements take the sleeve's colour as
+// their accent, as Waveform always does. Off by default; saved in the config.
+bool player_cover_accent(void);
+void player_cover_accent_set(bool on);
+
 // The output the music was going to has just been unplugged -- a jack pulled
 // out, a USB-C DAC removed, headphones that walked out of range. Pauses, so
 // that taking the headphones off does not cost three tracks of an album, and
@@ -133,6 +138,11 @@ const lv_image_dsc_t *player_backdrop_image(void);
 // whoever borrowed it can drop its references first. One at a time; NULL
 // clears it.
 void player_set_cover_release_cb(void (*cb)(void));
+
+// The size the standard arrangement draws the cover at. A page that shows the
+// same cover asks for it at this size, so the player's table of covers serves
+// both (coverloader_request_shared). 0 x 0 before the player is built.
+void player_cover_box(int *w, int *h);
 
 
 #endif

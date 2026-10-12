@@ -262,9 +262,9 @@ static int cover_box_w, cover_box_h;   // the artwork spans the full screen widt
 // What the sleeve's colour becomes once it has to be painted rather than
 // thrown.
 //
-// cover_dominant_tone() answers with a colour stretched to full strength,
-// because in Cover Flow it is a light behind the record and a light that is not
-// strong is not seen. Poured into a solid pill the same number is a poster
+// album_tone is stretched to full strength (cover_tone_stretched), the way
+// cover_dominant_tone() answers for Cover Flow, where it is a light behind the
+// record and a light that is not strong is not seen. Poured into a solid pill the same number is a poster
 // colour -- which is the complaint. So the hue is kept and everything else is
 // pinned: the surface keeps a third of its distance from grey and sits at a
 // fixed low brightness, the ink on it is always the same white, and the mark
@@ -293,6 +293,9 @@ static bool layout_studio_now;	// likewise for the third arrangement
 static bool layout_wave_now;
 
 static uint32_t album_tone; // the sleeve's colour, 0 when there is no sleeve
+// The setting that has the Standard and Studio arrangements wear the sleeve's
+// colour as their accent too, as Waveform always does.
+static bool cover_accent;
 
 static lv_obj_t *song_text_obj; // the title and artist, wherever they live now
 static lv_obj_t *song_side_obj; // the star and the format, likewise
@@ -306,7 +309,10 @@ static lv_obj_t *wave_canvas;
 static uint8_t *wave_buf;
 static int wave_w; // the buffer's width, which is what the painting must use
 static uint8_t wave_bars[WAVEFORM_BARS];
-static bool wave_have;		// the shape of this track is known
+// How many columns of this track's shape are known, from the left: all of them
+// once it has been worked out, fewer while the worker is still reading the
+// file, and the rest are drawn flat until they arrive.
+static int wave_ready;
 static int wave_drawn = -1; // where the playhead was, in pixels, when it was drawn
 static uint32_t wave_drawn_tone = 1;
 static int backdrop_w, backdrop_h;	   // size of the controls block it sits behind
@@ -971,6 +977,15 @@ static void (*cover_release_cb)(void);
 
 void player_set_cover_release_cb(void (*cb)(void)) { cover_release_cb = cb; }
 
+void player_cover_box(int *w, int *h) {
+	if (w) {
+		*w = cover_box_w;
+	}
+	if (h) {
+		*h = cover_box_h;
+	}
+}
+
 // The path whose artwork is currently up. A live stream refreshes its text
 // several times a minute (every new on-air title), and re-decoding the same
 // station icon each time would be pointless work on the UI thread.
@@ -1025,7 +1040,17 @@ static lv_color_t tone_shaped(int sat, int want) {
 static lv_color_t alt_surface(void) { return tone_shaped(ALT_SURFACE_SAT, ALT_SURFACE_LUMA); }
 static lv_color_t alt_mark(void) { return tone_shaped(ALT_MARK_SAT, ALT_MARK_LUMA); }
 
-static lv_color_t chrome_accent(void) { return layout_wave_now ? alt_mark() : theme()->accent; }
+// The accent the transport, the progress bar and the sung line wear: the
+// sleeve's colour in the Waveform arrangement, and in the other two as well
+// when the setting asks for it and there is a sleeve to take it from. The same
+// shade in all three, light enough to read over the dark backdrop every
+// arrangement puts behind a sleeve.
+static lv_color_t chrome_accent(void) {
+	if (layout_wave_now || (cover_accent && album_tone)) {
+		return alt_mark();
+	}
+	return theme()->accent;
+}
 
 // The type on that surface. Worked out rather than fixed so that a change to
 // ALT_SURFACE_LUMA cannot quietly leave the title unreadable.
@@ -1045,6 +1070,12 @@ static void paint_transport_tint(void) {
 	}
 	if (repeat_btn_icon) {
 		update_repeat_button();
+	}
+	update_speed_button();
+	// The progress bar, which Waveform hides under the shape of the track.
+	if (progress_slider) {
+		lv_obj_set_style_bg_color(progress_slider, chrome_accent(), LV_PART_INDICATOR);
+		lv_obj_set_style_bg_color(progress_slider, chrome_accent(), LV_PART_KNOB);
 	}
 	lyrics_repaint_lit(); // the sung line wears it too
 }
@@ -2917,7 +2948,7 @@ static void wave_paint(int played_px) {
 	}
 
 	for (int i = 0; i < WAVEFORM_BARS; i++) {
-		int value = wave_have ? wave_bars[i] : 0;
+		int value = i < wave_ready ? wave_bars[i] : 0;
 		int half = value * reach / 255;
 		if (half < WAVE_MIN_BAR) {
 			half = WAVE_MIN_BAR;
@@ -2975,16 +3006,22 @@ static void wave_refresh(const char *path, double position) {
 		return;
 	}
 
-	bool had = wave_have;
+	// Compared with what is on screen as well as counted: while the shape is
+	// being worked out the columns already shown are scaled again whenever a
+	// louder one arrives.
+	int had = wave_ready;
+	uint8_t before[WAVEFORM_BARS];
+	memcpy(before, wave_bars, sizeof(before));
 	if (path && path[0]) {
-		wave_have = waveform_get(path, wave_bars);
+		wave_ready = waveform_get(path, wave_bars);
 	} else {
-		wave_have = false;
+		wave_ready = 0;
 	}
+	bool same_shape = wave_ready == had && memcmp(before, wave_bars, (size_t)wave_ready) == 0;
 
 	int px = wave_played_px(position);
 	uint32_t tone = album_tone;
-	if (px == wave_drawn && wave_have == had && tone == wave_drawn_tone) {
+	if (px == wave_drawn && same_shape && tone == wave_drawn_tone) {
 		return;
 	}
 	wave_drawn = px;
@@ -3164,8 +3201,19 @@ static void apply_cover_result(void) {
 		set_over_cover(true);
 
 		// And the sleeve's own colour, which is what the alternative layout is
-		// drawn in.
-		album_tone = cover_dominant_tone(&current_cover);
+		// drawn in: the one an album's page is painted in (cover_page_tone),
+		// so the record looks the same colour on both. Kept with the picture by
+		// the loader, so a cover seen before is not worked out again, and taken
+		// to full strength here for marks drawn over a dark backdrop.
+		uint32_t tone = 0;
+		int luma = 0;
+		bool light = false;
+		if (current_cover.has_tone) {
+			tone = current_cover.tone;
+		} else if (!cover_page_tone(&current_cover, COVER_PAGE_LIGHT_FROM, &tone, &luma, &light)) {
+			tone = 0;
+		}
+		album_tone = tone ? cover_tone_stretched(tone) : 0;
 		paint_alt_tint();
 
 		// The words' background, ready before they are pulled in.
@@ -3220,8 +3268,8 @@ static void player_refresh_theme(void) {
 	// The backdrop over a loaded cover is always the dark treatment -- same
 	// look in both themes; only the no-cover panel follows the theme.
 	cover_set_backdrop_light(false);
-	lv_obj_set_style_bg_color(progress_slider, theme()->accent, LV_PART_INDICATOR);
-	lv_obj_set_style_bg_color(progress_slider, theme()->accent, LV_PART_KNOB);
+	lv_obj_set_style_bg_color(progress_slider, chrome_accent(), LV_PART_INDICATOR);
+	lv_obj_set_style_bg_color(progress_slider, chrome_accent(), LV_PART_KNOB);
 	set_over_cover(chrome_over_cover); // repaints the play disc for the new palette
 	update_repeat_button();
 	update_speed_button();
@@ -3715,7 +3763,7 @@ static void update_speed_button(void) {
 		return;
 	}
 	bool normal = speed_current_permille() == AUDIOBOOK_SPEED_NORMAL;
-	lv_obj_set_style_image_recolor(speed_btn_icon, normal ? lv_color_make(100, 100, 100) : theme()->accent, 0);
+	lv_obj_set_style_image_recolor(speed_btn_icon, normal ? lv_color_make(100, 100, 100) : chrome_accent(), 0);
 	lv_obj_set_style_image_recolor_opa(speed_btn_icon, LV_OPA_COVER, 0);
 }
 
@@ -3908,6 +3956,9 @@ static void update_progress(void) {
 
 	set_progress_label(state.progress_current_secs, current_total_length);
 	wave_refresh(cover_shown_path, state.progress_current_secs);
+	if (state.status == AUDIO_STATUS_PLAYING && !state.live) {
+		device_state_read_ahead(state.progress_current_secs, state.progress_total_secs);
+	}
 	lyrics_request(&state);
 	lyrics_follow(state.progress_current_secs);
 	apply_playback_status(state.status);
@@ -4309,6 +4360,18 @@ void player_play_file(const char *filepath) {
 // because half a second of a pause button over a paused track reads as a
 // control that did not take.
 player_layout_t player_layout_get(void) { return layout_choice; }
+
+bool player_cover_accent(void) { return cover_accent; }
+
+void player_cover_accent_set(bool on) {
+	if (on == cover_accent) {
+		return;
+	}
+	cover_accent = on;
+	config_set_bool("screen", "cover_accent", on);
+	config_save();
+	paint_transport_tint();
+}
 
 void player_layout_set(player_layout_t layout) {
 	if (layout == layout_choice) {
@@ -5343,6 +5406,7 @@ void player_init(gui_config_t *cfg) {
 	layout_choice = (saved == (int)PLAYER_LAYOUT_ALTERNATIVE)	? PLAYER_LAYOUT_ALTERNATIVE
 					: (saved == (int)PLAYER_LAYOUT_STUDIO)		? PLAYER_LAYOUT_STUDIO
 																: PLAYER_LAYOUT_STANDARD;
+	cover_accent = config_get_bool("screen", "cover_accent", false);
 	layout_alt_now = false; // apply_layout() below puts the standard one up first
 	layout_studio_now = false;
 	apply_layout();

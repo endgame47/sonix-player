@@ -100,6 +100,25 @@ static void add_tile(lv_obj_t *grid, const grid_entry_t *entry, int width, int h
 	}
 }
 
+void gridpage_set_entries(lv_obj_t *grid, gui_config_t *cfg, const grid_entry_t *entries, int count, int columns,
+						  int rows, bool clear_corner_buttons) {
+	if (!grid) {
+		return;
+	}
+	lv_obj_clean(grid);
+
+	int top = clear_corner_buttons ? settingsrow_content_top(cfg) : cfg->top_bar_height;
+	int usable_w = cfg->screen_width - (2 * cfg->padding);
+	int usable_h = (cfg->screen_height - top) - (2 * cfg->padding);
+
+	int tile_w = (usable_w - (columns - 1) * GRID_GAP) / columns;
+	int tile_h = (usable_h - (rows - 1) * GRID_GAP) / rows;
+
+	for (int i = 0; i < count; i++) {
+		add_tile(grid, &entries[i], tile_w, tile_h);
+	}
+}
+
 lv_obj_t *gridpage_build(lv_obj_t *screen, gui_config_t *cfg, const grid_entry_t *entries, int count, int columns,
 						 int rows, bool clear_corner_buttons) {
 	lv_obj_add_style(screen, &theme_style_screen, 0);
@@ -123,15 +142,7 @@ lv_obj_t *gridpage_build(lv_obj_t *screen, gui_config_t *cfg, const grid_entry_t
 	// its row, giving that page a shape no other one has.
 	lv_obj_set_flex_align(grid, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
 
-	int usable_w = cfg->screen_width - (2 * cfg->padding);
-	int usable_h = (cfg->screen_height - top) - (2 * cfg->padding);
-
-	int tile_w = (usable_w - (columns - 1) * GRID_GAP) / columns;
-	int tile_h = (usable_h - (rows - 1) * GRID_GAP) / rows;
-
-	for (int i = 0; i < count; i++) {
-		add_tile(grid, &entries[i], tile_w, tile_h);
-	}
+	gridpage_set_entries(grid, cfg, entries, count, columns, rows, clear_corner_buttons);
 
 	// The player can be pulled in from any tiled page.
 	player_sheet_attach_drag(grid, true);
@@ -143,6 +154,57 @@ lv_obj_t *gridpage_build(lv_obj_t *screen, gui_config_t *cfg, const grid_entry_t
 	// on the page has to put it on this object, because nothing below it
 	// bubbles any further.
 	return grid;
+}
+
+void gridpage_set_scrolling(lv_obj_t *grid) {
+	if (!grid) {
+		return;
+	}
+	lv_obj_set_scrollable(grid, true);
+	lv_obj_set_scroll_dir(grid, LV_DIR_VER);
+	lv_obj_set_scrollbar_mode(grid, LV_SCROLLBAR_MODE_ACTIVE);
+	// No give past either end, so the page does not bounce under a pull from
+	// the bottom edge, which belongs to the album carousel
+	// (coverflow_attach_edge).
+	lv_obj_set_scroll_elastic(grid, false);
+}
+
+// How long the scrollbar stays up when a page that scrolls is shown: long
+// enough to be seen, short enough not to sit over the tiles.
+#define SCROLL_HINT_MS 1500
+
+static lv_timer_t *scroll_hint_timer;
+static lv_obj_t *scroll_hint_grid;
+
+static void scroll_hint_end_cb(lv_timer_t *timer) {
+	(void)timer;
+	scroll_hint_timer = NULL; // a repeat count of one deletes the timer after this call
+	if (scroll_hint_grid) {
+		lv_obj_set_scrollbar_mode(scroll_hint_grid, LV_SCROLLBAR_MODE_ACTIVE);
+		scroll_hint_grid = NULL;
+	}
+}
+
+void gridpage_hint_scroll(lv_obj_t *grid) {
+	if (!grid || !lv_obj_is_scrollable(grid)) {
+		return;
+	}
+	// The page's real size: on its first showing nothing has laid it out yet.
+	lv_obj_update_layout(grid);
+	if (lv_obj_get_scroll_top(grid) + lv_obj_get_scroll_bottom(grid) <= 0) {
+		return; // everything fits, nothing to hint at
+	}
+	if (scroll_hint_timer) {
+		lv_timer_delete(scroll_hint_timer);
+		scroll_hint_timer = NULL;
+		if (scroll_hint_grid && scroll_hint_grid != grid) {
+			lv_obj_set_scrollbar_mode(scroll_hint_grid, LV_SCROLLBAR_MODE_ACTIVE);
+		}
+	}
+	scroll_hint_grid = grid;
+	lv_obj_set_scrollbar_mode(grid, LV_SCROLLBAR_MODE_ON);
+	scroll_hint_timer = lv_timer_create(scroll_hint_end_cb, SCROLL_HINT_MS, NULL);
+	lv_timer_set_repeat_count(scroll_hint_timer, 1);
 }
 
 lv_obj_t *gridpage_empty_panel(lv_obj_t *screen, gui_config_t *cfg, const lv_image_dsc_t *icon, const char *text,

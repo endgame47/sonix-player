@@ -15,7 +15,7 @@
 //  * SF_INFO is described in full because it has to be: libsndfile writes into
 //    it. Its six fields have been these six, in this order, since 1.0.0, and
 //    the sf_count_t at the front is a 64-bit signed count on every build that
-//    has ever shipped -- the device carries 1.0.28;
+//    has ever shipped -- the device carries 1.2.2;
 //  * every symbol is looked up by name and a missing one turns the whole thing
 //    off rather than crashing.
 

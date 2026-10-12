@@ -88,6 +88,11 @@ static const char *const SCHEMA[] = {
 	// and can point at files the index has never seen.
 	"CREATE TABLE IF NOT EXISTS FAVOURITES(path TEXT PRIMARY KEY, name TEXT, artist TEXT, added_at INT)",
 
+	// Also local: how many times each track has been played through, by the
+	// rule Last.fm counts a play by, and when last. Keyed by path and kept apart
+	// from MEDIA_TABLE like the favourites, so a rescan does not forget it.
+	"CREATE TABLE IF NOT EXISTS PLAY_COUNTS(path TEXT PRIMARY KEY, plays INT NOT NULL, last_played INT)",
+
 	// Also local: where playback was left (the "Ricorda traccia" option). One
 	// row only; id is always 0.
 	"CREATE TABLE IF NOT EXISTS PLAYBACK_STATE(id INT PRIMARY KEY, path TEXT, position REAL, updated_at INT)",
@@ -316,6 +321,14 @@ static pthread_mutex_t db_lock = PTHREAD_MUTEX_INITIALIZER;
 	"COALESCE(NULLIF((SELECT m.artist FROM MEDIA_TABLE m WHERE m.path = FAVOURITES.path LIMIT 1), ''), artist)"
 // The title the same way: the library's, then the one written down at starring.
 #define FAV_NAME "COALESCE(NULLIF((SELECT m.name FROM MEDIA_TABLE m WHERE m.path = FAVOURITES.path LIMIT 1), ''), name)"
+
+// The most played tracks: the ones still in the index, most plays first and,
+// between equals, the one played last. The title and the artist are the
+// index's, which is the only place they are kept.
+#define PLAYS_IN_INDEX "EXISTS(SELECT 1 FROM MEDIA_TABLE m WHERE m.path = PLAY_COUNTS.path)"
+#define PLAYS_ORDER "plays DESC, last_played DESC, rowid"
+#define PLAYS_NAME "(SELECT m.name FROM MEDIA_TABLE m WHERE m.path = PLAY_COUNTS.path LIMIT 1)"
+#define PLAYS_ARTIST "(SELECT m.artist FROM MEDIA_TABLE m WHERE m.path = PLAY_COUNTS.path LIMIT 1)"
 
 typedef enum {
 	GEN_MEDIA = 0, // MEDIA_TABLE and the four lookup tables the scan fills
@@ -1274,7 +1287,8 @@ static void backfill_stop_and_wait(void) {
 static bool list_uses_sortkey(library_list_t kind) {
 	// Favourites run by when they were starred and a playlist by the order it
 	// was built, so neither has a sort key to read.
-	return sortkeys_ready && kind != LIBRARY_LIST_FAVOURITES && kind != LIBRARY_LIST_PLAYLIST;
+	return sortkeys_ready && kind != LIBRARY_LIST_FAVOURITES && kind != LIBRARY_LIST_PLAYLIST &&
+		   kind != LIBRARY_LIST_MOST_PLAYED;
 }
 
 static void next_mount_serial(void);
@@ -1437,7 +1451,7 @@ static bool playlist_table(const char *name, char *out, size_t out_size);
 // are found by name.
 static const char *const KEPT_TABLES[] = {
 	"FAVOURITES",			"PLAYBACK_STATE",		"PLAYBACK_QUEUE", "PLAYBACK_QUEUE_STATE",
-	"PLAYBACK_QUEUE_QUERY", "PLAYBACK_QUEUE_ALBUM", "PLAYLIST_MIGRATION",
+	"PLAYBACK_QUEUE_QUERY", "PLAYBACK_QUEUE_ALBUM", "PLAYLIST_MIGRATION",   "PLAY_COUNTS",
 };
 
 // Copies one table from the attached damaged file. A table the damage reaches
@@ -1654,6 +1668,8 @@ static const char *filter_column(library_filter_t filter) {
 		return "album_artist";
 	case LIBRARY_FILTER_GENRE:
 		return "genre";
+	case LIBRARY_FILTER_YEAR:
+		return "year";
 	default:
 		return NULL;
 	}
@@ -1675,6 +1691,11 @@ static const char *filter_where(library_filter_t filter) {
 				   : "album_artist=?1";
 	case LIBRARY_FILTER_GENRE:
 		return genre_links ? "(genre=?1 OR path IN (SELECT path FROM GENRE_LINK WHERE genre=?1))" : "genre=?1";
+	case LIBRARY_FILTER_YEAR:
+		// The tracks of the albums of that year, by the album's year and not
+		// the track's own, so the tracks are those of the records listed.
+		return "(album, album_key) IN (SELECT g.album, g.album_key FROM ALBUM_GROUP_TABLE g WHERE " ALBUM_GROUP_YEAR
+			   " = CAST(?1 AS INTEGER))";
 	default:
 		return NULL;
 	}
@@ -1701,6 +1722,47 @@ bool library_track_title(const char *path, char *out, size_t out_size) {
 		sqlite3_finalize(stmt);
 	}
 	pthread_mutex_unlock(&db_lock);
+	return found;
+}
+
+// The lock is let go between batches, so a scan writing rows or the interface
+// opening a list is never held behind a folder of eight hundred lookups.
+#define TRACK_PLACE_BATCH 64
+
+size_t library_track_places(const char *const *paths, size_t count, library_place_cb cb, void *user) {
+	if (!paths || !cb) {
+		return 0;
+	}
+
+	size_t found = 0;
+	for (size_t start = 0; start < count; start += TRACK_PLACE_BATCH) {
+		size_t end = start + TRACK_PLACE_BATCH < count ? start + TRACK_PLACE_BATCH : count;
+
+		pthread_mutex_lock(&db_lock);
+		sqlite3_stmt *stmt = NULL;
+		if (!db || sqlite3_prepare_v2(db,
+									  "SELECT album, COALESCE(disc,1), dis_id FROM MEDIA_TABLE WHERE path=? LIMIT 1",
+									  -1, &stmt, NULL) != SQLITE_OK) {
+			pthread_mutex_unlock(&db_lock);
+			break;
+		}
+		for (size_t i = start; i < end; i++) {
+			if (!paths[i] || !paths[i][0]) {
+				continue;
+			}
+			sqlite3_bind_text(stmt, 1, paths[i], -1, SQLITE_STATIC);
+			if (sqlite3_step(stmt) == SQLITE_ROW) {
+				const unsigned char *album = sqlite3_column_text(stmt, 0);
+				cb(i, album ? (const char *)album : "", sqlite3_column_int(stmt, 1), sqlite3_column_int(stmt, 2),
+				   user);
+				found++;
+			}
+			sqlite3_reset(stmt);
+			sqlite3_clear_bindings(stmt);
+		}
+		sqlite3_finalize(stmt);
+		pthread_mutex_unlock(&db_lock);
+	}
 	return found;
 }
 
@@ -1737,6 +1799,76 @@ bool library_album_artist(const char *album, char *out, size_t size) {
 	}
 	pthread_mutex_unlock(&db_lock);
 	return found;
+}
+
+bool library_album_info(const char *album, library_album_info_t *out) {
+	if (!out) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	if (!album || !album[0]) {
+		return false;
+	}
+
+	// The artist and the genre of the first track, as library_album_artist()
+	// picks it; the year as ALBUM_GROUP_YEAR works it out for the Albums list.
+	pthread_mutex_lock(&db_lock);
+	bool found = false;
+	sqlite3_stmt *stmt = NULL;
+	if (db && sqlite3_prepare_v2(db,
+								 "SELECT COALESCE(NULLIF(album_artist,''), artist), genre,"
+								 " (SELECT MAX(CASE WHEN year > 0 THEN year END) FROM MEDIA_TABLE WHERE " ALBUM_VALUE_MATCH
+								 ") FROM MEDIA_TABLE WHERE " ALBUM_VALUE_MATCH " ORDER BY COALESCE(disc,1), dis_id LIMIT 1",
+								 -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(stmt, 1, album, -1, SQLITE_TRANSIENT);
+		if (sqlite3_step(stmt) == SQLITE_ROW) {
+			const unsigned char *artist = sqlite3_column_text(stmt, 0);
+			const unsigned char *genre = sqlite3_column_text(stmt, 1);
+			snprintf(out->artist, sizeof(out->artist), "%s", artist ? (const char *)artist : "");
+			snprintf(out->genre, sizeof(out->genre), "%s", genre ? (const char *)genre : "");
+			out->year = sqlite3_column_type(stmt, 2) == SQLITE_NULL ? 0 : sqlite3_column_int(stmt, 2);
+			found = true;
+		}
+		sqlite3_finalize(stmt);
+	}
+	pthread_mutex_unlock(&db_lock);
+	return found;
+}
+
+int library_album_places(const char *album, uint16_t *disc, uint16_t *track, int max) {
+	if (!album || !album[0]) {
+		return 0;
+	}
+
+	// The same rows and the same order as the album's track list (see
+	// list_sql and TRACK_ORDER_IN_ALBUM). Rows the list tells apart only by
+	// name share their disc and number, so which of them comes first does not
+	// change what is written at any position.
+	pthread_mutex_lock(&db_lock);
+	int count = 0;
+	sqlite3_stmt *stmt = NULL;
+	if (db && sqlite3_prepare_v2(db,
+								 "SELECT COALESCE(disc,1), dis_id FROM MEDIA_TABLE WHERE " ALBUM_VALUE_MATCH
+								 " ORDER BY " TRACK_ORDER_IN_ALBUM,
+								 -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(stmt, 1, album, -1, SQLITE_TRANSIENT);
+		while (sqlite3_step(stmt) == SQLITE_ROW) {
+			if (count < max) {
+				int d = sqlite3_column_int(stmt, 0);
+				int t = sqlite3_column_int(stmt, 1);
+				if (disc) {
+					disc[count] = (uint16_t)(d < 1 ? 1 : (d > UINT16_MAX ? UINT16_MAX : d));
+				}
+				if (track) {
+					track[count] = (uint16_t)(t < 0 ? 0 : (t > UINT16_MAX ? UINT16_MAX : t));
+				}
+			}
+			count++;
+		}
+		sqlite3_finalize(stmt);
+	}
+	pthread_mutex_unlock(&db_lock);
+	return count;
 }
 
 bool library_track_names(const char *path, char *title_out, size_t title_size, char *artist_out, size_t artist_size) {
@@ -2034,6 +2166,38 @@ bool library_fav_toggle(const char *path, const char *name, const char *artist) 
 	return now_favourite;
 }
 
+void library_note_play(const char *path) {
+	if (!path || !path[0]) {
+		return;
+	}
+	pthread_mutex_lock(&db_lock);
+	sqlite3_stmt *stmt = NULL;
+	// An upsert and not INSERT OR REPLACE: the row keeps its row id, so an open
+	// list of the most played -- and a queue built on one -- is not left
+	// holding ids that no longer exist. Neither is told: the list takes the
+	// new order the next time it is opened, and a queue playing it goes on in
+	// the order it started with.
+	//
+	// Only a track the index has: a station, a stream's cache file or a file
+	// played from the browser that was never scanned would only fill the table
+	// with rows the list never shows.
+	if (db && sqlite3_prepare_v2(db,
+								 "INSERT INTO PLAY_COUNTS(path, plays, last_played)"
+								 " SELECT ?1, 1, strftime('%s','now') WHERE EXISTS"
+								 " (SELECT 1 FROM MEDIA_TABLE m WHERE m.path = ?1)"
+								 " ON CONFLICT(path) DO UPDATE SET plays = plays + 1, last_played = excluded.last_played",
+								 -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(stmt, 1, path, -1, SQLITE_TRANSIENT);
+		if (sqlite3_step(stmt) != SQLITE_DONE) {
+			fprintf(stderr, "library: play of '%s' not counted: %s\n", path, sqlite3_errmsg(db));
+		} else if (sqlite3_changes(db) > 0) {
+			printf("library: play of '%s' counted\n", path);
+		}
+		sqlite3_finalize(stmt);
+	}
+	pthread_mutex_unlock(&db_lock);
+}
+
 int library_fav_add_many(const library_fav_row_t *rows, int count) {
 	if (!rows || count <= 0) {
 		return 0;
@@ -2180,6 +2344,9 @@ int library_for_each_ordered(library_list_t kind, library_filter_t filter, const
 
 	if (kind == LIBRARY_LIST_FAVOURITES) {
 		snprintf(sql, sizeof(sql), "SELECT name, path, %s FROM FAVOURITES ORDER BY added_at, rowid", FAV_ARTIST);
+	} else if (kind == LIBRARY_LIST_MOST_PLAYED) {
+		snprintf(sql, sizeof(sql), "SELECT " PLAYS_NAME ", path, " PLAYS_ARTIST " FROM PLAY_COUNTS WHERE " PLAYS_IN_INDEX
+								   " ORDER BY " PLAYS_ORDER);
 	} else if (kind == LIBRARY_LIST_TRACKS) {
 		char order_sql[256];
 		track_order_sql(order_sql, sizeof(order_sql), order, col && value && filter == LIBRARY_FILTER_ALBUM, by_name);
@@ -2396,6 +2563,11 @@ static void list_sql(char *sql, size_t size, const char *select, library_list_t 
 		return;
 	}
 
+	if (kind == LIBRARY_LIST_MOST_PLAYED) {
+		snprintf(sql, size, "SELECT %s FROM PLAY_COUNTS WHERE " PLAYS_IN_INDEX " ORDER BY " PLAYS_ORDER, select);
+		return;
+	}
+
 	// A playlist is a table of its own, so the name of the table is the value
 	// the caller passed. It runs in the order it was built -- `idx` -- and
 	// shows what PLAYLIST_SHOWN lets through.
@@ -2428,6 +2600,29 @@ static void list_sql(char *sql, size_t size, const char *select, library_list_t 
 		} else {
 			snprintf(sql, size, "SELECT %s FROM MEDIA_TABLE ORDER BY %s", select, order_sql);
 		}
+		return;
+	}
+
+	// The years, latest first: each year once, named by the row id of one of
+	// its albums, which is how row_by_id_sql() finds the year again. Counted
+	// as the distinct years, since there is no table of them to count.
+	if (kind == LIBRARY_LIST_YEARS) {
+		const char *years =
+			"SELECT g.rowid AS rid, " ALBUM_GROUP_YEAR " AS y FROM ALBUM_GROUP_TABLE g WHERE g.album <> ''";
+		if (strncmp(select, "COUNT(", 6) == 0) {
+			snprintf(sql, size, "SELECT COUNT(DISTINCT y) FROM (%s) WHERE y IS NOT NULL", years);
+		} else {
+			snprintf(sql, size, "SELECT MIN(rid), y FROM (%s) WHERE y IS NOT NULL GROUP BY y ORDER BY y DESC", years);
+		}
+		return;
+	}
+
+	// One year's records, by name.
+	if (kind == LIBRARY_LIST_ALBUMS && filter == LIBRARY_FILTER_YEAR && value) {
+		snprintf(sql, size,
+				 "SELECT %s FROM ALBUM_GROUP_TABLE g WHERE album <> '' AND " ALBUM_GROUP_YEAR
+				 " = CAST(?1 AS INTEGER) ORDER BY %s",
+				 select, list_uses_sortkey(kind) ? "sortkey" : "album COLLATE listorder");
 		return;
 	}
 
@@ -2549,8 +2744,13 @@ static const char *row_by_id_sql(library_list_t kind, const char *value, char *o
 		return "SELECT album_artist, NULL, NULL FROM ALBUM_ARTIST_TABLE WHERE rowid=?";
 	case LIBRARY_LIST_GENRES:
 		return "SELECT genre, NULL, NULL FROM GENRE_TABLE WHERE rowid=?";
+	case LIBRARY_LIST_YEARS:
+		// The row is one of the year's albums, and the name is its year.
+		return "SELECT " ALBUM_GROUP_YEAR ", NULL, NULL FROM ALBUM_GROUP_TABLE g WHERE rowid=?";
 	case LIBRARY_LIST_FAVOURITES:
 		return "SELECT " FAV_NAME ", path, " FAV_ARTIST " FROM FAVOURITES WHERE rowid=?";
+	case LIBRARY_LIST_MOST_PLAYED:
+		return "SELECT " PLAYS_NAME ", path, " PLAYS_ARTIST " FROM PLAY_COUNTS WHERE rowid=?";
 	default:
 		return NULL;
 	}
@@ -2569,6 +2769,10 @@ static const char *name_column(library_list_t kind) {
 		return "album_artist";
 	case LIBRARY_LIST_GENRES:
 		return "genre";
+	case LIBRARY_LIST_MOST_PLAYED:
+		// No name of its own: the table holds the path, and the list is not
+		// filed by letter anyway.
+		return "path";
 	default:
 		return "name";
 	}
@@ -2591,8 +2795,9 @@ library_index_t *library_index_open(library_list_t kind, library_filter_t filter
 	// album/artist/genre, and an album list narrowed to one artist or genre.
 	bool bound = col && value &&
 				 (kind == LIBRARY_LIST_TRACKS ||
-				  (kind == LIBRARY_LIST_ALBUMS && (filter == LIBRARY_FILTER_ARTIST ||
-												   filter == LIBRARY_FILTER_ALBUM_ARTIST || filter == LIBRARY_FILTER_GENRE)));
+				  (kind == LIBRARY_LIST_ALBUMS &&
+				   (filter == LIBRARY_FILTER_ARTIST || filter == LIBRARY_FILTER_ALBUM_ARTIST ||
+					filter == LIBRARY_FILTER_GENRE || filter == LIBRARY_FILTER_YEAR)));
 	// A search binds the pattern the value becomes, not the value.
 	char pattern[2 * 256 + 3];
 	if (filter == LIBRARY_FILTER_SEARCH) {
@@ -2707,7 +2912,8 @@ library_index_t *library_index_open(library_list_t kind, library_filter_t filter
 		// ordered by that letter. Favourites run by when they were starred, an
 		// album by disc position, an artist's records by album -- three lists
 		// whose order has nothing to do with the alphabet.
-		bool by_name = kind != LIBRARY_LIST_FAVOURITES && kind != LIBRARY_LIST_PLAYLIST &&
+		bool by_name = kind != LIBRARY_LIST_FAVOURITES && kind != LIBRARY_LIST_PLAYLIST && kind != LIBRARY_LIST_YEARS &&
+					   kind != LIBRARY_LIST_MOST_PLAYED &&
 					   order != LIBRARY_ORDER_ALBUM && order != LIBRARY_ORDER_ADDED && order != LIBRARY_ORDER_YEAR &&
 					   order != LIBRARY_ORDER_YEAR_DESC &&
 					   !(kind == LIBRARY_LIST_TRACKS && filter == LIBRARY_FILTER_ALBUM);
@@ -2897,7 +3103,9 @@ int library_index_find_path(const library_index_t *ix, const char *path) {
 			return -1;
 		}
 	} else {
-		const char *table = ix->kind == LIBRARY_LIST_FAVOURITES ? "FAVOURITES" : "MEDIA_TABLE";
+		const char *table = ix->kind == LIBRARY_LIST_FAVOURITES	 ? "FAVOURITES"
+							: ix->kind == LIBRARY_LIST_MOST_PLAYED ? "PLAY_COUNTS"
+																   : "MEDIA_TABLE";
 		snprintf(sql, sizeof(sql), "SELECT rowid FROM %s WHERE path = ?", table);
 	}
 

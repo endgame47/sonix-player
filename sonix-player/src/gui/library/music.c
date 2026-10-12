@@ -2,6 +2,9 @@
 
 #include "lvgl/lvgl.h"
 
+#include <stdio.h>
+#include <string.h>
+
 #include "src/gui/library/browser.h"
 #include "src/gui/library/libraryscan.h"
 #include "src/gui/nowplaying/coverflow.h"
@@ -15,6 +18,7 @@
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/switcher.h"
 #include "src/gui/shell/theme.h"
+#include "src/system/core/config.h"
 #include "src/system/core/lang.h"
 #include "src/system/library/library.h"
 
@@ -29,42 +33,230 @@ static void open_album_artists(void) {
 	medialist_open(tr("music_album_artists"), LIBRARY_LIST_ALBUM_ARTISTS, LIBRARY_FILTER_NONE, NULL);
 }
 static void open_genres(void) { medialist_open(tr("music_genres"), LIBRARY_LIST_GENRES, LIBRARY_FILTER_NONE, NULL); }
+static void open_years(void) { medialist_open(tr("music_year"), LIBRARY_LIST_YEARS, LIBRARY_FILTER_NONE, NULL); }
+static void open_favourites(void) {
+	medialist_open(tr("favourites"), LIBRARY_LIST_FAVOURITES, LIBRARY_FILTER_NONE, NULL);
+}
+static void open_most_played(void) {
+	medialist_open(tr("music_most_played"), LIBRARY_LIST_MOST_PLAYED, LIBRARY_FILTER_NONE, NULL);
+}
+static void open_browse(void) { switch_screen(browser_screen); }
+static void open_playlists(void) { playlistpage_open(); }
 
-// Browse and Playlists trade places.
-//
-// The tile is the sixth one and the corner button is the second: which of the
-// two holds which is the "playlists first" option, and nothing else about
-// either of them changes. So there is one opener for each position rather than
-// one for each destination.
 static lv_obj_t *tile_grid;
-static lv_obj_t *playlists_btn;
-static lv_obj_t *playlists_icon;
+static gui_config_t *grid_cfg;
 
-static void open_tile_slot(void) {
-	if (musicsettings_playlists_first()) {
-		playlistpage_open();
-	} else {
-		switch_screen(browser_screen);
+// ---------------------------------------------------------------------------
+// Which tiles, in which order
+//
+// Every tile is in use to begin with, in the order of TILES. The user can put
+// them in another order and leave some out (Music settings > Display options
+// > Library > Rearrange main page); at least one always stays. Both lists are
+// kept in the config by the tiles' names, so a tile added by a later build is
+// simply one the saved lists do not mention, and joins the end of the tiles in
+// use.
+// ---------------------------------------------------------------------------
+
+static const struct {
+	const char *id; // its name in the config, never translated
+	grid_entry_t entry;
+} TILES[MUSIC_TILE_COUNT] = {
+	[MUSIC_TILE_ALL] = {"all", {"music_all_tracks", &icon_menu_all, NULL, open_all_tracks}},
+	[MUSIC_TILE_ALBUMS] = {"albums", {"albums", &icon_menu_album, NULL, open_albums}},
+	[MUSIC_TILE_ARTISTS] = {"artists", {"artists", &icon_menu_artist, NULL, open_artists}},
+	[MUSIC_TILE_ALBUM_ARTISTS] = {"album_artists",
+								  {"music_album_artists", &icon_menu_album_artist, NULL, open_album_artists}},
+	[MUSIC_TILE_GENRES] = {"genres", {"music_genres", &icon_menu_genre, NULL, open_genres}},
+	[MUSIC_TILE_YEARS] = {"years", {"music_year", &icon_menu_year, NULL, open_years}},
+	[MUSIC_TILE_FAVOURITES] = {"favourites", {"favourites", &icon_menu_favourites, NULL, open_favourites}},
+	[MUSIC_TILE_MOST_PLAYED] = {"most_played",
+								{"music_most_played", &icon_menu_most_played, NULL, open_most_played}},
+	[MUSIC_TILE_PLAYLISTS] = {"playlists", {"playlists", &icon_menu_playlist, NULL, open_playlists}},
+	[MUSIC_TILE_BROWSE] = {"browse", {"music_browse", &icon_menu_explorer, NULL, open_browse}},
+};
+
+static music_tile_t in_use[MUSIC_TILE_COUNT];
+static int in_use_n;
+static music_tile_t hidden[MUSIC_TILE_COUNT];
+static int hidden_n;
+static bool order_loaded;
+
+static int tile_by_id(const char *id, size_t len) {
+	for (int i = 0; i < MUSIC_TILE_COUNT; i++) {
+		if (strlen(TILES[i].id) == len && strncmp(TILES[i].id, id, len) == 0) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+static bool listed(const music_tile_t *list, int n, music_tile_t tile) {
+	for (int i = 0; i < n; i++) {
+		if (list[i] == tile) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Reads one saved list ("albums,artists,...") into `list`, skipping names this
+// build does not know and any tile already placed in either list.
+static int parse_list(const char *text, music_tile_t *list) {
+	int n = 0;
+	const char *at = text ? text : "";
+	while (*at) {
+		const char *end = strchr(at, ',');
+		size_t len = end ? (size_t)(end - at) : strlen(at);
+		int tile = tile_by_id(at, len);
+		if (tile >= 0 && !listed(in_use, in_use_n, (music_tile_t)tile) && !listed(hidden, hidden_n, (music_tile_t)tile) &&
+			!listed(list, n, (music_tile_t)tile)) {
+			list[n++] = (music_tile_t)tile;
+		}
+		if (!end) {
+			break;
+		}
+		at = end + 1;
+	}
+	return n;
+}
+
+static void order_load(void) {
+	if (order_loaded) {
+		return;
+	}
+	order_loaded = true;
+	in_use_n = 0;
+	hidden_n = 0;
+	in_use_n = parse_list(config_get("music", "tiles", ""), in_use);
+	hidden_n = parse_list(config_get("music", "tiles_hidden", ""), hidden);
+	// Whatever neither list names is in use, at the end, in the usual order.
+	for (int i = 0; i < MUSIC_TILE_COUNT; i++) {
+		if (!listed(in_use, in_use_n, (music_tile_t)i) && !listed(hidden, hidden_n, (music_tile_t)i)) {
+			in_use[in_use_n++] = (music_tile_t)i;
+		}
+	}
+	if (in_use_n == 0 && hidden_n > 0) {
+		in_use[in_use_n++] = hidden[--hidden_n]; // never an empty page
 	}
 }
 
-static void playlists_cb(lv_event_t *e) {
-	(void)e;
-	if (musicsettings_playlists_first()) {
-		switch_screen(browser_screen);
-	} else {
-		playlistpage_open();
+static void save_list(const char *key, const music_tile_t *list, int n) {
+	char text[160] = "";
+	size_t used = 0;
+	for (int i = 0; i < n; i++) {
+		int wrote = snprintf(text + used, sizeof(text) - used, "%s%s", i ? "," : "", TILES[list[i]].id);
+		if (wrote < 0 || (size_t)wrote >= sizeof(text) - used) {
+			break;
+		}
+		used += (size_t)wrote;
 	}
+	config_set("music", key, text);
+}
+
+// The page's tiles, rebuilt from the lists, and the lists written down.
+static void order_changed(void) {
+	save_list("tiles", in_use, in_use_n);
+	save_list("tiles_hidden", hidden, hidden_n);
+	config_save();
+	music_rebuild_tiles();
+}
+
+static void list_remove(music_tile_t *list, int *n, music_tile_t tile) {
+	for (int i = 0; i < *n; i++) {
+		if (list[i] == tile) {
+			memmove(&list[i], &list[i + 1], (size_t)(*n - i - 1) * sizeof(*list));
+			(*n)--;
+			return;
+		}
+	}
+}
+
+static void list_insert(music_tile_t *list, int *n, music_tile_t tile, int position) {
+	if (position < 0) {
+		position = 0;
+	}
+	if (position > *n) {
+		position = *n;
+	}
+	memmove(&list[position + 1], &list[position], (size_t)(*n - position) * sizeof(*list));
+	list[position] = tile;
+	(*n)++;
+}
+
+int music_tiles_in_use_count(void) {
+	order_load();
+	return in_use_n;
+}
+
+music_tile_t music_tiles_in_use_at(int position) {
+	order_load();
+	return position >= 0 && position < in_use_n ? in_use[position] : MUSIC_TILE_ALL;
+}
+
+int music_tiles_hidden_count(void) {
+	order_load();
+	return hidden_n;
+}
+
+music_tile_t music_tiles_hidden_at(int position) {
+	order_load();
+	return position >= 0 && position < hidden_n ? hidden[position] : MUSIC_TILE_ALL;
+}
+
+void music_tiles_move_in_use(music_tile_t tile, int position) {
+	order_load();
+	if (tile < 0 || tile >= MUSIC_TILE_COUNT) {
+		return;
+	}
+	list_remove(in_use, &in_use_n, tile);
+	list_remove(hidden, &hidden_n, tile);
+	list_insert(in_use, &in_use_n, tile, position);
+	order_changed();
+}
+
+bool music_tiles_move_hidden(music_tile_t tile, int position) {
+	order_load();
+	if (tile < 0 || tile >= MUSIC_TILE_COUNT) {
+		return false;
+	}
+	// The last tile in use stays: a Music page with nothing on it has no way
+	// into the library at all.
+	if (listed(in_use, in_use_n, tile) && in_use_n <= 1) {
+		return false;
+	}
+	list_remove(in_use, &in_use_n, tile);
+	list_remove(hidden, &hidden_n, tile);
+	list_insert(hidden, &hidden_n, tile, position);
+	order_changed();
+	return true;
+}
+
+const char *music_tile_tag(music_tile_t tile) {
+	return tile >= 0 && tile < MUSIC_TILE_COUNT ? TILES[tile].entry.label : "";
+}
+
+const lv_image_dsc_t *music_tile_icon(music_tile_t tile) {
+	return tile >= 0 && tile < MUSIC_TILE_COUNT ? TILES[tile].entry.icon : NULL;
+}
+
+void music_rebuild_tiles(void) {
+	if (!tile_grid || !grid_cfg) {
+		return;
+	}
+	order_load();
+	grid_entry_t entries[MUSIC_TILE_COUNT];
+	for (int i = 0; i < in_use_n; i++) {
+		entries[i] = TILES[in_use[i]].entry;
+	}
+	// Tiles at the size of the other sections' six: past the third row the
+	// page scrolls.
+	gridpage_set_entries(tile_grid, grid_cfg, entries, in_use_n, 2, 3, true);
+	lv_obj_scroll_to_y(tile_grid, 0, LV_ANIM_OFF);
 }
 
 static void search_cb(lv_event_t *e) {
 	(void)e;
 	search_open();
-}
-
-static void favourites_cb(lv_event_t *e) {
-	(void)e;
-	medialist_open(tr("favourites"), LIBRARY_LIST_FAVOURITES, LIBRARY_FILTER_NONE, NULL);
 }
 
 // With no tracks indexed the tiles would all open empty lists: the page says
@@ -78,7 +270,12 @@ static void scan_cb(lv_event_t *e) {
 
 static void screen_loaded_cb(lv_event_t *e) {
 	(void)e;
-	gridpage_show_empty(tile_grid, empty_panel, !library_scan_running() && library_track_count() == 0);
+	bool empty = !library_scan_running() && library_track_count() == 0;
+	gridpage_show_empty(tile_grid, empty_panel, empty);
+	// More tiles than the screen holds: the scrollbar shows for a moment.
+	if (!empty) {
+		gridpage_hint_scroll(tile_grid);
+	}
 }
 
 // The corner buttons share everything but icon and action.
@@ -100,53 +297,27 @@ static lv_obj_t *corner_button(gui_config_t *cfg, int slot, const lv_image_dsc_t
 }
 
 void music_init(gui_config_t *cfg) {
-	const grid_entry_t entries[] = {
-		{"music_all_tracks", &icon_menu_all, NULL, open_all_tracks},
-		{"albums", &icon_menu_album, NULL, open_albums},
-		{"artists", &icon_menu_artist, NULL, open_artists},
-		{"music_album_artists", &icon_menu_album_artist, NULL, open_album_artists},
-		{"music_genres", &icon_menu_genre, NULL, open_genres},
-		// An opener rather than a target: what this tile is depends on the
-		// option, and music_refresh_layout() paints it accordingly.
-		{"music_browse", &icon_menu_explorer, NULL, open_tile_slot},
-	};
-
-	lv_obj_t *grid = gridpage_build(music_screen, cfg, entries, (int)(sizeof(entries) / sizeof(entries[0])), 2, 3, true);
+	// Built empty and filled from the saved order. With more tiles than the
+	// three rows other sections have, the page scrolls to the rest.
+	grid_cfg = cfg;
+	lv_obj_t *grid = gridpage_build(music_screen, cfg, NULL, 0, 2, 3, true);
 	tile_grid = grid;
+	gridpage_set_scrolling(grid);
+	music_rebuild_tiles();
 
 	// The pull from the bottom edge that opens the album carousel. It goes on
 	// the grid because that is where a tile's press stops bubbling.
 	coverflow_attach_edge(grid, cfg);
 
-	// Four buttons in the corner, so the heading has to be told to clear them.
-	settingsrow_title_corner_slots(settingsrow_title(music_screen, cfg, "music"), cfg, 4);
+	// Two buttons in the corner, so the heading has to be told to clear them.
+	settingsrow_title_corner_slots(settingsrow_title(music_screen, cfg, "music"), cfg, 2);
 
 	lv_obj_t *settings_btn = corner_button(cfg, 0, &icon_music_settings);
 	lv_obj_add_event_cb(settings_btn, switch_screen_cb, LV_EVENT_CLICKED, musicsettings_screen);
 
-	playlists_btn = corner_button(cfg, 1, &icon_list_music);
-	playlists_icon = lv_obj_get_child(playlists_btn, 0);
-	lv_obj_add_event_cb(playlists_btn, playlists_cb, LV_EVENT_CLICKED, NULL);
-
-	lv_obj_t *favourites_btn = corner_button(cfg, 2, &icon_star_corner);
-	lv_obj_add_event_cb(favourites_btn, favourites_cb, LV_EVENT_CLICKED, NULL);
-
-	lv_obj_t *search_btn = corner_button(cfg, 3, &icon_search);
+	lv_obj_t *search_btn = corner_button(cfg, 1, &icon_search);
 	lv_obj_add_event_cb(search_btn, search_cb, LV_EVENT_CLICKED, NULL);
 
 	empty_panel = gridpage_empty_panel(music_screen, cfg, &icon_music_note, "music_no_database", scan_cb);
 	lv_obj_add_event_cb(music_screen, screen_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
-
-	music_refresh_layout();
-}
-
-void music_refresh_layout(void) {
-	bool playlists_first = musicsettings_playlists_first();
-
-	gridpage_set_tile(tile_grid, 5, playlists_first ? &icon_menu_playlist : &icon_menu_explorer,
-					  playlists_first ? "playlists" : "music_browse");
-
-	if (playlists_icon) {
-		lv_image_set_src(playlists_icon, playlists_first ? &icon_folder_corner : &icon_list_music);
-	}
 }

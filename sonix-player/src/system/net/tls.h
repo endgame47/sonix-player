@@ -7,7 +7,7 @@
 // TLS for http.c, on top of the OpenSSL the device already ships.
 //
 // The rootfs carries /usr/lib/libssl.so.1.1 and libcrypto.so.1.1 (OpenSSL
-// 1.1.1f), because the stock player links libcurl. The cross toolchain has no
+// 1.1.1w from the assets, see tools/system-libs). The cross toolchain has no
 // headers for them and nothing to link against, so they are opened at run time
 // with dlopen() and the two dozen functions needed are looked up by name. That
 // is the only way to use a library present on the target and absent from the

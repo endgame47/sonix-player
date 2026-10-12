@@ -111,6 +111,9 @@ void bluetooth_pair(const char *mac);
 void bluetooth_connect(const char *mac);
 void bluetooth_disconnect(const char *mac);
 void bluetooth_forget(const char *mac);
+// The name a paired device is shown under on this player. An empty name gives
+// it back the one it announces itself. False when Bluetooth is off.
+bool bluetooth_rename(const char *mac, const char *name);
 
 // The outcome of the last action the user asked for, reported once.
 bt_op_t bluetooth_take_op_result(char *name_out, int name_size);

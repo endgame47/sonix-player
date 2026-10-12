@@ -225,8 +225,8 @@ inside the folder. That is how the resource tree gets installed:
 assets/R3PII/                           (and assets/R1/, the same shape)
 ├── etc/                             boot logos at the panel's size, D-Bus policy, certificates, S80_bt_init
 ├── usr/
-│   ├── bin/                         bluealsa
-│   ├── lib/                         the bluealsa ALSA plugin
+│   ├── bin/                         bluealsa, ntfs-3g, thttpd
+│   ├── lib/                         the bluealsa ALSA plugin, and OpenSSL, libupnp, libsndfile and fdk-aac (see "System libraries" below)
 │   ├── resource/
 │   │   └── sonix/
 │   │       ├── language/            the 8 .ini files
@@ -307,7 +307,11 @@ It runs through without asking anything, once for each model:
    loads it from (it is HiBy's, so it is not in the assets); then copies
    `assets/<model>/` over the rootfs and installs
    `usr/bin/sonix_launch` and has the launcher script exec it (skipped with a warning
-   if it is not there)
+   if it is not there). Before the copy, a library in `assets/<model>/usr/lib`
+   takes the place of the stock one: the stock versioned file it replaces goes
+   (`libupnp.so.6.3.4` for `libupnp.so.6`, and so on), the symlinks to it are
+   pointed at the new file, and the stock `libntfs-3g` goes, which the new
+   `ntfs-3g` has linked in
 6. deletes the stock interface's own resources - `litegui`, `layout`, `str`,
    `fonts`.
 7. checks the `device-name` in `system-info.json` and writes the build stamp
@@ -341,6 +345,36 @@ carried across from the stock firmware.
 | board | `gpio_aw95016_add.ko`, `sau.ko`, `sa_sound_hbc3000.ko` (the HBC3000 FPGA; its configuration comes from the stock firmware, see step 5 above) | |
 | on both | `cw2015.ko` (fuel gauge), `soc_efuse.ko`, `soc_adc.ko`, `rmem_manager.ko`, `i2c_gpio_add.ko` (the DAC's I2C bus), `keyboard_gpio_add.ko` (power and track keys), `sa_sound_switch.ko`, `sa_earpods_adc.ko`, `pwm_backlight.ko`, `soc_utils.ko`, `sa_config_module.ko`, `utils.ko` (the helpers the other modules link against), `soc_gpio.ko` (`/dev/gpio`), `sa_hgl_dma.ko` (`/dev/sa_hgl_dma`), `soc_aic.ko` (the I2S controller), `soc_pwm.ko` (the PWM controller), `soc_i2c.ko` (the I2C controllers), `soc_fb.ko` (the LCD controller, `/dev/fb0`), `soc_msc.ko` (the MMC/SD controllers: the microSD slot and the Wi-Fi chip's SDIO), `axp2101.ko` (the PMIC: regulators and power off) | the same |
 | Wi-Fi | `brcmfmac.ko`, `brcmutil.ko` and `bcm_wlbt_power.ko` in place of `cywdhd.ko` | the same |
+
+### System libraries
+
+`assets/<model>/usr/lib` and `usr/bin` carry newer builds of libraries and
+programs the stock firmware has, the same files in both models:
+
+| | stock | assets |
+|---|---|---|
+| `libssl.so.1.1`, `libcrypto.so.1.1` | OpenSSL 1.1.1f | 1.1.1w |
+| `libupnp.so.6`, `libixml.so.2`, `libthreadutil.so.6` | pupnp 1.6.21 | 1.6.25 |
+| `libsndfile.so.1` | 1.0.28 | 1.2.2 |
+| `libfdk-aac.so.2` | 2.0.1 | 2.0.3 |
+| `ntfs-3g` | 2015.3.14 | 2022.10.3, with libntfs-3g linked in |
+| `thttpd` | 2.27 | 2.29 |
+
+The sonames, paths and build options are the stock ones, so the stock
+programs that use them (`wpa_supplicant`, `ntpd`, `curl`, `adbd`, `dmrd`,
+`shairport`, `bluealsa`) load them unchanged. They are built by
+`tools/system-libs/build.sh` from the upstream sources, against the device's
+own glibc 2.22 taken from a stock rootfs, and checked with
+`tools/system-libs/abicheck.py`:
+
+```bash
+# Ubuntu 24.04, or docker run -it -v "$PWD":/w ubuntu:24.04
+apt install gcc-9-mipsel-linux-gnu binutils-mipsel-linux-gnu libc6-dev-mipsel-cross \
+    autoconf automake libtool pkg-config make git perl python3-pyelftools zlib1g-dev
+tools/system-libs/build.sh <extracted stock rootfs> out
+```
+
+`out/usr/lib` and `out/usr/bin` then go into `assets/R3PII/` and `assets/R1/`.
 
 ### Patches
 
@@ -453,7 +487,8 @@ sonix-player/
 │   │   │
 │   │   └── main.c                   entry point: display, input, and the startup order
 │   │
-│   ├── tools/                       generators, and the multitouch patches for the stock touch drivers
+│   ├── tools/                       generators, the multitouch patches for the stock touch drivers,
+│   │                                and system-libs/, the build of the system libraries in the assets
 │   │
 │   ├── web/                         Wi-Fi transfer page, source of src/system/net/webpage.h
 │   │   ├── icons/                   26 Lucide glyphs, inlined as <symbol>

@@ -1804,6 +1804,33 @@ static void edge_committed_clear_cb(void *unused) {
 	edge_committed = false;
 }
 
+// A page that scrolls would take the pull from the bottom edge as a scroll of
+// its own. While a press that started in the band is being watched, the page
+// is made unscrollable, and so is the way up to its parents, so LVGL finds
+// nothing to scroll and the pull moves the sheet alone. The page gets back
+// exactly what it had when the finger lifts, or as soon as the finger heads
+// down instead, which is a scroll of the page and not a pull.
+static lv_obj_t *held_page;
+static bool held_scrollable;
+static bool held_chain_ver;
+
+static void page_hold(lv_obj_t *page) {
+	held_page = page;
+	held_scrollable = lv_obj_is_scrollable(page);
+	held_chain_ver = lv_obj_is_scroll_chain_ver(page);
+	lv_obj_set_scrollable(page, false);
+	lv_obj_set_scroll_chain_ver(page, false);
+}
+
+static void page_release(void) {
+	if (!held_page) {
+		return;
+	}
+	lv_obj_set_scrollable(held_page, held_scrollable);
+	lv_obj_set_scroll_chain_ver(held_page, held_chain_ver);
+	held_page = NULL;
+}
+
 static void edge_drag_cb(lv_event_t *e) {
 	static bool tracking;
 	static bool armed;
@@ -1817,10 +1844,17 @@ static void edge_drag_cb(lv_event_t *e) {
 	int band = (int)(uintptr_t)lv_event_get_user_data(e);
 
 	if (code == LV_EVENT_PRESSED) {
+		page_release();
 		lv_indev_get_point(indev, &start);
 		tracking = coverflow_enabled() && !sheet_open && start.y >= band;
 		armed = false;
+		if (tracking) {
+			page_hold(lv_event_get_current_target(e));
+		}
 		return;
+	}
+	if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+		page_release();
 	}
 	if (!tracking) {
 		return;
@@ -1832,6 +1866,11 @@ static void edge_drag_cb(lv_event_t *e) {
 
 	if (code == LV_EVENT_PRESSING) {
 		if (!armed) {
+			if (dy >= CF_EDGE_COMMIT_PX) {
+				tracking = false;
+				page_release();
+				return;
+			}
 			int dx = p.x - start.x;
 			int adx = dx < 0 ? -dx : dx;
 			if (dy > -CF_EDGE_COMMIT_PX || -dy <= adx) {
@@ -1839,6 +1878,7 @@ static void edge_drag_cb(lv_event_t *e) {
 			}
 			if (!sheet_drag_begin()) {
 				tracking = false;
+				page_release();
 				return;
 			}
 			armed = true;
