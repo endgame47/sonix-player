@@ -1296,9 +1296,13 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 	
 	uint16_t packed;
 	size_t at;
+	uint8_t opa;
 
 	uint16_t *colour = (uint16_t *)visualizer_buf;
+	uint8_t *alpha = visualizer_buf + (size_t)width * height * 2;
+	memset(alpha, 0, (size_t)width * height);
 
+	/*
 	// Fill the canvas with a dark background, which is the same colour as the panel behind it. 
 	lv_color_t visualizer_bg = lv_color_make(12, 5, 24);
 
@@ -1306,7 +1310,9 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 
 	for (size_t i = 0; i < width * height; i++) {
     	colour[i] = packed;
+		alpha[i] = 0;
 	}
+	*/
 
 	float level = 0.0f;
 	float peak_level = 0.0f;
@@ -1316,14 +1322,14 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 	bool playing = audio_get_status() == AUDIO_STATUS_PLAYING;
 
 	if ( 1 == 1 ) {
-		// Horizontal spectrum, which is a set of vertical bars that rise from a baseline. 
-		// The bars are modulated in height and colour to make them feel like a spectrum 
-		// rather than a set of unrelated dots. 
+		// Horizontal spectrum 
 		
 		// Baseline
-		int baseline = height * 3 / 4;
+		int baseline = height; // height * 3 / 4;
 		int max_height = height * 48 / 100;
 		int bar_top_limit = LV_MAX(0, baseline - max_height);
+
+		/*
 		lv_color_t baseline_color = lv_color_make(35, 94, 116);
 
 		packed = rgb888_to_rgb565(baseline_color);
@@ -1331,10 +1337,10 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 		for (int x = 0; x < width; x++) {
 			at = (size_t)baseline * width + x;
 			colour[at] = packed;
+			alpha[at] = 255;
 		}
+		*/
 
-		// Each bin rises from the same baseline, with a dim reflection and a
-		// decaying peak marker above the current level.
 		for (int segment = 0; segment < AUDIO_VISUALIZER_BINS; segment++) {
 			float magnitude = spectrum[segment];
 			magnitude *= 0.55f + sqrtf(level) * 0.45f;
@@ -1355,7 +1361,11 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 			int bar_top = LV_MAX(bar_top_limit, baseline - bar_height);
 			int peak_y = LV_MAX(bar_top_limit, baseline - (int)(*held_peak * max_height));
 
+			// Opacity is based on magnitude. Used for bars and peak marker.
+			opa = (uint8_t)(215.0f * magnitude * 2);
+
 			if (playing) {
+				// Bar
 				for (int y = baseline - 1; y >= bar_top; y--) {
 					float position = (float)(baseline - 1 - y) / LV_MAX(1, bar_height - 1);
 					lv_color_t color = lv_color_make(
@@ -1365,9 +1375,12 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 					for (int x = x_start; x < x_end; x++) {
 						at = (size_t)y * width + x;
 						colour[at] = rgb888_to_rgb565(color);
+						alpha[at] = opa;
 					}
 				}
 
+				/*
+				// Reflection
 				int reflection_height = bar_height / 3;
 				for (int y = baseline + 1; y <= baseline + reflection_height && y < height; y++) {
 					float fade = 1.0f - (float)(y - baseline) / LV_MAX(1, reflection_height);
@@ -1377,14 +1390,17 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 						colour[at] = rgb888_to_rgb565(reflection);
 					}
 				}
+				*/
 			}
 
+			// Peak marker
 			if (peak_y < baseline) {
 				float brightness = 0.65f + 0.35f * peak_level;
 				lv_color_t marker = lv_color_make(255, (uint8_t)(215.0f * brightness), 255);
 				for (int x = x_start; x < x_end; x++) {
 					at = (size_t)peak_y * width + x;
 					colour[at] = rgb888_to_rgb565(marker);
+					alpha[at] = opa;
 				}
 			}
 		}
@@ -5429,21 +5445,26 @@ void player_init(gui_config_t *cfg) {
 	lv_obj_center(cover_img);
 	lv_obj_set_hidden(cover_img, true);
 
+	// FIXME: position/size correctly for alternative layout.
+
 	// The generated visualizer is a sibling of the artwork panel. It has no
 	// image source or artwork child and is hidden until the cover panel opens it.
-	visualizer_canvas = lv_canvas_create(player_screen);
-	lv_obj_set_size(visualizer_canvas, cfg->screen_width, cfg->screen_height);
+	visualizer_canvas = lv_canvas_create(cover_panel);
+	lv_obj_set_size(visualizer_canvas, cover_size, cover_size);
 	lv_obj_set_pos(visualizer_canvas, 0, 0);
 	lv_obj_set_clickable(visualizer_canvas, true);
 	lv_obj_add_event_cb(visualizer_canvas, visualizer_canvas_click_cb,
 		LV_EVENT_CLICKED, NULL);
 	lv_obj_set_hidden(visualizer_canvas, true);
-	visualizer_buf = malloc((size_t)cfg->screen_width *
-		(size_t)cfg->screen_height * 2);
+	visualizer_buf = malloc((size_t)cover_size *
+		(size_t)cover_size * 3);
 	if (visualizer_buf) {
 		lv_canvas_set_buffer(visualizer_canvas, visualizer_buf,
-			cfg->screen_width, cfg->screen_height, LV_COLOR_FORMAT_RGB565);
+			cover_size, cover_size, LV_COLOR_FORMAT_RGB565A8);
 	}
+
+	// Blend mode experiment
+	lv_obj_set_style_blend_mode(visualizer_canvas, LV_BLEND_MODE_DIFFERENCE, 0);
 
 	// ---------------------------------------------------------------------
 	// Studio: the blurred sleeve behind the whole screen, and everything else
