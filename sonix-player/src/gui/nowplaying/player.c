@@ -1294,7 +1294,7 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 	int width = (int)lv_obj_get_width(visualizer_canvas);
 	int height = (int)lv_obj_get_height(visualizer_canvas);
 	
-	uint16_t packed;
+	// uint16_t packed;
 	size_t at;
 	uint8_t opa;
 
@@ -1320,6 +1320,16 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 	audio_get_visualizer_frame(spectrum, &level, &peak_level);
 	
 	bool playing = audio_get_status() == AUDIO_STATUS_PLAYING;
+
+	lv_color_t complement = chrome_accent();
+	lv_color_t accent = theme()->panel;
+
+	//*
+	lv_color_hsv_t complement_hsv = lv_color_to_hsv(complement);
+	// Increase saturation
+	complement_hsv.s = LV_MIN(100, complement_hsv.s + 20);
+	complement = lv_color_hsv_to_rgb(complement_hsv.h, complement_hsv.s, complement_hsv.v);
+	//*/
 
 	if ( 1 == 1 ) {
 		// Horizontal spectrum 
@@ -1362,16 +1372,17 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 			int peak_y = LV_MAX(bar_top_limit, baseline - (int)(*held_peak * max_height));
 
 			// Opacity is based on magnitude. Used for bars and peak marker.
-			opa = (uint8_t)(215.0f * magnitude * 2);
+			opa = (uint8_t)(215.0f * magnitude * 3); // boost by * 3 to make it more opaque
+			opa = LV_MIN(opa, 255);
 
 			if (playing) {
 				// Bar
 				for (int y = baseline - 1; y >= bar_top; y--) {
 					float position = (float)(baseline - 1 - y) / LV_MAX(1, bar_height - 1);
 					lv_color_t color = lv_color_make(
-						(uint8_t)(245.0f * position),
-						(uint8_t)(225.0f - 195.0f * position),
-						(uint8_t)(245.0f - 25.0f * position));
+						(uint8_t)(accent.red + (complement.red - accent.red) * position),
+						(uint8_t)(accent.green + (complement.green - accent.green) * position),
+						(uint8_t)(accent.blue + (complement.blue - accent.blue) * position));
 					for (int x = x_start; x < x_end; x++) {
 						at = (size_t)y * width + x;
 						colour[at] = rgb888_to_rgb565(color);
@@ -1396,7 +1407,10 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 			// Peak marker
 			if (peak_y < baseline) {
 				float brightness = 0.65f + 0.35f * peak_level;
-				lv_color_t marker = lv_color_make(255, (uint8_t)(215.0f * brightness), 255);
+				lv_color_t marker = lv_color_make(
+					(uint8_t)(accent.red + (complement.red - accent.red) * brightness),
+					(uint8_t)(accent.green + (complement.green - accent.green) * brightness),
+					(uint8_t)(accent.blue + (complement.blue - accent.blue) * brightness));				
 				for (int x = x_start; x < x_end; x++) {
 					at = (size_t)peak_y * width + x;
 					colour[at] = rgb888_to_rgb565(marker);
@@ -5464,7 +5478,7 @@ void player_init(gui_config_t *cfg) {
 	}
 
 	// Blend mode experiment
-	lv_obj_set_style_blend_mode(visualizer_canvas, LV_BLEND_MODE_DIFFERENCE, 0);
+	// lv_obj_set_style_blend_mode(visualizer_canvas, LV_BLEND_MODE_DIFFERENCE, 0);
 
 	// ---------------------------------------------------------------------
 	// Studio: the blurred sleeve behind the whole screen, and everything else
