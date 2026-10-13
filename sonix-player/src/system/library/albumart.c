@@ -36,9 +36,10 @@ static uint32_t syncsafe32(const uint8_t *b) {
 		   (uint32_t)(b[3] & 0x7F);
 }
 
-// Only JPEG and PNG reach the GUI: those are the two formats the image decoder
-// is built with, and together they cover essentially every tagged file in the
-// wild.
+// Only JPEG, PNG and GIF reach the GUI: those are the formats the image decoder
+// is built with. The first two cover essentially every tagged file in the
+// wild; GIF is there for radio stations' icons, and is drawn wherever else it
+// turns up as well.
 static bool is_supported_image(const uint8_t *data, size_t size) {
 	if (!data || size < 12)
 		return false;
@@ -50,6 +51,10 @@ static bool is_supported_image(const uint8_t *data, size_t size) {
 	// PNG: 89 'P' 'N' 'G' 0D 0A 1A 0A
 	static const uint8_t png_magic[] = {0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A};
 	if (memcmp(data, png_magic, sizeof(png_magic)) == 0)
+		return true;
+
+	// GIF: "GIF87a" or "GIF89a"
+	if (memcmp(data, "GIF8", 4) == 0 && (data[4] == '7' || data[4] == '9') && data[5] == 'a')
 		return true;
 
 	return false;

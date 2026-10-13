@@ -428,6 +428,13 @@ int library_fav_add_many(const library_fav_row_t *rows, int count);
 // favourites and are not any more.
 int library_fav_remove_many(const char *const *paths, int count);
 
+// Takes out of the index the tracks of files that have been deleted: each path
+// a file, a cue sheet or a folder, and of the tracks it stands for only those
+// whose file is no longer on the card -- so a delete that stopped halfway
+// leaves in what it left behind. Their favourites and play counts go with
+// them. Returns how many tracks went.
+int library_forget_deleted(const char *const *paths, int count);
+
 // Removes from the favourites (and from the saved playback state) everything
 // under `prefix`. It is what clears rows pointing into the stream cache, whose
 // files are emptied and would otherwise show as dead favourites. Run once at

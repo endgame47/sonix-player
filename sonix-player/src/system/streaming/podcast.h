@@ -36,6 +36,10 @@
 #define PODCAST_AUTHOR_MAX 120
 #define PODCAST_URL_MAX 512
 #define PODCAST_PAGE_LIMIT 60
+// The feed's own address, the RSS. Shorter than the other addresses: it is
+// kept for every followed podcast and in every list of podcasts, and a feed
+// address is rarely a third of this.
+#define PODCAST_FEED_URL_MAX 384
 
 // The ids are 64-bit, and not out of generosity: on this device `long` is
 // 32-bit, and Podcast Index numbers episodes with eleven digits (16795090626
@@ -50,7 +54,8 @@ typedef struct {
 	char title[PODCAST_TITLE_MAX];
 	char author[PODCAST_AUTHOR_MAX];
 	char image[PODCAST_URL_MAX];
-	int episode_count; // 0 when the catalogue does not say
+	char url[PODCAST_FEED_URL_MAX]; // the RSS feed; "" when not known
+	int episode_count;				 // 0 when the catalogue does not say
 } podcast_feed_t;
 
 typedef struct {
@@ -90,6 +95,11 @@ int podcast_episodes(long long feed_id, podcast_episode_t *out, int max);
 // A single podcast, by id. Needed by "My podcasts", which stores ids rather
 // than titles, so a podcast that is renamed stays the right one.
 bool podcast_feed(long long feed_id, podcast_feed_t *out);
+
+// A podcast found by the address of its feed, the way an OPML file names it.
+// 1 when found, 0 when the catalogue does not have it, -1 when the catalogue
+// could not be asked (podcast_last_error() says why).
+int podcast_feed_by_url(const char *url, podcast_feed_t *out);
 
 // A single episode. Needed by the player, which has the id from the sidecar and
 // wants to know which podcast it belongs to.

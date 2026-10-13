@@ -22,6 +22,7 @@ static lv_obj_t *btn_clock[4]; // left / centre / right / hidden
 static lv_obj_t *btn_accent[THEME_ACCENT_COUNT]; // the coloured circles
 static lv_obj_t *tint_toggle;
 static lv_obj_t *battery_percent_toggle;
+static lv_obj_t *statusbar_always_toggle;
 static lv_obj_t *rounded_corners_toggle;
 static lv_obj_t *text_size_pill[2]; // normal / large
 // The status bar draws the battery either way; this setting is only about the
@@ -31,6 +32,14 @@ static void battery_percent_cb(lv_event_t *e) {
 	bool shown = lv_obj_has_state(battery_percent_toggle, LV_STATE_CHECKED);
 	topbar_set_battery_percent(shown);
 	config_set_int("screen", "battery_percent", shown ? 1 : 0);
+	config_save();
+}
+
+static void statusbar_always_cb(lv_event_t *e) {
+	(void)e;
+	bool on = lv_obj_has_state(statusbar_always_toggle, LV_STATE_CHECKED);
+	player_set_statusbar_always(on);
+	config_set_int("screen", "statusbar_always", on ? 1 : 0);
 	config_save();
 }
 
@@ -318,6 +327,19 @@ void appearance_init(gui_config_t *cfg) {
 	if (config_get_int("screen", "battery_percent", 1) != 0) {
 		lv_obj_add_state(battery_percent_toggle, LV_STATE_CHECKED);
 	}
+
+	// The bar up in the player too, where it otherwise steps aside for the
+	// artwork.
+	settingsrow_toggle(container, "appearance_statusbar_always", &statusbar_always_toggle, statusbar_always_cb);
+	if (player_statusbar_always()) {
+		lv_obj_add_state(statusbar_always_toggle, LV_STATE_CHECKED);
+	}
+	lv_obj_t *statusbar_note = lv_label_create(container);
+	lv_label_set_long_mode(statusbar_note, LV_LABEL_LONG_WRAP);
+	lv_obj_set_width(statusbar_note, lv_pct(100));
+	lv_obj_add_style(statusbar_note, &theme_style_text_dim, 0);
+	lv_obj_set_style_text_font(statusbar_note, &font_ui_22, 0);
+	lv_label_set_text(statusbar_note, tr("appearance_statusbar_always_note"));
 
 	// Rounds off the four corners of the screen, over every page and overlay.
 	settingsrow_toggle(container, "appearance_rounded_corners", &rounded_corners_toggle, rounded_corners_cb);

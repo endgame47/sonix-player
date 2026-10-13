@@ -121,8 +121,7 @@ typedef enum {
 	// The name the adapter answers with. Carried in g_local_name rather than in
 	// the job: a name is longer than `text` holds.
 	JOB_SET_NAME,
-	// A paired device's name on this player: the device is the job's mac, the
-	// name is in g_alias_name for the same reason as above.
+	// Wakes the worker for the renames waiting in g_renames.
 	JOB_SET_ALIAS,
 	JOB_SET_CODEC, // text: the codec to switch to
 	JOB_VOLUME,	   // arg_int: percent, for AVRCP absolute volume
@@ -168,8 +167,21 @@ static bt_op_t g_op = BT_OP_IDLE;
 static char g_op_name[BT_NAME_MAX];
 
 static char g_local_name[BT_NAME_MAX] = "HiBy Music";
-// The name a JOB_SET_ALIAS gives its device.
-static char g_alias_name[BT_NAME_MAX];
+
+// Renames typed but not yet handed to bluez, one per device.
+//
+// The worker can be busy for half a minute with something long -- going back
+// to the last headphones after a wake, a connection to a device that is
+// switched off, a search -- and a device that is not connected is exactly the
+// one those are about. So a rename does not wait in the queue behind them: the
+// long steps hand it over between their own waits (apply_renames), and until
+// bluez has it the lists already show the new name (refresh_devices).
+#define RENAMES_MAX 4
+static struct {
+	bool pending;
+	char mac[BT_MAC_MAX];
+	char name[BT_NAME_MAX]; // empty: back to the name the device announces
+} g_renames[RENAMES_MAX];
 
 // A2DP. There is deliberately no on/off switch here, as in the stock player:
 // connected headphones are the output, and a switch that could send the music
@@ -1607,6 +1619,19 @@ static void refresh_devices(void) {
 	}
 
 	pthread_mutex_lock(&lock);
+	// A rename bluez does not have yet is shown already. Not one back to the
+	// announced name: that name is bluez's to give, and it comes with the
+	// refresh after the rename.
+	for (int r = 0; r < RENAMES_MAX; r++) {
+		if (!g_renames[r].pending || !g_renames[r].name[0]) {
+			continue;
+		}
+		for (int i = 0; i < paired_count; i++) {
+			if (strcasecmp(paired[i].mac, g_renames[r].mac) == 0) {
+				snprintf(paired[i].name, sizeof(paired[i].name), "%s", g_renames[r].name);
+			}
+		}
+	}
 	memcpy(g_paired, paired, sizeof(bt_device_t) * (size_t)paired_count);
 	g_paired_count = paired_count;
 	memcpy(g_found, found, sizeof(bt_device_t) * (size_t)found_count);
@@ -1620,6 +1645,43 @@ static void refresh_devices(void) {
 	pthread_mutex_unlock(&lock);
 
 	refresh_audio_state();
+}
+
+// Hands bluez every rename waiting for it. Worker only: bluez is asked over the
+// worker's own connection. Cheap when there is none, so the long steps call it
+// between their waits.
+static void apply_renames(void) {
+	bool changed = false;
+	for (int r = 0; r < RENAMES_MAX; r++) {
+		pthread_mutex_lock(&lock);
+		bool pending = g_renames[r].pending;
+		char mac[BT_MAC_MAX];
+		char name[BT_NAME_MAX];
+		snprintf(mac, sizeof(mac), "%s", g_renames[r].mac);
+		snprintf(name, sizeof(name), "%s", g_renames[r].name);
+		pthread_mutex_unlock(&lock);
+		if (!pending) {
+			continue;
+		}
+
+		fprintf(stderr, "bluetooth: renaming %s to '%s'\n", mac, name);
+		if (!btstack_set_device_alias(mac, name)) {
+			fprintf(stderr, "bluetooth: bluez did not take the new name of %s\n", mac);
+		}
+
+		// Done with, whatever bluez answered: a name it refused would otherwise
+		// stay on screen as if it had been taken. Unless it was typed again in
+		// the meantime, in which case the new one is still to go.
+		pthread_mutex_lock(&lock);
+		if (strcasecmp(g_renames[r].mac, mac) == 0 && strcmp(g_renames[r].name, name) == 0) {
+			g_renames[r].pending = false;
+		}
+		pthread_mutex_unlock(&lock);
+		changed = true;
+	}
+	if (changed) {
+		refresh_devices();
+	}
 }
 
 // How long a discovery runs when the user presses search. Ten seconds, as the
@@ -1650,6 +1712,7 @@ static void do_scan(void) {
 		// Every second, so the list grows in front of the user instead of
 		// appearing when the sweep is over.
 		refresh_devices();
+		apply_renames();
 	}
 
 	btstack_discovery(false);
@@ -1737,6 +1800,7 @@ static bool wait_for_a2dp(const char *mac, int timeout_ms) {
 		if (!bluetooth_still_wanted() || waited >= timeout_ms) {
 			return false;
 		}
+		apply_renames();
 		sleep_ms(100);
 	}
 }
@@ -1994,6 +2058,10 @@ static bool pair_and_connect(const char *mac) {
 // every attempt, which is when a device that connected meanwhile shows up in
 // it; the sending stream is read from the signal cache and is current.
 static bool reconnect_should_stop(const char *mac) {
+	// Called between every wait of the reconnect, which makes it the place a
+	// rename typed meanwhile goes out instead of waiting for the whole of it.
+	apply_renames();
+
 	char other[BT_MAC_MAX];
 	if (btstack_audio_sink(other, sizeof(other)) && strcasecmp(other, mac) != 0) {
 		fprintf(stderr, "bluetooth: %s is playing now; not going back to %s\n", other, mac);
@@ -2201,6 +2269,10 @@ static bool bring_stack_up(void) {
 // patchram, rfkill off, and only then kill bluealsa -- so bluealsa is asked to
 // let go of a transport that has already gone.
 static void bring_stack_down(bool deliberate) {
+	// Renames still waiting go to bluez while it is there to take them: it
+	// writes them down with the pairing, and they are back the next time.
+	apply_renames();
+
 	btstack_discovery(false);
 
 	// Whatever is connected is disconnected properly rather than having the
@@ -2941,6 +3013,10 @@ static void *bluetooth_worker(void *arg) {
 			}
 		}
 
+		// Before the job and not only in its own: a rename whose wake-up did
+		// not fit in a full queue still goes out on the next round.
+		apply_renames();
+
 		if (have_job) {
 			char name[BT_NAME_MAX];
 
@@ -3035,16 +3111,9 @@ static void *bluetooth_worker(void *arg) {
 				break;
 			}
 
-			case JOB_SET_ALIAS: {
-				pthread_mutex_lock(&lock);
-				char alias[BT_NAME_MAX];
-				snprintf(alias, sizeof(alias), "%s", g_alias_name);
-				pthread_mutex_unlock(&lock);
-				fprintf(stderr, "bluetooth: renaming %s to '%s'\n", job.mac, alias);
-				btstack_set_device_alias(job.mac, alias);
-				refresh_devices();
+			case JOB_SET_ALIAS:
+				apply_renames();
 				break;
-			}
 
 			case JOB_SET_CODEC:
 				do_set_codec(job.text);
@@ -3175,6 +3244,8 @@ static void set_enabled(bool on, bool remember) {
 		// attempt takes.
 		queue_head = 0;
 		queue_count = 0;
+		// Renames waiting are kept: the "name changed" has already been said,
+		// and they go to bluez before the stack comes down (bring_stack_down).
 	}
 	pthread_mutex_unlock(&lock);
 
@@ -3367,12 +3438,42 @@ bool bluetooth_rename(const char *mac, const char *name) {
 	}
 
 	pthread_mutex_lock(&lock);
-	snprintf(g_alias_name, sizeof(g_alias_name), "%s", start);
-	bool enabled = g_enabled;
-	pthread_mutex_unlock(&lock);
-	if (!enabled) {
+	if (!g_enabled) {
+		pthread_mutex_unlock(&lock);
 		return false; // bluez is not running, and the name lives in bluez
 	}
+
+	// The device's own slot if it has one, a free one otherwise, and when all
+	// four are waiting the first is reused: four devices renamed in the time
+	// one step of the worker takes is not something a person does.
+	int slot = -1;
+	for (int r = 0; r < RENAMES_MAX && slot < 0; r++) {
+		if (g_renames[r].pending && strcasecmp(g_renames[r].mac, mac) == 0) {
+			slot = r;
+		}
+	}
+	for (int r = 0; r < RENAMES_MAX && slot < 0; r++) {
+		if (!g_renames[r].pending) {
+			slot = r;
+		}
+	}
+	if (slot < 0) {
+		slot = 0;
+	}
+	g_renames[slot].pending = true;
+	snprintf(g_renames[slot].mac, sizeof(g_renames[slot].mac), "%s", mac);
+	snprintf(g_renames[slot].name, sizeof(g_renames[slot].name), "%s", start);
+
+	// On screen at once, whatever the worker is in the middle of.
+	if (start[0]) {
+		for (int i = 0; i < g_paired_count; i++) {
+			if (strcasecmp(g_paired[i].mac, mac) == 0) {
+				snprintf(g_paired[i].name, sizeof(g_paired[i].name), "%s", start);
+				g_serial++;
+			}
+		}
+	}
+	pthread_mutex_unlock(&lock);
 
 	job_t job = {.type = JOB_SET_ALIAS};
 	snprintf(job.mac, sizeof(job.mac), "%s", mac);

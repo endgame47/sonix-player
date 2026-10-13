@@ -12,6 +12,9 @@
 
 #define STBI_ONLY_JPEG
 #define STBI_ONLY_PNG
+// A radio station's icon is a GIF often enough that leaving GIF out leaves
+// those stations without one. The first frame is what is drawn.
+#define STBI_ONLY_GIF
 #define STBI_NO_STDIO
 #define STBI_NO_LINEAR
 #define STBI_NO_HDR

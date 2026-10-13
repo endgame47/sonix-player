@@ -1242,7 +1242,8 @@ static lv_obj_t *folder_chain_switch;
 static lv_obj_t *scan_screen;
 static lv_obj_t *keep_articles_switch;
 static lv_obj_t *detect_changes_switch;
-static lv_obj_t *display_screen;
+static lv_obj_t *nowplaying_screen;
+static lv_obj_t *allow_delete_switch;
 static lv_obj_t *library_screen;
 static lv_obj_t *album_view_switch;
 static lv_obj_t *album_head_switch;
@@ -1482,13 +1483,11 @@ static void build_scan_page(gui_config_t *cfg) {
 }
 
 // ---------------------------------------------------------------------------
-// Display options
+// Library and Now Playing
 //
 // What the lists and the now-playing page show, as opposed to what playback
-// does with them. A page of its own rather than rows on the music page: it is
-// the third such question -- how a name is filed, what happens after a track,
-// what a list shows -- and the other two already have one. How the library's
-// own lists look is one page further in, under Library.
+// does with them: two pages, one for the library's lists and one for the page
+// of the track that is playing. Their switches first, the pages further down.
 // ---------------------------------------------------------------------------
 
 static void album_view_cb(lv_event_t *e) {
@@ -1616,11 +1615,15 @@ static void layout_pick_cb(lv_event_t *e) {
 // ---------------------------------------------------------------------------
 // Library
 //
-// How the library's lists are drawn: what an artist opens on, what a row says
-// under its title, and which tiles the Music page shows. A page of its own
-// beside Display options, which keeps what concerns the now-playing page and
-// the rest.
+// Everything about finding the music: the Music page's tiles and Cover Flow,
+// what an artist opens on, how an album's page and a list's rows are drawn,
+// where a list opens, and whether tracks can be deleted from it. Now Playing,
+// beside it, keeps what concerns the page of the track that is playing.
 // ---------------------------------------------------------------------------
+
+static void allow_delete_cb(lv_event_t *e) {
+	medialist_set_allow_delete(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+}
 
 static void build_library_page(gui_config_t *cfg) {
 	library_screen = lv_obj_create(NULL);
@@ -1630,6 +1633,16 @@ static void build_library_page(gui_config_t *cfg) {
 	// Which tiles the Music page shows, and in what order.
 	musictiles_init(cfg);
 	settingsrow_add(container, "musicsettings_rearrange_main_page", NULL, switch_screen_cb, musictiles_screen);
+
+	// The album carousel. Off by default: it is a second way into the records,
+	// not a replacement for the list, and the covers it draws are decoded at a
+	// size the lists never ask for -- so switching it on fills the thumbnail
+	// database with rather bigger pictures the first time it is flicked through.
+	settingsrow_toggle(container, "cover_flow", &coverflow_switch, coverflow_cb);
+	option_note(container, "cover_flow_note");
+	if (coverflow_enabled()) {
+		lv_obj_add_state(coverflow_switch, LV_STATE_CHECKED);
+	}
 
 	// On: an artist, a genre or a year is a list of its records. Off: a flat
 	// list of its tracks, with the grouping button in the corner on an
@@ -1668,23 +1681,6 @@ static void build_library_page(gui_config_t *cfg) {
 		lv_obj_add_state(quality_badges_switch, LV_STATE_CHECKED);
 	}
 
-	switcher_attach_back_gesture(library_screen);
-}
-
-static void build_display_page(gui_config_t *cfg) {
-	display_screen = lv_obj_create(NULL);
-	lv_obj_t *container = settingsrow_page(display_screen, cfg, "musicsettings_display_options");
-	settingsrow_title_corner_slots(settingsrow_page_title(display_screen), cfg, 0);
-
-	// Whose name goes under the title on the now-playing page, in the control
-	// centre and on the screensaver: the album's artist, as the record is
-	// filed, or the track's own. Off by default -- see metadata_shown_artist().
-	settingsrow_toggle(container, "musicsettings_track_artist", &track_artist_switch, track_artist_cb);
-	option_note(container, "musicsettings_track_artist_note");
-	if (metadata_track_artist()) {
-		lv_obj_add_state(track_artist_switch, LV_STATE_CHECKED);
-	}
-
 	// The library lists open on what is playing: the track in All tracks, what
 	// it belongs to in the others.
 	settingsrow_toggle(container, "musicsettings_go_to_current", &go_to_current_switch, go_to_current_cb);
@@ -1693,15 +1689,29 @@ static void build_display_page(gui_config_t *cfg) {
 		lv_obj_add_state(go_to_current_switch, LV_STATE_CHECKED);
 	}
 
-	// The album carousel. Off by default: it is a second way into the records,
-	// not a replacement for the list, and the covers it draws are decoded at a
-	// size the lists never ask for -- so switching it on fills the thumbnail
-	// database with rather bigger pictures the first time it is flicked through.
-	settingsrow_toggle(container, "cover_flow", &coverflow_switch, coverflow_cb);
-	option_note(container, "cover_flow_note");
-	if (coverflow_enabled()) {
-		lv_obj_add_state(coverflow_switch, LV_STATE_CHECKED);
+	// The bin among the selection's buttons, which deletes the chosen tracks
+	// from the card and from the library. Off by default: it is the one
+	// button on these lists that cannot be undone.
+	settingsrow_toggle(container, "musicsettings_allow_delete", &allow_delete_switch, allow_delete_cb);
+	option_note(container, "musicsettings_allow_delete_note");
+	if (medialist_allow_delete()) {
+		lv_obj_add_state(allow_delete_switch, LV_STATE_CHECKED);
 	}
+
+	switcher_attach_back_gesture(library_screen);
+}
+
+// ---------------------------------------------------------------------------
+// Now Playing
+//
+// The page of the track that is playing: how it is arranged, the colour it
+// wears, whose name it shows, and whether the player starts on it.
+// ---------------------------------------------------------------------------
+
+static void build_nowplaying_page(gui_config_t *cfg) {
+	nowplaying_screen = lv_obj_create(NULL);
+	lv_obj_t *container = settingsrow_page(nowplaying_screen, cfg, "musicsettings_now_playing");
+	settingsrow_title_corner_slots(settingsrow_page_title(nowplaying_screen), cfg, 0);
 
 	// How the now-playing page is arranged.
 	lv_obj_t *layout_pills = NULL;
@@ -1730,6 +1740,15 @@ static void build_display_page(gui_config_t *cfg) {
 		lv_obj_add_state(cover_accent_switch, LV_STATE_CHECKED);
 	}
 
+	// Whose name goes under the title on the now-playing page, in the control
+	// centre and on the screensaver: the album's artist, as the record is
+	// filed, or the track's own. Off by default -- see metadata_shown_artist().
+	settingsrow_toggle(container, "musicsettings_track_artist", &track_artist_switch, track_artist_cb);
+	option_note(container, "musicsettings_track_artist_note");
+	if (metadata_track_artist()) {
+		lv_obj_add_state(track_artist_switch, LV_STATE_CHECKED);
+	}
+
 	// Whether a start with a remembered track lands on the now-playing page
 	// rather than on the home screen. Read once, at startup (main.c).
 	settingsrow_toggle(container, "musicsettings_nowplaying_at_boot", &nowplaying_at_boot_switch,
@@ -1739,7 +1758,7 @@ static void build_display_page(gui_config_t *cfg) {
 		lv_obj_add_state(nowplaying_at_boot_switch, LV_STATE_CHECKED);
 	}
 
-	switcher_attach_back_gesture(display_screen);
+	switcher_attach_back_gesture(nowplaying_screen);
 }
 
 static lv_obj_t *endless_shuffle_switch;
@@ -1882,9 +1901,9 @@ void musicsettings_init(gui_config_t *cfg) {
 	lv_obj_t *container = settingsrow_page(musicsettings_screen, cfg, "music");
 
 	// The pages of behaviour first: how the index is built, what playback does
-	// around a track, how the pages and the lists look, and Last.fm, which
-	// only reports what was played. Then the sound, from the widest tool to the narrowest, and the
-	// DAC's own switches at the end.
+	// around a track, how the library's lists and the now-playing page look,
+	// and Last.fm, which only reports what was played. Then the sound, from the
+	// widest tool to the narrowest, and the DAC's own switches at the end.
 	artistexceptions_init(cfg, organize_touched);
 	build_scan_page(cfg);
 	settingsrow_add(container, "musicsettings_scan_options", NULL, switch_screen_cb, scan_screen);
@@ -1892,11 +1911,11 @@ void musicsettings_init(gui_config_t *cfg) {
 	build_playback_page(cfg);
 	settingsrow_add(container, "musicsettings_playback_options", NULL, switch_screen_cb, playback_screen);
 
-	build_display_page(cfg);
-	settingsrow_add(container, "musicsettings_display_options", NULL, switch_screen_cb, display_screen);
-
 	build_library_page(cfg);
 	settingsrow_add(container, "musicsettings_library", NULL, switch_screen_cb, library_screen);
+
+	build_nowplaying_page(cfg);
+	settingsrow_add(container, "musicsettings_now_playing", NULL, switch_screen_cb, nowplaying_screen);
 
 	lastfmsettings_init(cfg);
 	settingsrow_add(container, "lastfm", NULL, switch_screen_cb, lastfmsettings_screen());

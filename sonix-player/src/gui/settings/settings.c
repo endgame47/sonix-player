@@ -404,6 +404,32 @@ static lv_obj_t *make_kbtype_pill(lv_obj_t *parent, const char *text, int t9) {
 // Screenshots, on the keys shown under the switch.
 static lv_obj_t *screenshot_switch;
 
+// Volume steps: how far one press of a volume key moves the volume, from
+// VOLUME_STEP_MIN to VOLUME_STEP_MAX percent. Position 0 of the slider is the
+// smallest step.
+static lv_obj_t *volume_step_slider;
+static lv_obj_t *volume_step_value;
+
+static int volume_step_setting(void) {
+	int step = (int)config_get_int("other", "volume_step", VOLUME_STEP_MIN);
+	if (step < VOLUME_STEP_MIN) {
+		return VOLUME_STEP_MIN;
+	}
+	return step > VOLUME_STEP_MAX ? VOLUME_STEP_MAX : step;
+}
+
+static void volume_step_changed_cb(lv_event_t *e) {
+	(void)e;
+	int step = VOLUME_STEP_MIN + (int)lv_slider_get_value(volume_step_slider);
+	if (step == volume_step_setting()) {
+		return;
+	}
+	config_set_int("other", "volume_step", step);
+	config_save();
+	input_set_volume_step(step);
+	lv_label_set_text_fmt(volume_step_value, "%d", step);
+}
+
 static void screenshot_toggled_cb(lv_event_t *e) {
 	(void)e;
 	screenshot_set_enabled(lv_obj_has_state(screenshot_switch, LV_STATE_CHECKED));
@@ -419,6 +445,13 @@ static void build_other_page(gui_config_t *cfg) {
 	}
 
 	settingsrow_add(container, "remap_buttons", NULL, switch_screen_cb, remap_screen);
+
+	settingsrow_slider(container, "settings_volume_steps", VOLUME_STEP_MAX - VOLUME_STEP_MIN + 1, &volume_step_value,
+					   &volume_step_slider, volume_step_changed_cb);
+	int step = volume_step_setting();
+	lv_slider_set_value(volume_step_slider, step - VOLUME_STEP_MIN, LV_ANIM_OFF);
+	lv_label_set_text_fmt(volume_step_value, "%d", step);
+	input_set_volume_step(step);
 	settingsrow_add(container, "control_centre", NULL, switch_screen_cb, ccsettings_screen);
 
 	// Which alphabets the keyboard can be laid out in, above the shape of the

@@ -153,7 +153,6 @@ ICONS = [
     ("list-x.svg", "list_x", 34),
     ("star-x.svg", "star_x", 34),
     ("search.svg", "search", 34),
-    ("podcast-downloaded.svg", "podcast_downloaded", 34), # podcasts corner: the downloaded episodes
     ("wifi.svg", "wifi", 46),
     ("bluetooth.svg", "bluetooth", 46),
     # Status bar radios. The wifi glyph is the same arc with none, one, two or
@@ -241,6 +240,21 @@ ICONS = [
     ("circle-alert.svg", "circle_alert", 64), # ...and what a failure shows instead
     ("book-headphones.svg", "book_headphones", 128),
     ("book-headphones.svg", "book_headphones_row", 64), # audiobook rows with no cover
+    # Music and Audiobooks with no card in the slot, or the card at a computer.
+    ("sd-card.svg", "sd_card", 128),
+    # Podcasts on the card: the badge on a cover (copied in, or downloaded by
+    # Sonix), the line without a network, the empty folder, the OPML files.
+    ("sd-card.svg", "sd_card_badge", 16),
+    ("arrow-down-to-line.svg", "download_badge", 16),
+    # Downloading the chosen episodes, on the disc of a podcast's page.
+    ("arrow-down-to-line.svg", "download", 34),
+    ("wifi-off.svg", "wifi_off", 30),
+    ("folder-open.svg", "folder_open", 80),
+    ("file-down.svg", "file_down", 34),
+    # An episode's state in its row, and the play and pause buttons of the podcast pages.
+    ("check.svg", "check_small", 22),
+    ("play.svg", "play_small", 26),
+    ("pause.svg", "pause_small", 26),
     # The same glyph the podcast rows use, at the size the three the player
     # stands in with are drawn: an episode with no artwork gets this one.
     ("podcast-list.svg", "podcast_cover", 128),

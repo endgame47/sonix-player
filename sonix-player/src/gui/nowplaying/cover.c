@@ -1604,6 +1604,7 @@ static uint64_t source_id_uncached(const char *filepath, int *index) {
 // The player's cover cache, further down with the other tables.
 static uint64_t player_source_id(const char *filepath, int *index);
 static bool player_cover_load(uint64_t id, int w, int h, cover_image_t *out);
+static bool player_cover_kept(uint64_t id, int w, int h);
 static void player_cover_store(uint64_t id, int w, int h, const cover_image_t *img);
 static void cover_tone_attach(uint64_t id, cover_image_t *img);
 
@@ -1688,6 +1689,21 @@ bool cover_load_player_images(const char *filepath, int cover_w, int cover_h, co
 	return ok;
 }
 
+void cover_prefetch_player(const char *filepath, int cover_w, int cover_h) {
+	if (!filepath || !filepath[0] || cover_w <= 0 || cover_h <= 0) {
+		return;
+	}
+	// Nothing to make: no artwork, or the cover is already kept at this size.
+	int source_index = -1;
+	uint64_t id = player_source_id(filepath, &source_index);
+	if (!id || player_cover_kept(id, cover_w, cover_h)) {
+		return;
+	}
+	cover_image_t cover;
+	cover_load_player_images(filepath, cover_w, cover_h, &cover, 0, 0, NULL);
+	cover_free(&cover);
+}
+
 bool cover_load_shared(const char *filepath, int player_w, int player_h, int size, cover_image_t *out) {
 	memset(out, 0, sizeof(*out));
 	if (!filepath || player_w <= 0 || player_h <= 0 || size <= 0) {
@@ -1736,6 +1752,23 @@ bool cover_load_shared(const char *filepath, int player_w, int player_h, int siz
 		out->tone = tones.tone;
 		out->tone_luma = tones.tone_luma;
 		out->tone_light = tones.tone_light;
+	}
+	return ok;
+}
+
+bool cover_scaled_copy(const cover_image_t *src, int size, cover_image_t *out) {
+	memset(out, 0, sizeof(*out));
+	raw_image_t raw;
+	if (size <= 0 || !raw_from_cover(src, &raw)) {
+		return false;
+	}
+	bool ok = make_scaled(&raw, size, size, COVER_FIT_COVER, out);
+	raw_free(&raw);
+	if (ok) {
+		out->has_tone = src->has_tone;
+		out->tone = src->tone;
+		out->tone_luma = src->tone_luma;
+		out->tone_light = src->tone_light;
 	}
 	return ok;
 }
@@ -2398,6 +2431,36 @@ uint64_t cover_source_id(const char *filepath) {
 	return player_source_id(filepath, &index);
 }
 
+bool cover_known_id(const char *filepath, uint64_t *id) {
+	char key[32];
+	return player_id_key(filepath, key, sizeof(key)) && player_id_lookup(key, id);
+}
+
+bool cover_picture_known(const char *filepath) {
+	uint64_t id = 0;
+	if (!cover_known_id(filepath, &id)) {
+		return false;
+	}
+	// Any size of it: the rows of one picture share the id and then '|', and
+	// '}' is the character after '|', so the range is exactly those rows and
+	// is answered from the key's index.
+	char from[24], to[24];
+	snprintf(from, sizeof(from), "%016llx|", (unsigned long long)id);
+	snprintf(to, sizeof(to), "%016llx}", (unsigned long long)id);
+	bool kept = false;
+	pthread_mutex_lock(&thumb_db_lock);
+	sqlite3_stmt *stmt = NULL;
+	if (thumb_db && sqlite3_prepare_v2(thumb_db, "SELECT 1 FROM player_covers WHERE key >= ?1 AND key < ?2 LIMIT 1", -1,
+									   &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(stmt, 1, from, -1, SQLITE_STATIC);
+		sqlite3_bind_text(stmt, 2, to, -1, SQLITE_STATIC);
+		kept = sqlite3_step(stmt) == SQLITE_ROW;
+		sqlite3_finalize(stmt);
+	}
+	pthread_mutex_unlock(&thumb_db_lock);
+	return kept;
+}
+
 static void player_cover_key(char *out, size_t out_size, uint64_t id, int w, int h) {
 	snprintf(out, out_size, "%016llx|%dx%d|%d", (unsigned long long)id, w, h, PLAYER_COVER_EPOCH);
 }
@@ -2482,6 +2545,23 @@ static bool player_cover_load(uint64_t id, int w, int h, cover_image_t *out) {
 		free(blob);
 	}
 	return hit;
+}
+
+// Whether the cover of picture `id` is kept at w x h, without reading it.
+static bool player_cover_kept(uint64_t id, int w, int h) {
+	char key[64];
+	player_cover_key(key, sizeof(key), id, w, h);
+	bool kept = false;
+	pthread_mutex_lock(&thumb_db_lock);
+	sqlite3_stmt *stmt = NULL;
+	if (thumb_db &&
+		sqlite3_prepare_v2(thumb_db, "SELECT 1 FROM player_covers WHERE key = ?1", -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(stmt, 1, key, -1, SQLITE_STATIC);
+		kept = sqlite3_step(stmt) == SQLITE_ROW;
+		sqlite3_finalize(stmt);
+	}
+	pthread_mutex_unlock(&thumb_db_lock);
+	return kept;
 }
 
 static void player_cover_store(uint64_t id, int w, int h, const cover_image_t *img) {

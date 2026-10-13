@@ -178,6 +178,7 @@ static void read_feed(const json_doc_t *doc, int obj, podcast_feed_t *out) {
 		json_obj_str(doc, obj, "image", out->image, sizeof(out->image));
 	}
 	out->episode_count = (int)json_obj_long(doc, obj, "episodeCount", 0);
+	json_obj_str(doc, obj, "url", out->url, sizeof(out->url));
 }
 
 static void read_episode(const json_doc_t *doc, int obj, podcast_episode_t *out) {
@@ -348,6 +349,47 @@ bool podcast_feed(long long feed_id, podcast_feed_t *out) {
 		set_error(tr("podcast_gone"));
 	}
 	return ok;
+}
+
+int podcast_feed_by_url(const char *url, podcast_feed_t *out) {
+	if (!url || !url[0] || !out) {
+		return -1;
+	}
+	char encoded[1200];
+	http_url_encode(url, encoded, sizeof(encoded));
+	char path[1300];
+	snprintf(path, sizeof(path), "/podcasts/byfeedurl?url=%s", encoded);
+
+	char *body = api_get(path);
+	if (!body) {
+		return -1;
+	}
+	json_doc_t doc;
+	if (!json_parse(body, &doc)) {
+		set_error(tr("podcast_directory_unparsable"));
+		free(body);
+		return -1;
+	}
+	// A match is the single object "feed"; no match is "feed" as an empty
+	// array, with status still "true".
+	int found = 0;
+	int feed = json_get(&doc, json_root(&doc), "feed");
+	if (feed >= 0) {
+		// An empty array reads as no id at all.
+		read_feed(&doc, feed, out);
+		if (out->id > 0) {
+			found = 1;
+			// The address asked for is the one the user knows the podcast by;
+			// the catalogue may hold a newer one after a move, and that is the
+			// one worth keeping.
+			if (!out->url[0]) {
+				snprintf(out->url, sizeof(out->url), "%s", url);
+			}
+		}
+	}
+	json_free(&doc);
+	free(body);
+	return found;
 }
 
 bool podcast_episode(long long episode_id, podcast_episode_t *out) {

@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <errno.h>
+#include <unistd.h>
 
 #include "src/gui/nowplaying/coverloader.h"
 #include "src/gui/fonts/fonts.h"
@@ -82,6 +84,10 @@ lv_obj_t *medialist_albums_screen;
 
 // How often finished artwork is collected while any is pending.
 #define THUMB_POLL_MS 150
+#define HEAD_POLL_MS 30
+
+// The bin's red disc in selection mode.
+#define DELETE_FAB_SIZE 72
 
 // Inside a record of more than one disc, a heading above the first track of
 // each: "Disc 2". This is the height it adds above that track's row.
@@ -197,6 +203,21 @@ typedef struct {
 	char thumb_path[512]; // the file the picture, or the request for it, is of
 } row_t;
 
+// A list a panel showed before the one on it now, kept so the step back can
+// open it again (see panel_back_guard).
+typedef struct {
+	library_list_t kind;
+	library_filter_t filter;
+	char value[256];
+	char title[160];
+	int scroll;
+	// Replaced from the player's own menu: the step back reopens the player
+	// over it, as leaving any page opened from there does.
+	bool from_player;
+} panel_step_t;
+
+#define PANEL_BACK_DEPTH 6
+
 // Everything one of the two screens owns.
 typedef struct {
 	lv_obj_t *screen;
@@ -260,6 +281,13 @@ typedef struct {
 	// so reopening the same list puts the user back where they were.
 	char signature[600];
 	int saved_scroll;
+
+	// The lists this one replaced on the same screen, newest last. One screen
+	// shows them all in turn -- "Show album" from Favourites opens the album
+	// where Favourites was -- so the switcher's history cannot step back
+	// between them; the panel's back guard does, before the page is left.
+	panel_step_t back[PANEL_BACK_DEPTH];
+	int back_count;
 
 	// Inside one album: what sits above the rows and between them. The rows
 	// are still the list's rows one for one -- row i is track i of the queue a
@@ -328,6 +356,9 @@ typedef struct {
 	lv_obj_t *sel_unfav_btn;  // favourites only
 	lv_obj_t *sel_unlist_btn; // a playlist only
 	lv_obj_t *sel_close_btn;
+	// The red bin in the bottom corner, on the lists of tracks while
+	// "Allow deleting tracks" is on (see sel_delete_cb).
+	lv_obj_t *sel_delete_btn;
 	unsigned corner_shown;
 	int corner_slots;
 } panel_t;
@@ -380,6 +411,10 @@ static bool quality_badges;
 // row of whatever is playing. Off by default.
 static bool go_to_current;
 
+// "Allow deleting tracks": the bin among the selection's buttons on the lists
+// of tracks. Off by default.
+static bool allow_delete;
+
 // "Show artist": the artist under each row's title, on the lists picked out by
 // artist_lists (MEDIALIST_ARTIST_* bits). Off by default, with all of them
 // picked so that switching it on shows something at once.
@@ -407,6 +442,7 @@ static void load_view_settings(void) {
 	show_artist = config_get_int("library", "show_artist", 0) != 0;
 	go_to_current = config_get_int("library", "go_to_current", 0) != 0;
 	album_head = config_get_int("library", "album_head", 0) != 0;
+	allow_delete = config_get_int("library", "allow_delete", 0) != 0;
 	artist_lists = (int)config_get_int("library", "artist_lists", artist_lists);
 }
 
@@ -431,6 +467,18 @@ void medialist_set_go_to_current(bool on) {
 	load_view_settings();
 	go_to_current = on;
 	config_set_int("library", "go_to_current", on ? 1 : 0);
+	config_save();
+}
+
+bool medialist_allow_delete(void) {
+	load_view_settings();
+	return allow_delete;
+}
+
+void medialist_set_allow_delete(bool on) {
+	load_view_settings();
+	allow_delete = on;
+	config_set_int("library", "allow_delete", on ? 1 : 0);
 	config_save();
 }
 
@@ -549,6 +597,7 @@ static void row_drop_thumb(panel_t *p, row_t *row);
 static void album_places_load(panel_t *p);
 static bool panel_is_album(const panel_t *p);
 static bool head_poll(panel_t *p);
+static bool head_from_player(panel_t *p, const char *first_path);
 static int body_height(const panel_t *p);
 static int row_y(const panel_t *p, int index);
 static int row_at_y(const panel_t *p, int y);
@@ -1202,6 +1251,10 @@ static void sel_buttons_show(panel_t *p, bool on) {
 	show_if(p->sel_unfav_btn, on && favourites);
 	show_if(p->sel_unlist_btn, on && playlist);
 	show_if(p->sel_close_btn, on);
+	if (p->sel_delete_btn) {
+		show_if(p->sel_delete_btn, on && allow_delete && !p->from_paths);
+		lv_obj_move_foreground(p->sel_delete_btn);
+	}
 }
 
 static void head_bar_update(panel_t *p);
@@ -1612,6 +1665,77 @@ static void sel_unlist_cb(lv_event_t *e) { sel_remove_ask(lv_event_get_user_data
 
 static void sel_unfav_cb(lv_event_t *e) { sel_remove_ask(lv_event_get_user_data(e)); }
 
+// Deleting the chosen tracks: off the card, and out of the library with them
+// (library_forget_deleted), after asking. Kept between the question and the
+// answer, the selection being gone by then.
+static path_list_t delete_pending;
+static panel_t *delete_panel;
+
+static void delete_confirmed(void *user) {
+	(void)user;
+	panel_t *p = delete_panel;
+	delete_panel = NULL;
+	int wanted = delete_pending.count;
+	if (!p || wanted == 0) {
+		path_list_free(&delete_pending);
+		return;
+	}
+
+	const char **gone = calloc((size_t)wanted, sizeof(*gone));
+	int deleted = 0;
+	for (int i = 0; gone && i < wanted; i++) {
+		const char *path = delete_pending.paths[i];
+		// A track of a cue sheet is a stretch of a file that holds the others
+		// too: there is nothing of its own to delete.
+		if (strstr(path, "?track=")) {
+			continue;
+		}
+		if (unlink(path) == 0 || errno == ENOENT) {
+			gone[deleted++] = path;
+		} else {
+			fprintf(stderr, "medialist: cannot delete %s: %s\n", path, strerror(errno));
+		}
+	}
+	if (deleted > 0) {
+		library_forget_deleted(gone, deleted);
+	}
+	free(gone);
+	path_list_free(&delete_pending);
+
+	// The index behind the list has moved on; the list follows it.
+	panel_refresh_stale(p);
+	window_update(p);
+
+	if (deleted == wanted) {
+		toast_success(deleted == 1 ? "medialist_track_deleted" : "medialist_tracks_deleted");
+	} else if (deleted > 0) {
+		toast_error("medialist_some_tracks_not_deleted");
+	} else {
+		gui_notify_popup("medialist_delete_failed");
+	}
+}
+
+static void sel_delete_cb(lv_event_t *e) {
+	panel_t *p = lv_event_get_user_data(e);
+	if (!p || !p->selecting || p->sel_count == 0 || !allow_delete) {
+		return;
+	}
+	path_list_free(&delete_pending);
+	sel_gather(p, &delete_pending); // leaves the mode, as the other buttons do
+	if (delete_pending.count == 0) {
+		return;
+	}
+	delete_panel = p;
+
+	char message[96];
+	if (delete_pending.count == 1) {
+		snprintf(message, sizeof(message), "%s", tr("selection_one_track"));
+	} else {
+		snprintf(message, sizeof(message), tr("selection_tracks_count"), delete_pending.count);
+	}
+	confirm_show("medialist_delete_tracks_question", message, "delete", delete_confirmed, NULL);
+}
+
 static void row_bind(panel_t *p, row_t *row, int index) {
 	if (row->index == index) {
 		return;
@@ -1677,8 +1801,13 @@ static void row_bind(panel_t *p, row_t *row, int index) {
 // Requests artwork for the visible rows and collects what the worker has
 // finished. Same loop as the browser's thumbs_update.
 static void thumbs_update(panel_t *p) {
+	// The head's picture is the one thing on the page that changes its colour,
+	// so it is looked for more often than the rows' thumbnails while it comes.
 	if (head_poll(p)) {
+		lv_timer_set_period(thumb_timer, HEAD_POLL_MS);
 		lv_timer_resume(thumb_timer);
+	} else {
+		lv_timer_set_period(thumb_timer, THUMB_POLL_MS);
 	}
 
 	// No icons, no covers: loading thumbnails that would land in a hidden
@@ -3586,6 +3715,29 @@ static void build_panel(panel_t *p, gui_config_t *cfg, bool is_tracks, int slot_
 	p->sel_unfav_btn = corner_button(p->corner, &icon_star_x, sel_unfav_cb, p);
 	p->sel_unlist_btn = corner_button(p->corner, &icon_list_x, sel_unlist_cb, p);
 	p->sel_close_btn = corner_button(p->corner, &icon_close, sel_close_cb, p);
+
+	// The bin, a red disc in the bottom right corner rather than one more
+	// button in the corner above: it is the one choice here that cannot be
+	// taken back, and it stands apart from the others for it. Tracks only.
+	if (is_tracks) {
+		p->sel_delete_btn = lv_btn_create(p->screen);
+		lv_obj_set_size(p->sel_delete_btn, DELETE_FAB_SIZE, DELETE_FAB_SIZE);
+		lv_obj_set_style_radius(p->sel_delete_btn, LV_RADIUS_CIRCLE, 0);
+		lv_obj_set_style_bg_color(p->sel_delete_btn, lv_color_make(224, 27, 36), 0); // Adwaita red
+		lv_obj_set_style_bg_color(p->sel_delete_btn, lv_color_make(192, 28, 40), LV_STATE_PRESSED);
+		lv_obj_set_style_bg_opa(p->sel_delete_btn, LV_OPA_COVER, 0);
+		lv_obj_set_style_border_width(p->sel_delete_btn, 0, 0);
+		lv_obj_set_style_shadow_width(p->sel_delete_btn, 0, 0);
+		lv_obj_set_style_pad_all(p->sel_delete_btn, 0, 0);
+		lv_obj_align(p->sel_delete_btn, LV_ALIGN_BOTTOM_RIGHT, -(int)cfg->padding - 6, -(int)cfg->padding - 6);
+		lv_obj_add_event_cb(p->sel_delete_btn, sel_delete_cb, LV_EVENT_CLICKED, p);
+		lv_obj_t *bin = lv_image_create(p->sel_delete_btn);
+		lv_image_set_src(bin, &icon_trash);
+		lv_obj_set_style_image_recolor(bin, lv_color_white(), 0);
+		lv_obj_set_style_image_recolor_opa(bin, LV_OPA_COVER, 0);
+		lv_obj_center(bin);
+		lv_obj_set_hidden(p->sel_delete_btn, true);
+	}
 	lv_obj_set_hidden(p->sel_queue_btn, true);
 	lv_obj_set_hidden(p->sel_fav_btn, true);
 	lv_obj_set_hidden(p->sel_add_btn, true);
@@ -4294,11 +4446,19 @@ static void head_build(panel_t *p) {
 
 	// The cover of the first track, which is what the Albums list shows for
 	// the record too.
+	//
+	// The record that is playing -- "Show album" from the player above all --
+	// has that picture up in the player already, with its colour worked out:
+	// the head starts with it, scaled on the spot, instead of with the glyph
+	// and the theme's colours while the loader gets to it.
 	// Made from the player's own cover of that track, so a record already
 	// played comes straight from the player's table, and one shown here first
 	// is in it when it plays.
-	char path[512];
-	if (row_path_copy(p, 0, path, sizeof(path))) {
+	char path[512] = "";
+	if (row_path_copy(p, 0, path, sizeof(path)) && head_from_player(p, path)) {
+		p->head_cover_requested = true;
+		p->head_cover_settled = true;
+	} else if (path[0]) {
 		int player_w = 0, player_h = 0;
 		player_cover_box(&player_w, &player_h);
 		if (player_w > 0 && player_h > 0) {
@@ -4312,6 +4472,52 @@ static void head_build(panel_t *p) {
 	}
 }
 
+// Puts `image` at the head, in place of whatever picture was there, and the
+// page in its colours. The head owns it from here.
+static void head_show_image(panel_t *p, const cover_image_t *image) {
+	lv_image_set_src(p->head_cover, NULL); // let go of the old pixels first
+	if (p->head_has_cover) {
+		cover_free(&p->head_image);
+	}
+	p->head_image = *image;
+	p->head_image.dsc.data = p->head_image.pixels; // the struct moved, the buffer did not
+	p->head_has_cover = true;
+	lv_obj_remove_style(p->head_cover, &theme_style_icon, 0);
+	lv_obj_set_style_image_recolor_opa(p->head_cover, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_bg_opa(p->head_cover, LV_OPA_TRANSP, 0);
+	lv_image_set_src(p->head_cover, &p->head_image.dsc);
+	if (tint_from_cover(p)) {
+		p->tinted = true;
+		page_paint(p);
+	} else if (p->tinted) {
+		// A picture with no colour to give, in place of one that had.
+		p->tinted = false;
+		page_paint(p);
+	}
+}
+
+// The player's picture at the head, when the record is the one playing. True
+// when it is known to be the first track's picture as well, and nothing more
+// is to come; false when the first track's own is still to be loaded, which
+// then takes its place if it turns out to be another.
+static bool head_from_player(panel_t *p, const char *first_path) {
+	device_state_t state;
+	device_state_get(&state);
+	char album[256];
+	if (!state.current_file[0] || !library_track_album_value(state.current_file, album, sizeof(album)) ||
+		!library_album_same(album, p->filter_value)) {
+		return false;
+	}
+	cover_image_t image;
+	uint64_t shown = 0;
+	if (!player_cover_copy(HEAD_COVER_SIZE, &image, &shown)) {
+		return false;
+	}
+	head_show_image(p, &image);
+	uint64_t first = 0;
+	return shown != 0 && cover_known_id(first_path, &first) && first == shown;
+}
+
 // Collects the head's picture once the worker has it, and paints the page in
 // its colours. True while it is still coming.
 static bool head_poll(panel_t *p) {
@@ -4321,17 +4527,8 @@ static bool head_poll(panel_t *p) {
 	bool finished = false;
 	cover_image_t image;
 	if (coverloader_take(COVERLOADER_ALBUM_HEAD, &image, &finished)) {
-		p->head_image = image;
-		p->head_has_cover = true;
+		head_show_image(p, &image);
 		p->head_cover_settled = true;
-		lv_obj_remove_style(p->head_cover, &theme_style_icon, 0);
-		lv_obj_set_style_image_recolor_opa(p->head_cover, LV_OPA_TRANSP, 0);
-		lv_obj_set_style_bg_opa(p->head_cover, LV_OPA_TRANSP, 0);
-		lv_image_set_src(p->head_cover, &p->head_image.dsc);
-		if (tint_from_cover(p)) {
-			p->tinted = true;
-			page_paint(p);
-		}
 		return false;
 	}
 	if (finished) {
@@ -4490,7 +4687,125 @@ static int current_row(panel_t *p) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Stepping back on one screen
+// ---------------------------------------------------------------------------
+
+// Set while a list is reopened by the step back: it is not a step forward, and
+// it comes back where it was scrolled to (step_back_scroll).
+static bool opening_step_back;
+static int step_back_scroll = -1;
+
+// What the last medialist_open() did to the screen it opened on, for
+// medialist_step_back_to_player(): the panel whose list it stacked, or the
+// panel it left showing the same list it already showed.
+static panel_t *last_stacked;
+static panel_t *last_unchanged;
+
+// Called by medialist_open() before the panel takes the new list. A different
+// list opened on the screen that is already showing stacks the one it
+// replaces; one opened from another screen starts the panel's steps afresh,
+// since the switcher's history is what leads back there. Re-reading the same
+// list, a re-sort and the disc button's swap are not steps.
+static void panel_push_step(panel_t *p) {
+	if (p->back_count == PANEL_BACK_DEPTH) {
+		// The oldest goes: past this many the way back is the page before.
+		memmove(&p->back[0], &p->back[1], (size_t)(PANEL_BACK_DEPTH - 1) * sizeof(p->back[0]));
+		p->back_count--;
+	}
+	panel_step_t *step = &p->back[p->back_count++];
+	step->kind = p->kind;
+	step->filter = p->filter;
+	snprintf(step->value, sizeof(step->value), "%s", p->filter_value);
+	snprintf(step->title, sizeof(step->title), "%s", p->title);
+	step->scroll = lv_obj_get_scroll_y(p->list);
+	step->from_player = false;
+}
+
+static void panel_note_step(panel_t *p, const char *signature) {
+	last_stacked = NULL;
+	last_unchanged = NULL;
+	if (opening_step_back || open_replacing || reopening_resorted) {
+		return;
+	}
+	if (lv_screen_active() != p->screen) {
+		p->back_count = 0;
+		return;
+	}
+	if (p->from_paths || !p->signature[0]) {
+		return;
+	}
+	if (strcmp(p->signature, signature) == 0) {
+		last_unchanged = p;
+		return;
+	}
+	panel_push_step(p);
+	last_stacked = p;
+}
+
+static panel_t *panel_on_screen(void) {
+	lv_obj_t *active = lv_screen_active();
+	panel_t *const panels[] = {&panel_names, &panel_tracks, &panel_artist_albums};
+	for (size_t i = 0; i < sizeof(panels) / sizeof(panels[0]); i++) {
+		if (panels[i]->screen == active) {
+			return panels[i];
+		}
+	}
+	return NULL;
+}
+
+// Whether the step back stays on this screen; the swipe-back asks before it
+// draws what is underneath.
+static bool panel_back_peek(void) {
+	panel_t *p = panel_on_screen();
+	return p && p->back_count > 0 && library_is_open();
+}
+
+// The chevron on a list screen: the list this one replaced comes back first,
+// where it was scrolled to; only with none left does the page go.
+static bool panel_back_guard(void) {
+	panel_t *p = panel_on_screen();
+	if (!p || p->back_count == 0) {
+		return false;
+	}
+	if (!library_is_open()) {
+		p->back_count = 0; // nothing can be reopened without the card
+		return false;
+	}
+	panel_step_t step = p->back[--p->back_count];
+	opening_step_back = true;
+	step_back_scroll = step.scroll;
+	medialist_open(step.title, step.kind, step.filter, step.value[0] ? step.value : NULL);
+	opening_step_back = false;
+	step_back_scroll = -1;
+	if (step.from_player) {
+		player_sheet_open(false);
+	}
+	return true;
+}
+
+bool medialist_step_back_to_player(void) {
+	panel_t *stacked = last_stacked;
+	panel_t *unchanged = last_unchanged;
+	last_stacked = NULL;
+	last_unchanged = NULL;
+	// The list asked for was already the one on the page under the player:
+	// the step back is to that same list, with the player over it.
+	if (unchanged && lv_screen_active() == unchanged->screen) {
+		panel_push_step(unchanged);
+		stacked = unchanged;
+	}
+	if (!stacked || stacked->back_count == 0 || lv_screen_active() != stacked->screen) {
+		return false;
+	}
+	stacked->back[stacked->back_count - 1].from_player = true;
+	return true;
+}
+
 void medialist_open(const char *title, library_list_t kind, library_filter_t filter, const char *filter_value) {
+	last_stacked = NULL;
+	last_unchanged = NULL;
+
 	// Nothing to open without the card. The index lives on it, so every list
 	// here would come up empty -- and an empty list under a title, with "scan
 	// the library" written across it, tells the user to do the one thing that
@@ -4509,6 +4824,11 @@ void medialist_open(const char *title, library_list_t kind, library_filter_t fil
 		kind == LIBRARY_LIST_ALBUMS && (filter == LIBRARY_FILTER_ARTIST || filter == LIBRARY_FILTER_ALBUM_ARTIST ||
 										filter == LIBRARY_FILTER_GENRE || filter == LIBRARY_FILTER_YEAR);
 	panel_t *p = tracks_like ? &panel_tracks : (artist_albums ? &panel_artist_albums : &panel_names);
+
+	char signature[600];
+	snprintf(signature, sizeof(signature), "%d|%d|%s", (int)kind, (int)filter, filter_value ? filter_value : "");
+	panel_note_step(p, signature);
+
 	p->kind = kind;
 	// A playlist is a query like any other, and the query's value is its
 	// name -- which is also what the ellipsis needs to know to offer taking a
@@ -4532,8 +4852,6 @@ void medialist_open(const char *title, library_list_t kind, library_filter_t fil
 
 	// Coming back to the very list that was open before? Then put the user
 	// back where they left it instead of at the top.
-	char signature[600];
-	snprintf(signature, sizeof(signature), "%d|%d|%s", (int)kind, (int)filter, filter_value ? filter_value : "");
 	bool same_list = strcmp(signature, p->signature) == 0;
 	snprintf(p->signature, sizeof(p->signature), "%s", signature);
 
@@ -4687,6 +5005,10 @@ void medialist_open(const char *title, library_list_t kind, library_filter_t fil
 			target_scroll = 0;
 		}
 	}
+	// The step back: where the list was left, playing track or not.
+	if (opening_step_back && step_back_scroll >= 0) {
+		target_scroll = step_back_scroll;
+	}
 	int max_scroll = body_height(p) - view_height;
 	if (target_scroll > max_scroll) {
 		target_scroll = max_scroll > 0 ? max_scroll : 0;
@@ -4813,6 +5135,12 @@ void medialist_init(gui_config_t *cfg) {
 	build_panel(&panel_names, cfg, false, SLOT_BASE_NAMES);
 	build_panel(&panel_tracks, cfg, true, SLOT_BASE_TRACKS);
 	build_panel(&panel_artist_albums, cfg, false, SLOT_BASE_ARTIST_ALBUMS);
+
+	panel_t *const panels[] = {&panel_names, &panel_tracks, &panel_artist_albums};
+	for (size_t i = 0; i < sizeof(panels) / sizeof(panels[0]); i++) {
+		switcher_set_back_guard(panels[i]->screen, panel_back_guard);
+		switcher_set_back_guard_peek(panels[i]->screen, panel_back_peek);
+	}
 	// The records of one artist carry the disc button too, lit, to go back to
 	// the tracks; leftmost, as on the track list.
 	panel_artist_albums.album_btn =

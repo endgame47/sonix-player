@@ -8,6 +8,7 @@
 #include "src/system/core/utils.h"
 
 #include <dirent.h>
+#include <stdint.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -732,6 +733,140 @@ bool playlist_insert_at(const char *path, int slot) {
 
 	custom_queue = true;
 	revision++;
+	return true;
+}
+
+static void refresh_stale_source(void);
+
+typedef struct {
+	char **out;
+	size_t want;
+	size_t got;
+} collect_t;
+
+static bool collect_cb(const char *name, const char *path, const char *artist, void *user) {
+	(void)name;
+	(void)artist;
+	collect_t *c = user;
+	if (c->got >= c->want) {
+		return false;
+	}
+	c->out[c->got] = strdup(path ? path : "");
+	if (!c->out[c->got]) {
+		return false;
+	}
+	c->got++;
+	return true;
+}
+
+bool playlist_remove(const int *indices, int count) {
+	if (!indices || count <= 0 || !order || entry_count == 0) {
+		return false;
+	}
+	refresh_stale_source();
+
+	// Which entries go, by where they are stored. The one playing stays.
+	uint8_t *gone = calloc(entry_count, 1);
+	if (!gone) {
+		return false;
+	}
+	size_t removed = 0;
+	for (int i = 0; i < count; i++) {
+		int at = indices[i];
+		if (at < 0 || (size_t)at >= entry_count || (size_t)at == pos || gone[order[at]]) {
+			continue;
+		}
+		gone[order[at]] = 1;
+		removed++;
+	}
+	if (removed == 0) {
+		free(gone);
+		return false;
+	}
+
+	// Every entry becomes a path: the rows of a library list are read in one
+	// pass rather than one lookup each. What is left of the queue is no longer
+	// that list, so it is not held as one either.
+	size_t total = entry_count;
+	char **stored = calloc(total, sizeof(*stored));
+	size_t *old_order = malloc(total * sizeof(*old_order));
+	bool ok = stored && old_order;
+	if (ok && ix_count > 0) {
+		collect_t c = {stored, ix_count, 0};
+		library_index_window(source_ix, 0, (int)ix_count, collect_cb, &c);
+		ok = c.got == ix_count;
+	}
+	for (size_t i = ix_count; ok && i < total; i++) {
+		stored[i] = strdup(paths[i - ix_count]);
+		ok = stored[i] != NULL;
+	}
+	if (!ok) {
+		for (size_t i = 0; stored && i < total; i++) {
+			free(stored[i]);
+		}
+		free(stored);
+		free(old_order);
+		free(gone);
+		return false;
+	}
+	memcpy(old_order, order, total * sizeof(*old_order));
+	size_t old_pos = pos;
+
+	// The new place of every entry that stays, in the order they are stored.
+	size_t *kept_at = malloc(total * sizeof(*kept_at));
+	if (!kept_at) {
+		for (size_t i = 0; i < total; i++) {
+			free(stored[i]);
+		}
+		free(stored);
+		free(old_order);
+		free(gone);
+		return false;
+	}
+
+	bool was_ordered = ordered_queue;
+	char album[sizeof(queue_album)];
+	snprintf(album, sizeof(album), "%s", queue_album);
+
+	playlist_clear();
+	size_t kept = 0;
+	for (size_t i = 0; i < total; i++) {
+		kept_at[i] = (size_t)-1;
+		// A row of the library gone meanwhile comes back blank.
+		if (gone[i] || !stored[i][0]) {
+			continue;
+		}
+		if (push_path(stored[i])) {
+			kept_at[i] = kept++;
+		}
+	}
+	custom_queue = true;
+	ordered_queue = was_ordered;
+	order_identity(0);
+	if (order && kept == entry_count) {
+		// The order the queue was in, without what was taken out of it.
+		size_t at = 0;
+		for (size_t i = 0; i < total; i++) {
+			size_t entry = old_order[i];
+			if (gone[entry] || kept_at[entry] == (size_t)-1) {
+				continue;
+			}
+			if (i == old_pos) {
+				pos = at;
+			}
+			order[at++] = kept_at[entry];
+		}
+	}
+	revision++;
+	playlist_set_album(album);
+
+	for (size_t i = 0; i < total; i++) {
+		free(stored[i]);
+	}
+	free(stored);
+	free(old_order);
+	free(kept_at);
+	free(gone);
 	return true;
 }
 

@@ -6,6 +6,7 @@
 #include <string.h>
 #include <time.h>
 #include <malloc.h>
+#include <unistd.h>
 
 #include "src/gui/fonts/fonts.h"
 #include "src/system/playback/sleeptimer.h"
@@ -14,7 +15,10 @@
 #include "src/gui/nowplaying/player.h"
 #include "src/gui/shell/popover.h"
 #include "src/gui/shell/toast.h"
-#include "src/gui/streaming/podcastsaved.h"
+#include "src/gui/nowplaying/cover.h"
+#include "src/gui/nowplaying/coverloader.h"
+#include "src/gui/streaming/podcastcard.h"
+#include "src/gui/streaming/podcastopml.h"
 #include "src/gui/streaming/qobuzart.h"
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/spinner.h"
@@ -28,6 +32,7 @@
 #include "src/system/streaming/podcast.h"
 #include "src/system/streaming/podcastcache.h"
 #include "src/system/streaming/podcastdl.h"
+#include "src/system/streaming/podcaststate.h"
 #include "src/system/streaming/podcastsubs.h"
 #include "src/system/streaming/streamturn.h"
 #include "src/system/device/power.h"
@@ -69,13 +74,13 @@
 // Search results and the chart stop at four pages, like the radio stations.
 // The arrays are static and sized for the larger of the two; their pages only
 // take memory once entries are written into them.
-#define PODCAST_MAX_HELD 1000
+#define PODCAST_MAX_HELD PODCASTPAGE_FEED_MAX
 #define PODCAST_FEEDS_MAX (4 * PODCAST_LIMIT)
 
 // Episodes are asked for in steps of this many: the first step when a podcast
 // is opened, another each time the scroll nears the bottom. Each step repeats
 // the whole request with the higher limit.
-#define PODCAST_EPISODES_STEP 100
+#define PODCAST_EPISODES_STEP PODCASTPAGE_FEED_STEP
 
 // The longest queue a tapped episode builds: it and the ones after it in the
 // list. Each queued episode that is not on the card yet gets its sidecar
@@ -92,18 +97,52 @@ static lv_obj_t *busy_layer;
 static lv_obj_t *busy_label;
 static lv_obj_t *search_btn;
 static lv_obj_t *settings_btn;
-static lv_obj_t *saved_btn; // the downloaded podcasts, which need no network
 
-// The two pills at the top -- "My podcasts" and "Trending" -- and the row that
-// holds them. Shown only while one of the two lists they name is underneath: on
-// search results or on a podcast's episodes they would not be telling the
-// truth, because what is on screen is neither of them.
+// The three pills at the top -- the followed podcasts, the ones on the card and
+// the chart -- and the row that holds them. Shown only while one of the lists
+// they name is underneath: on search results they would not be telling the
+// truth, because what is on screen is none of them.
 static lv_obj_t *pill_row;
 static lv_obj_t *pill_followed;
+static lv_obj_t *pill_card;
 static lv_obj_t *pill_trending;
 
-// The notice that takes the list's place when the section cannot work: the
-// keys are missing, or the Wi-Fi is.
+// Without a network, or without the keys, the line that says so above the
+// podcasts on the card -- which are all that can be listened to then.
+static lv_obj_t *offline_banner;
+static lv_obj_t *offline_label;
+static bool offline;
+
+// Above the followed podcasts and the ones on the card: "Now listening", the
+// episode in the player, and under "Continue listening" the ones left halfway
+// most recently. They scroll with the list, in a block above its rows.
+#define LISTEN_ROWS 4 // the first for the episode in the player
+
+typedef struct {
+	lv_obj_t *button;
+	lv_obj_t *thumb;
+	lv_obj_t *title;
+	lv_obj_t *detail;
+	lv_obj_t *bar;
+	lv_obj_t *action; // play, or pause on the episode in the player
+	lv_obj_t *action_icon;
+	cover_image_t image;
+	char cover_path[512]; // the file the picture is of; "" for none
+	bool cover_waiting;
+	podcaststate_t state;
+} listen_row_t;
+
+static lv_obj_t *top_block;
+static lv_obj_t *now_header;
+static lv_obj_t *continue_header;
+static listen_row_t listen[LISTEN_ROWS];
+
+// What the "on the card" pill shows when the Podcast folder is empty: how to
+// fill it.
+static lv_obj_t *card_empty;
+
+// The notice that takes the list's place when the section cannot work at all:
+// no card.
 static lv_obj_t *note_label;
 static lv_obj_t *note_wifi_row; // the "Wi-Fi settings" row under the network notice
 static void note_wifi_row_cb(lv_event_t *e);
@@ -116,16 +155,19 @@ typedef enum {
 	JOB_NONE = 0,
 	JOB_SEARCH,	  // search podcasts by name
 	JOB_TRENDING, // the current chart
-	JOB_EPISODES, // one podcast's episodes
+	JOB_FEED,	  // one podcast's episodes, for its page (podcastcard.c)
 	JOB_FOLLOWED, // the followed podcasts, which live on the card
 	JOB_PLAY,	  // download an episode and start it
+	JOB_CARD,	  // the podcasts in the card's Podcast folder: drawn on the spot, never queued
+	JOB_RESUME,	  // an episode of the catalogue left halfway: its podcast's list, then play it
 } job_kind_t;
 
 typedef struct {
 	job_kind_t kind;
 	char text[160];	 // the query, or the title the list will carry
 	long long id;	 // the podcast's or the episode's id (64 bit: see podcast.h)
-	int index;		 // for JOB_PLAY: which row was tapped
+	int index;		 // for JOB_PLAY: which row was tapped; for JOB_FEED: the request's number
+	long long feed;	 // for JOB_RESUME: the episode's podcast; for JOB_FEED: whether to ask its record too
 	int want;		 // how many entries in all; 0 means one page
 	// Whether this is the SAME list continuing rather than a new one. Set only
 	// by the paging at the bottom of the list, never inferred from `want`: a
@@ -165,6 +207,9 @@ static bool result_pending;
 // Kept for the heading, whose reserved width follows the corner buttons.
 static gui_config_t *g_cfg;
 
+// The podcaststate_revision() the page was last drawn with.
+static unsigned states_seen;
+
 static void *worker_main(void *arg);
 static void refresh_page_state(void);
 static bool refresh_notes(void);
@@ -178,13 +223,22 @@ static void list_nav_commit(void);
 static void fill_list(int from);
 static void busy_hide(void);
 static void prefetch_urgent(const char *wanted_path);
+static bool show_card_now(void);
+static void backfill_start(void);
 
 static void submit(const job_t *job) {
 	pthread_mutex_lock(&job_lock);
+	// One job waits at a time: a podcast's page whose list is pushed out by
+	// another job is told, so that it asks again rather than wait for nothing.
+	bool dropped = have_pending && pending.kind == JOB_FEED && job->kind != JOB_FEED;
+	unsigned dropped_ticket = (unsigned)pending.index;
 	pending = *job;
 	have_pending = true;
 	pthread_cond_signal(&job_ready);
 	pthread_mutex_unlock(&job_lock);
+	if (dropped) {
+		podcastcard_feed_loaded(dropped_ticket, -1, NULL, NULL);
+	}
 }
 
 static void job_result_taken(void) {
@@ -267,13 +321,10 @@ static lv_obj_t *list_empty;
 
 // What is drawn right now, which is not the same as result_kind: result_* says
 // what the worker is working on, and while an episode downloads that job is
-// JOB_PLAY -- but the screen still holds the episode list with its tappable
-// rows. Whatever answers a tap has to look at what is visible, not at what is
-// being done. (qobuzpage.c does the same, under the same name.)
+// JOB_PLAY -- but the screen still holds the list with its tappable rows.
+// Whatever answers a tap has to look at what is visible, not at what is being
+// done. (qobuzpage.c does the same, under the same name.)
 static job_kind_t list_kind;
-
-// The podcast whose episodes are on screen: the folder a download goes into.
-static char list_feed_title[PODCAST_TITLE_MAX];
 
 // Paging, as in the radio: the last request came back full to the limit, so
 // there may be more -- and one request at a time.
@@ -308,6 +359,8 @@ typedef struct {
 	lv_obj_t *title;
 	lv_obj_t *detail;
 	lv_obj_t *menu_btn;
+	lv_obj_t *badge;	  // on the cover of a podcast on the card: where it came from
+	lv_obj_t *badge_icon;
 	// The entry drawn on it: -1 for a row with nothing to show, and -2 for one
 	// that must be redrawn even though its number has not changed -- the list
 	// reloaded underneath it to the same length.
@@ -315,6 +368,13 @@ typedef struct {
 } row_t;
 
 static row_t rows[ROW_POOL];
+
+// The podcasts on the card, when that is the list on screen.
+static podcastcard_show_t card_shows[PODCASTCARD_MAX_SHOWS];
+
+// How many episodes the card holds for each followed podcast, for the line
+// under its name.
+static int followed_on_card[PODCASTSUBS_MAX];
 
 // The object the rows are positioned inside. It holds no layout of its own: its
 // only job is to be as tall as the whole list so the container has something to
@@ -349,16 +409,43 @@ static bool row_art_failed[PODCAST_MAX_HELD];
 // its value.
 static const char podcast_art_owner;
 
-static int slot_owner[QOBUZART_SLOTS];
+// The last of the loader's slots is the cover at the head of a podcast's page
+// (podcastcard.c); the rows share the others.
+#define ROW_ART_SLOTS (QOBUZART_SLOTS - 1)
+#define HERO_ART_SLOT (QOBUZART_SLOTS - 1)
+
+static int slot_owner[ROW_ART_SLOTS];
 static lv_timer_t *art_timer;
 
+// The podcasts on the card bring their covers from the card, through the
+// cover loader: pooled row i asks with slot PODCASTCARD_SLOT_ROWS + i, and this
+// is the entry it asked for, or -1.
+static int card_slot_entry[ROW_POOL];
+
 static bool art_any_pending(void) {
-	for (int i = 0; i < QOBUZART_SLOTS; i++) {
+	for (int i = 0; i < ROW_ART_SLOTS; i++) {
 		if (slot_owner[i] >= 0) {
 			return true;
 		}
 	}
+	for (int i = 0; i < ROW_POOL; i++) {
+		if (card_slot_entry[i] >= 0) {
+			return true;
+		}
+	}
+	for (int i = 0; i < LISTEN_ROWS; i++) {
+		if (listen[i].cover_waiting) {
+			return true;
+		}
+	}
 	return false;
+}
+
+static void card_art_release(int pool) {
+	if (card_slot_entry[pool] >= 0) {
+		coverloader_release(PODCASTCARD_SLOT_ROWS + pool);
+		card_slot_entry[pool] = -1;
+	}
 }
 
 static void art_wake(void) {
@@ -368,7 +455,7 @@ static void art_wake(void) {
 }
 
 static void art_release_slot(int slot) {
-	if (slot < 0 || slot >= QOBUZART_SLOTS) {
+	if (slot < 0 || slot >= ROW_ART_SLOTS) {
 		return;
 	}
 	qobuzart_release(&podcast_art_owner, slot);
@@ -376,6 +463,7 @@ static void art_release_slot(int slot) {
 }
 
 static void art_request_visible(void);
+static void listen_art_poll(void);
 
 // The pooled widget drawing this entry right now, or NULL when the entry is off
 // screen. Twelve comparisons, which is cheaper than keeping a map up to date.
@@ -417,7 +505,7 @@ static void show_cover(int row, int owner) {
 	if (row != owner) {
 		// It may already have asked for a copy of its own; that copy is now
 		// pointless and the slot is worth more to a row that has nothing.
-		for (int slot = 0; slot < QOBUZART_SLOTS; slot++) {
+		for (int slot = 0; slot < ROW_ART_SLOTS; slot++) {
 			if (slot_owner[slot] == row) {
 				art_release_slot(slot);
 			}
@@ -475,7 +563,7 @@ static void art_poll_cb(lv_timer_t *timer) {
 		return;
 	}
 
-	for (int slot = 0; slot < QOBUZART_SLOTS; slot++) {
+	for (int slot = 0; slot < ROW_ART_SLOTS; slot++) {
 		int row = slot_owner[slot];
 		if (row < 0 || row >= PODCAST_MAX_HELD) {
 			continue;
@@ -501,6 +589,39 @@ static void art_poll_cb(lv_timer_t *timer) {
 		freed = true;
 	}
 
+	// The covers of the podcasts on the card.
+	for (int i = 0; i < ROW_POOL; i++) {
+		int row = card_slot_entry[i];
+		if (row < 0) {
+			continue;
+		}
+		cover_image_t image;
+		bool finished = false;
+		bool got = coverloader_take(PODCASTCARD_SLOT_ROWS + i, &image, &finished);
+		if (!got && !finished) {
+			continue;
+		}
+		card_slot_entry[i] = -1;
+		freed = true;
+		if (!got) {
+			if (row < PODCAST_MAX_HELD) {
+				row_art_failed[row] = true;
+			}
+			continue;
+		}
+		if (list_kind != JOB_CARD || row >= list_count || row_has_image[row]) {
+			cover_free(&image);
+			continue;
+		}
+		cover_free(&row_images[row]);
+		row_images[row] = image;
+		row_has_image[row] = true;
+		row_image_source[row] = row;
+		paint_thumb(thumb_showing(row), row);
+	}
+
+	listen_art_poll();
+
 	// A slot that frees up goes straight back out to someone.
 	//
 	// There are more rows than slots, so art_request_visible() hands out what
@@ -516,7 +637,40 @@ static void art_poll_cb(lv_timer_t *timer) {
 // The covers wanted right now, which is the same set as the rows that exist:
 // the pool IS the visible band, so there is nothing left to test for
 // visibility.
+static void card_art_request_visible(void) {
+	for (int i = 0; i < ROW_POOL; i++) {
+		int row = rows[i].index;
+		if (row < 0 || row >= list_count || row_has_image[row] || row_art_failed[row] || card_slot_entry[i] == row) {
+			continue;
+		}
+		card_art_release(i);
+		const char *first = card_shows[row].first;
+		if (!first[0]) {
+			row_art_failed[row] = true;
+			continue;
+		}
+		// A thumbnail made before costs a small read; only a podcast seen for
+		// the first time waits for the decoder.
+		cover_image_t image;
+		if (cover_thumb_cached(first, ROW_THUMB, &image)) {
+			cover_free(&row_images[row]);
+			row_images[row] = image;
+			row_has_image[row] = true;
+			row_image_source[row] = row;
+			paint_thumb(rows[i].thumb, row);
+			continue;
+		}
+		coverloader_request(PODCASTCARD_SLOT_ROWS + i, first, ROW_THUMB);
+		card_slot_entry[i] = row;
+		art_wake();
+	}
+}
+
 static void art_request_visible(void) {
+	if (list_kind == JOB_CARD) {
+		card_art_request_visible();
+		return;
+	}
 	for (int i = 0; i < ROW_POOL; i++) {
 		int row = rows[i].index;
 		if (row < 0 || row >= list_count || row_has_image[row] || row_art_failed[row] || !row_cover_url[row][0]) {
@@ -532,7 +686,7 @@ static void art_request_visible(void) {
 		}
 
 		bool queued = false;
-		for (int slot = 0; slot < QOBUZART_SLOTS && !queued; slot++) {
+		for (int slot = 0; slot < ROW_ART_SLOTS && !queued; slot++) {
 			queued = slot_owner[slot] == row;
 		}
 		if (queued) {
@@ -540,7 +694,7 @@ static void art_request_visible(void) {
 		}
 
 		int free_slot = -1;
-		for (int slot = 0; slot < QOBUZART_SLOTS && free_slot < 0; slot++) {
+		for (int slot = 0; slot < ROW_ART_SLOTS && free_slot < 0; slot++) {
 			if (slot_owner[slot] < 0) {
 				free_slot = slot;
 			}
@@ -573,11 +727,15 @@ static void row_bind(row_t *row, int index) {
 	// itself.
 	int leaving = row->index;
 	if (leaving >= 0 && !row_has_image[leaving]) {
-		for (int slot = 0; slot < QOBUZART_SLOTS; slot++) {
+		for (int slot = 0; slot < ROW_ART_SLOTS; slot++) {
 			if (slot_owner[slot] == leaving) {
 				art_release_slot(slot);
 			}
 		}
+	}
+	int pool = (int)(row - rows);
+	if (card_slot_entry[pool] >= 0 && card_slot_entry[pool] != index) {
+		card_art_release(pool);
 	}
 
 	row->index = index;
@@ -591,8 +749,16 @@ static void row_bind(row_t *row, int index) {
 	lv_obj_set_y(row->button, index * ROW_PITCH);
 
 	const char *title =
-		list_kind == JOB_EPISODES ? result_episodes[index].title : result_feeds[index].title;
+		list_kind == JOB_CARD ? podcastcard_show_name(&card_shows[index]) : result_feeds[index].title;
 	lv_label_set_text(row->title, title);
+
+	// Where a podcast on the card came from: downloaded here, or copied in.
+	if (list_kind == JOB_CARD) {
+		lv_image_set_src(row->badge_icon, card_shows[index].downloaded ? &icon_download_badge : &icon_sd_card_badge);
+		lv_obj_set_hidden(row->badge, false);
+	} else {
+		lv_obj_set_hidden(row->badge, true);
+	}
 
 	char detail[200];
 	row_detail(index, detail, sizeof(detail));
@@ -621,7 +787,8 @@ static void window_update(void) {
 		return;
 	}
 
-	int scroll = lv_obj_get_scroll_y(list_container);
+	// From the top of the rows, under whatever sits above them.
+	int scroll = lv_obj_get_scroll_y(list_container) - lv_obj_get_y(list_body);
 	if (scroll < 0) {
 		scroll = 0; // the elastic overscroll at the top
 	}
@@ -653,8 +820,11 @@ static void list_scrolled_cb(lv_event_t *e) {
 }
 
 static void art_forget_rows(void) {
-	for (int slot = 0; slot < QOBUZART_SLOTS; slot++) {
+	for (int slot = 0; slot < ROW_ART_SLOTS; slot++) {
 		art_release_slot(slot);
+	}
+	for (int i = 0; i < ROW_POOL; i++) {
+		card_art_release(i);
 	}
 	// Nothing may still be pointing at the pixels about to go: the widgets stay
 	// alive across a list change, so they are put back on the microphone first
@@ -685,8 +855,11 @@ static void art_forget_rows(void) {
 // still will not, and forgetting that would send the same failing requests
 // again at every visit.
 static void art_drop_pictures(void) {
-	for (int slot = 0; slot < QOBUZART_SLOTS; slot++) {
+	for (int slot = 0; slot < ROW_ART_SLOTS; slot++) {
 		art_release_slot(slot);
+	}
+	for (int i = 0; i < ROW_POOL; i++) {
+		card_art_release(i);
 	}
 	for (int row = 0; row < PODCAST_MAX_HELD; row++) {
 		row_has_image[row] = false;
@@ -746,15 +919,13 @@ static void list_unloaded_cb(lv_event_t *e) {
 // the rows
 // ---------------------------------------------------------------------------
 
-// The three-dot menu only makes sense on a podcast: that is where following it
-// is chosen. An episode has nothing to offer that tapping it does not do
-// already.
+// The three-dot menu is where following a podcast of the catalogue is chosen;
+// the podcasts on the card have none.
 static bool kind_has_row_menu(job_kind_t kind) {
 	return kind == JOB_SEARCH || kind == JOB_TRENDING || kind == JOB_FOLLOWED;
 }
 
 static void row_menu_cb(lv_event_t *e);
-static void row_long_cb(lv_event_t *e);
 
 // The twelve rows, built once. Everything that can differ between one entry and
 // the next is created here and shown or hidden at bind time: a recycled widget
@@ -782,7 +953,6 @@ static void build_rows(int width) {
 		// button keeps the press to itself.
 		lv_obj_set_event_bubble(row->button, true);
 		lv_obj_add_event_cb(row->button, row_clicked_cb, LV_EVENT_CLICKED, NULL);
-		lv_obj_add_event_cb(row->button, row_long_cb, LV_EVENT_LONG_PRESSED, NULL);
 
 		// The thumbnail is always there, even when the catalogue gives no
 		// address: a row without it comes up with nothing on the left, text
@@ -794,6 +964,23 @@ static void build_rows(int width) {
 		lv_image_set_inner_align(row->thumb, LV_IMAGE_ALIGN_CENTER);
 		lv_obj_set_event_bubble(row->thumb, true);
 		paint_thumb(row->thumb, -1);
+
+		// Over the cover's corner, out of the row's layout.
+		row->badge = lv_obj_create(row->button);
+		lv_obj_remove_style_all(row->badge);
+		lv_obj_set_ignore_layout(row->badge, true);
+		lv_obj_set_size(row->badge, 24, 24);
+		lv_obj_set_style_radius(row->badge, LV_RADIUS_CIRCLE, 0);
+		lv_obj_set_style_bg_opa(row->badge, LV_OPA_COVER, 0);
+		lv_obj_set_style_bg_color(row->badge, theme()->screen_bg, 0);
+		lv_obj_set_pos(row->badge, ROW_THUMB - 10, (ROW_HEIGHT + ROW_THUMB) / 2 - 18);
+		lv_obj_set_event_bubble(row->badge, true);
+		lv_obj_set_hidden(row->badge, true);
+		row->badge_icon = lv_image_create(row->badge);
+		lv_image_set_src(row->badge_icon, &icon_sd_card_badge);
+		lv_obj_add_style(row->badge_icon, &theme_style_icon, 0);
+		lv_obj_center(row->badge_icon);
+		lv_obj_set_event_bubble(row->badge_icon, true);
 
 		lv_obj_t *texts = lv_obj_create(row->button);
 		lv_obj_set_flex_grow(texts, 1);
@@ -875,27 +1062,8 @@ static void format_duration(int seconds, char *out, size_t size) {
 	}
 }
 
-// "12 March 2026". Written by hand rather than with strftime because strftime
-// follows the SYSTEM language, which on this device never changes, while the
-// interface language is the user's own choice.
-static void format_date(long unix_secs, char *out, size_t size) {
-	static const char *const PODCAST_MONTHS[12] = {"podcast_january", "podcast_february", "podcast_march",	   "podcast_april",   "podcast_may",   "podcast_june",
-										   "podcast_july",  "podcast_august",	  "podcast_september", "podcast_october",  "podcast_november", "podcast_december"};
-	if (unix_secs <= 0) {
-		out[0] = '\0';
-		return;
-	}
-	time_t t = (time_t)unix_secs;
-	struct tm tm_when;
-	if (!localtime_r(&t, &tm_when)) {
-		out[0] = '\0';
-		return;
-	}
-	snprintf(out, size, "%d %s %d", tm_when.tm_mday, tr(PODCAST_MONTHS[tm_when.tm_mon % 12]), tm_when.tm_year + 1900);
-}
-
-// The line under an entry's name: the date and length of an episode, the author
-// and episode count of a podcast. Built at bind time rather than kept for every
+// The line under an entry's name: the author and episode count of a podcast, or
+// what a podcast on the card holds. Built at bind time rather than kept for every
 // entry -- it is twelve short strings on screen, not two hundred and forty in
 // memory.
 static void row_detail(int index, char *out, size_t size) {
@@ -903,16 +1071,20 @@ static void row_detail(int index, char *out, size_t size) {
 	if (index < 0 || index >= list_count) {
 		return;
 	}
-	if (list_kind == JOB_EPISODES) {
-		const podcast_episode_t *e = &result_episodes[index];
-		char when[48];
-		char duration[32];
-		format_date(e->published, when, sizeof(when));
-		format_duration(e->duration_secs, duration, sizeof(duration));
-		if (when[0] && duration[0]) {
-			snprintf(out, size, "%s \xC2\xB7 %s", when, duration);
+	if (list_kind == JOB_CARD) {
+		const podcastcard_show_t *show = &card_shows[index];
+		char total[48];
+		if (show->episodes == 1) {
+			snprintf(total, sizeof(total), "%s", tr("podcast_one_episode"));
 		} else {
-			snprintf(out, size, "%s%s", when, duration);
+			snprintf(total, sizeof(total), tr("podcast_episodes_2"), show->episodes);
+		}
+		if (show->unheard == 0) {
+			snprintf(out, size, "%s \xC2\xB7 %s", tr("podcast_all_heard_short"), total);
+		} else {
+			char waiting[48];
+			snprintf(waiting, sizeof(waiting), tr("podcast_to_hear_count"), show->unheard);
+			snprintf(out, size, "%s%s \xC2\xB7 %s", show->fresh ? "\xE2\x80\xA2 " : "", waiting, total);
 		}
 		return;
 	}
@@ -924,7 +1096,17 @@ static void row_detail(int index, char *out, size_t size) {
 	} else {
 		snprintf(out, size, "%s", f->author);
 	}
+	// A followed podcast with episodes on the card says so.
+	if (list_kind == JOB_FOLLOWED && index < PODCASTSUBS_MAX && followed_on_card[index] > 0) {
+		size_t n = strlen(out);
+		char on_card[48];
+		snprintf(on_card, sizeof(on_card), tr("podcast_on_card_count"), followed_on_card[index]);
+		snprintf(out + n, size - n, "%s%s", n ? " \xC2\xB7 " : "", on_card);
+	}
 }
+
+static void refresh_listening(void);
+static void refresh_card_empty(void);
 
 // `from` is the first NEW entry: 0 is a different list, a higher value is
 // another page of the same one appended at the end. No widget is created or
@@ -937,16 +1119,17 @@ static void fill_list(int from) {
 
 	list_kind = result_kind;
 	list_count = result_count;
-	if (list_kind == JOB_EPISODES) {
-		snprintf(list_feed_title, sizeof(list_feed_title), "%s", result_title);
-	}
 
 	// The addresses of every entry, on screen or not, because the lending looks
 	// for a row that already holds this address and the row that holds it is
 	// usually one nobody can see.
-	for (int i = from; i < result_count && i < PODCAST_MAX_HELD; i++) {
-		const char *url = list_kind == JOB_EPISODES ? result_episodes[i].image : result_feeds[i].image;
-		snprintf(row_cover_url[i], sizeof(row_cover_url[0]), "%s", url ? url : "");
+	for (int i = from; i < result_count && i < PODCAST_MAX_HELD && list_kind != JOB_CARD; i++) {
+		snprintf(row_cover_url[i], sizeof(row_cover_url[0]), "%s", result_feeds[i].image);
+	}
+	if (list_kind == JOB_FOLLOWED) {
+		for (int i = 0; i < list_count && i < PODCASTSUBS_MAX; i++) {
+			followed_on_card[i] = podcastcard_count_for_title(result_feeds[i].title);
+		}
 	}
 
 	// The entries under the pool have changed even where their numbers have
@@ -962,11 +1145,11 @@ static void fill_list(int from) {
 	}
 	window_update();
 
-	// The pills only on the two lists they name. The title says "Podcasts"
-	// there, because the lit pill already says which of the two is on screen;
+	// The pills only on the three lists they name. The title says "Podcasts"
+	// there, because the lit pill already says which one is on screen;
 	// elsewhere it says what is on screen, which is the query or the podcast's
 	// name.
-	bool home_view = list_kind == JOB_FOLLOWED || list_kind == JOB_TRENDING;
+	bool home_view = list_kind == JOB_FOLLOWED || list_kind == JOB_TRENDING || list_kind == JOB_CARD;
 	if (pill_row) {
 		if (home_view) {
 			lv_obj_set_hidden(pill_row, false);
@@ -975,16 +1158,16 @@ static void fill_list(int from) {
 		}
 	}
 	// The magnifier and the gear belong to the SECTION, not to what is inside
-	// it: on search results and on a podcast's episodes they go away together
-	// with the pills.
+	// it: on search results they go away together with the pills.
 	refresh_corner_buttons();
 	paint_pill(pill_followed, list_kind == JOB_FOLLOWED);
+	paint_pill(pill_card, list_kind == JOB_CARD);
 	paint_pill(pill_trending, list_kind == JOB_TRENDING);
 	if (list_title) {
 		lv_label_set_text(list_title, home_view ? tr("podcasts") : result_title);
 	}
 
-	if (list_count == 0) {
+	if (list_count == 0 && list_kind != JOB_CARD) {
 		// The empty notice says what to do when there is something to do. It is
 		// where the hint lives: under the notice it appears only to someone
 		// whose list really is empty, rather than as a subtitle that stays over
@@ -995,6 +1178,8 @@ static void fill_list(int from) {
 	} else {
 		lv_obj_set_hidden(list_empty, true);
 	}
+	refresh_card_empty();
+	refresh_listening();
 
 	// A result can land after a notice has taken the page over -- the request
 	// was already on the wire when the Wi-Fi went. The list is filled anyway,
@@ -1027,7 +1212,12 @@ static bool inflight_valid;
 static bool inflight_is_back; // a back step consumes a rung instead of adding one
 static bool inflight_is_root; // a pill: the stack restarts from there
 
-static bool job_is_list(job_kind_t kind) { return kind != JOB_PLAY && kind != JOB_NONE; }
+static bool job_is_list(job_kind_t kind) {
+	return kind != JOB_PLAY && kind != JOB_RESUME && kind != JOB_FEED && kind != JOB_NONE;
+}
+
+// The jobs that start playback rather than draw a list.
+static bool job_plays(job_kind_t kind) { return kind == JOB_PLAY || kind == JOB_RESUME; }
 
 static bool same_list(const job_t *a, const job_t *b) {
 	return a->kind == b->kind && a->id == b->id && strcmp(a->text, b->text) == 0;
@@ -1110,6 +1300,12 @@ static bool list_back_guard(void) {
 	// The top step is PEEKED at and redone; the stack only shortens once the
 	// result has arrived (list_nav_commit).
 	job_t previous = list_history[list_history_len - 1];
+	// The card's podcasts are not the worker's: they are drawn on the spot.
+	if (previous.kind == JOB_CARD) {
+		if (show_card_now()) {
+			return true;
+		}
+	}
 	inflight_job = previous;
 	inflight_valid = true;
 	inflight_is_back = true;
@@ -1159,7 +1355,7 @@ static void run_ex(const job_t *job, bool root) {
 	// until job_done_cb takes it down, which is the moment playback has really
 	// begun -- a timed toast would leave before the download it is about.
 	if (job->kind != JOB_FOLLOWED) {
-		busy_show_text(job->kind == JOB_PLAY);
+		busy_show_text(job_plays(job->kind));
 	}
 	submit(job);
 }
@@ -1175,7 +1371,7 @@ static void maybe_load_more(void) {
 		return;
 	}
 	if (lv_screen_active() != list_screen || !have_current_list || !job_is_list(current_list_job.kind) ||
-		current_list_job.kind == JOB_FOLLOWED) {
+		current_list_job.kind == JOB_FOLLOWED || current_list_job.kind == JOB_CARD) {
 		return;
 	}
 	// A sideways drag (back, or pulling the player in) moves this list too:
@@ -1194,7 +1390,7 @@ static void maybe_load_more(void) {
 	// From the LIMIT asked for last time, not from the cleaned-up count: the
 	// discards (episodes with no audio) must not shift the step of the next
 	// request.
-	job.want = result_want + (current_list_job.kind == JOB_EPISODES ? PODCAST_EPISODES_STEP : PODCAST_LIMIT);
+	job.want = result_want + PODCAST_LIMIT;
 	job.more = true;
 	start_worker();
 	submit(&job);
@@ -1215,7 +1411,8 @@ static bool fetch_started;
 static bool waiting_for_episode;
 
 // The episodes that are known: they are what the address of the one the queue
-// asks for is found from. Filled when an episode list is started.
+// asks for is found from. Filled when a podcast's list arrives, and from the
+// list a tap was made on.
 static podcast_episode_t queued_episodes[PODCAST_MAX_HELD];
 // Whether that array is the whole feed rather than a page of it. Asking its
 // length is not the same question: a podcast with twenty episodes has twenty
@@ -1324,8 +1521,8 @@ static void prefetch_urgent(const char *wanted_path) {
 // -- the catalogue's /episodes/byfeedid answer carries the podcast's TITLE and
 // not its author -- but the sidecar files need it, because that is where the
 // player's star takes what it needs to follow the podcast without asking the
-// network. Taken when the podcast's row is tapped, where the whole record is
-// there.
+// network. Given by the podcast's page, which has the whole record
+// (podcastpage_set_browsing).
 static char browsing_author[PODCAST_AUTHOR_MAX];
 static char browsing_image[PODCAST_URL_MAX];
 
@@ -1447,7 +1644,7 @@ static void job_done_cb(void *user) {
 
 
 
-	if (result_kind == JOB_PLAY) {
+	if (job_plays(result_kind)) {
 		job_result_taken();
 		return;
 	}
@@ -1457,8 +1654,7 @@ static void job_done_cb(void *user) {
 	// Come back short, the list has ended and nothing more is asked for. "My
 	// podcasts" is entirely on the card and never pages.
 	page_loading = false;
-	page_more = result_kind != JOB_FOLLOWED && result_raw >= result_want &&
-				result_count < (result_kind == JOB_EPISODES ? PODCAST_MAX_HELD : PODCAST_FEEDS_MAX);
+	page_more = result_kind != JOB_FOLLOWED && result_raw >= result_want && result_count < PODCAST_FEEDS_MAX;
 	list_nav_commit();
 
 	// The page only changes if the viewer is still where it expects to be.
@@ -1476,8 +1672,216 @@ static void job_done_cb(void *user) {
 }
 
 // ---------------------------------------------------------------------------
+// a podcast's list, for its page
+//
+// The worker writes the answer into the downloader's array, and the GUI copies
+// it into the page's one when it is taken: the page reads its array while it
+// scrolls, and never while it is being written.
+// ---------------------------------------------------------------------------
+
+// The answer, written by the worker and read once it has been posted.
+static unsigned feed_answer_ticket;
+static int feed_answer_count; // -1 on failure
+static int feed_answer_want;
+static bool feed_answer_full; // as many came back as were asked for
+static char feed_answer_error[256];
+static podcast_feed_t feed_answer_info;
+static bool feed_answer_has_info;
+
+// The list the page draws: result_episodes, this long. GUI thread.
+static int feed_count;
+static int feed_want;
+static bool feed_more_flag;
+static unsigned feed_last_ticket;
+
+static void feed_done_cb(void *user) {
+	(void)user;
+	unsigned ticket = feed_answer_ticket;
+	int n = feed_answer_count;
+	// Only the latest request's: an older one is about a podcast no longer
+	// open, or an earlier step of the same list.
+	bool latest = ticket == feed_last_ticket;
+	if (latest && n >= 0) {
+		memcpy(result_episodes, queued_episodes, sizeof(result_episodes[0]) * (size_t)n);
+		feed_count = n;
+		feed_want = feed_answer_want;
+		feed_more_flag = feed_answer_full && n < PODCAST_MAX_HELD;
+	}
+	static char error[256];
+	static podcast_feed_t info;
+	snprintf(error, sizeof(error), "%s", feed_answer_error);
+	bool has_info = feed_answer_has_info;
+	if (has_info) {
+		info = feed_answer_info;
+	}
+	job_result_taken();
+	if (latest) {
+		podcastcard_feed_loaded(ticket, n, n < 0 ? error : NULL, has_info ? &info : NULL);
+	}
+}
+
+// On the worker.
+static void run_feed_job(const job_t *job) {
+	int want = job->want > 0 ? job->want : PODCAST_EPISODES_STEP;
+	if (want > PODCAST_MAX_HELD) {
+		want = PODCAST_MAX_HELD;
+	}
+	feed_answer_error[0] = '\0';
+	feed_answer_has_info = job->feed != 0 && podcast_feed(job->id, &feed_answer_info);
+	int n = podcast_episodes(job->id, queued_episodes, want);
+	if (n < 0) {
+		snprintf(feed_answer_error, sizeof(feed_answer_error), "%s", podcast_last_error());
+		// The array may hold part of an answer: nothing in it is to be trusted.
+		queued_count = 0;
+		feed_answer_full = false;
+	} else {
+		int raw = podcast_last_raw_count();
+		queued_count = n;
+		queued_complete = want >= PODCAST_MAX_HELD || raw < want;
+		feed_answer_full = raw >= want;
+	}
+	feed_answer_ticket = (unsigned)job->index;
+	feed_answer_count = n;
+	feed_answer_want = want;
+	pthread_mutex_lock(&job_lock);
+	result_pending = true;
+	pthread_mutex_unlock(&job_lock);
+	gui_post(feed_done_cb, NULL);
+}
+
+unsigned podcastpage_feed_load(long long feed_id, int want, bool with_info) {
+	job_t job = {0};
+	job.kind = JOB_FEED;
+	job.id = feed_id;
+	job.want = want;
+	job.feed = with_info ? 1 : 0;
+	feed_last_ticket++;
+	if (feed_last_ticket == 0) {
+		feed_last_ticket = 1;
+	}
+	job.index = (int)feed_last_ticket;
+	start_worker();
+	submit(&job);
+	return feed_last_ticket;
+}
+
+int podcastpage_feed_count(void) { return feed_count; }
+
+const podcast_episode_t *podcastpage_feed_episode(int index) {
+	return index >= 0 && index < feed_count ? &result_episodes[index] : NULL;
+}
+
+int podcastpage_feed_want(void) { return feed_want; }
+
+bool podcastpage_feed_more(void) { return feed_more_flag; }
+
+// ---------------------------------------------------------------------------
 // the thread
 // ---------------------------------------------------------------------------
+
+// Waits, on the worker, until the point an episode was left at has come down:
+// a seek past what has arrived is refused rather than waited for, so starting a
+// growing file in the middle needs the bytes there first. Gives up -- and the
+// episode starts from the top -- after two minutes, when the server did not
+// say how long the file is, or when another job has been asked for.
+static double wait_for_resume_point(const char *path, double resume, double duration) {
+	if (resume <= 0 || !growfile_is_growing(path)) {
+		return resume;
+	}
+	growfile_t *g = growfile_open(path);
+	if (!g) {
+		return 0;
+	}
+	double reached = 0;
+	for (int tick = 0; tick < 600; tick++) {
+		long done = 0, total = 0;
+		if (!growfile_span(g, &done, &total)) {
+			// Finished meanwhile, or no length announced.
+			reached = growfile_is_growing(path) ? 0 : resume;
+			break;
+		}
+		if (duration <= 0) {
+			break;
+		}
+		double needed = (double)total * (resume / duration) * 1.02 + 65536.0;
+		if ((double)done >= needed) {
+			reached = resume;
+			break;
+		}
+		pthread_mutex_lock(&job_lock);
+		bool superseded = have_pending;
+		pthread_mutex_unlock(&job_lock);
+		if (superseded) {
+			break;
+		}
+		usleep(200000);
+	}
+	growfile_close(g);
+	if (reached <= 0) {
+		fprintf(stderr, "podcast: '%s' did not come down as far as %.0f s, starting it from the top\n", path, resume);
+	}
+	return reached;
+}
+
+// Downloads queued_episodes[index], queues it and the ones after it, and
+// starts it -- from where it was left, if it was. False, with result_error
+// set, when the download cannot start.
+static bool play_queued_from(int index) {
+	// Drop whatever was coming down: this is the user's order, not a fetch
+	// ahead.
+	streamturn_abandon_all();
+	podcastcache_set_network_wanted(true);
+
+	char path[512];
+	if (!fetch_episode(&queued_episodes[index], path, sizeof(path))) {
+		snprintf(result_error, sizeof(result_error), "%s", podcastcache_last_error());
+		return false;
+	}
+
+	// Where it was left, by its id: the same whether it was streamed or kept.
+	double resume = 0;
+	podcaststate_t state;
+	if (podcaststate_get_episode(queued_episodes[index].id, &state) && !state.played && state.position > 5.0) {
+		double duration = state.duration > 0 ? state.duration : queued_episodes[index].duration_secs;
+		resume = wait_for_resume_point(path, state.position - 3.0, duration);
+	}
+
+	// The queue: this episode and the ones AFTER it in the list, that is,
+	// going back in time. The others are not downloaded now -- they come
+	// down when their turn arrives (see podcastpage_prepare_track).
+	static char paths[PODCAST_QUEUE_MAX][512];
+	static const char *path_ptr[PODCAST_QUEUE_MAX];
+	int count = 0;
+	for (int i = index; i < queued_count && count < PODCAST_QUEUE_MAX; i++) {
+		if (i == index) {
+			snprintf(paths[count], sizeof(paths[0]), "%s", path);
+		} else if (!podcastcache_find(queued_episodes[i].id, paths[count], sizeof(paths[0]))) {
+			podcastcache_path(queued_episodes[i].id, queued_episodes[i].mime, paths[count],
+							  sizeof(paths[0]));
+
+			// The tags for the whole queue at once, as Qobuz does and
+			// for the same reason: they are text files of a few dozen
+			// bytes and cost nothing, and without them the Queue page
+			// would show the file name, which is the id, for every
+			// episode not yet downloaded. Not the cover: that is an
+			// image to download, and it is fetched when the episode's
+			// turn comes.
+			const podcast_episode_t *q = &queued_episodes[i];
+			podcastcache_write_sidecars(q->id, q->mime, q->title,
+										q->feed_title[0] ? q->feed_title : NULL, q->feed_id,
+										browsing_author, browsing_image, q->image, false);
+		}
+		path_ptr[count] = paths[count];
+		count++;
+	}
+
+	// _ordered: a podcast queue already has its order, newest first
+	// going back. Plain device_state_play_list would shuffle the
+	// episodes whenever the play mode is random.
+	device_state_play_list_ordered_at(path_ptr, count, 0, resume > 0 ? resume : -1.0);
+	gui_post(play_started_async, NULL);
+	return true;
+}
 
 static void *worker_main(void *arg) {
 	(void)arg;
@@ -1505,6 +1909,13 @@ static void *worker_main(void *arg) {
 		have_pending = false;
 		pthread_mutex_unlock(&job_lock);
 
+		// A podcast's page: its own answer, which leaves the list on this page
+		// as it is.
+		if (job.kind == JOB_FEED) {
+			run_feed_job(&job);
+			continue;
+		}
+
 		// What is on screen stays there if the job fails: without this snapshot,
 		// an error emptied the list being looked at.
 		int kept_count = result_count;
@@ -1514,11 +1925,8 @@ static void *worker_main(void *arg) {
 
 		result_error[0] = '\0';
 
-		// Playback does not clear the list, and that is not a detail: what is
-		// playing is an episode of THIS list, and the list stays on screen with
-		// its tappable rows. Cleared, a second tap on another episode finds
-		// result_count at zero and returns in silence. Same rule as
-		// qobuzpage.c.
+		// Playback does not clear the list on this page: it stays on screen
+		// with its tappable rows. Same rule as qobuzpage.c.
 		result_kind = job.kind;
 
 		// How many entries in all. The catalogue does not page with an offset, so
@@ -1529,18 +1937,18 @@ static void *worker_main(void *arg) {
 		if (want <= 0) {
 			want = PODCAST_LIMIT;
 		}
-		int cap = job.kind == JOB_EPISODES || job.kind == JOB_PLAY ? PODCAST_MAX_HELD : PODCAST_FEEDS_MAX;
+		int cap = job_plays(job.kind) ? PODCAST_MAX_HELD : PODCAST_FEEDS_MAX;
 		if (want > cap) {
 			want = cap;
 		}
 		bool grow = job.more;
 		int kept = result_count;
 
-		if (job.kind != JOB_PLAY && !grow) {
+		if (!job_plays(job.kind) && !grow) {
 			result_count = 0;
 			snprintf(result_title, sizeof(result_title), "%s", job.text);
 		}
-		if (job.kind != JOB_PLAY) {
+		if (!job_plays(job.kind)) {
 			result_from = grow ? kept : 0;
 			result_want = want;
 		}
@@ -1568,25 +1976,6 @@ static void *worker_main(void *arg) {
 			break;
 		}
 
-		case JOB_EPISODES: {
-			int n = podcast_episodes(job.id, result_episodes, want);
-			if (n < 0) {
-				snprintf(result_error, sizeof(result_error), "%s", podcast_last_error());
-			} else {
-				result_count = n;
-				result_raw = podcast_last_raw_count();
-				// The episodes that just arrived become the ones the downloader
-				// can look up: this is where it takes the address from when the
-				// queue reaches one that is not there yet.
-				memcpy(queued_episodes, result_episodes, sizeof(result_episodes[0]) * (size_t)n);
-				queued_count = n;
-				// Short of the limit asked for, or at the most the arrays hold:
-				// what came back is the whole feed.
-				queued_complete = want >= PODCAST_MAX_HELD || result_raw < want;
-			}
-			break;
-		}
-
 		case JOB_FOLLOWED:
 			// No network: the list is on the card, all of it at once.
 			result_count = podcastsubs_list(result_feeds, PODCAST_MAX_HELD);
@@ -1594,98 +1983,48 @@ static void *worker_main(void *arg) {
 			break;
 
 		case JOB_PLAY: {
+			// The list the tap was made on is the podcast page's: the episode
+			// tapped and the ones after it are taken from there. The id says it
+			// is still the same list.
 			int index = job.index;
-			if (index < 0 || index >= queued_count) {
+			if (index < 0 || index >= feed_count || result_episodes[index].id != job.id) {
 				snprintf(result_error, sizeof(result_error), "%s", tr("podcast_that_episode_is_gone"));
 				break;
 			}
+			memcpy(queued_episodes, result_episodes, sizeof(result_episodes[0]) * (size_t)feed_count);
+			queued_count = feed_count;
+			queued_complete = !feed_more_flag;
+			play_queued_from(index);
+			break;
+		}
 
-			// The queue is the rest of the podcast, and the list it is built
-			// from already holds its first step: JOB_EPISODES asks for
-			// PODCAST_EPISODES_STEP episodes when the podcast is opened.
-			//
-			// This is the fallback for the one case where it is not -- a queue
-			// resumed after a restart, or an episode reached from somewhere
-			// that never loaded the list. Between the tap and the first sound
-			// there is nothing here to wait for otherwise, which is the whole
-			// point: the request costs a round trip and the user is watching.
-			//
-			// The tapped episode is found again by its id rather than kept at
-			// its index: the longer list is the same list with more of it, but
-			// the id is what makes that certain.
-			if (!queued_complete && queued_count < PODCAST_EPISODES_STEP && queued_episodes[index].feed_id > 0) {
-				long long wanted_id = queued_episodes[index].id;
-				long long feed = queued_episodes[index].feed_id;
-				int n = podcast_episodes(feed, result_episodes, PODCAST_EPISODES_STEP);
-				if (n > queued_count) {
-					memcpy(queued_episodes, result_episodes, sizeof(result_episodes[0]) * (size_t)n);
-					queued_count = n;
-					queued_complete = true;
-					// The list on screen has grown too: it is the same list.
-					result_count = n;
-					result_from = 0;
-					result_want = PODCAST_EPISODES_STEP;
-
-					int found = -1;
-					for (int i = 0; i < n; i++) {
-						if (queued_episodes[i].id == wanted_id) {
-							found = i;
-							break;
-						}
+		case JOB_RESUME: {
+			// The podcast's list first, so the episodes after this one follow it
+			// as they would from a tap; the one episode alone when it is older
+			// than the first step of the list, or the podcast is not known.
+			int n = job.feed > 0 ? podcast_episodes(job.feed, queued_episodes, PODCAST_EPISODES_STEP) : -1;
+			int index = -1;
+			if (n > 0) {
+				queued_count = n;
+				queued_complete = podcast_last_raw_count() < PODCAST_EPISODES_STEP;
+				for (int i = 0; i < n && index < 0; i++) {
+					if (queued_episodes[i].id == job.id) {
+						index = i;
 					}
-					if (found < 0) {
-						snprintf(result_error, sizeof(result_error), "%s", tr("podcast_that_episode_is_gone"));
-						break;
-					}
-					index = found;
 				}
 			}
-
-			// Drop whatever was coming down: this is the user's order, not a
-			// fetch ahead.
-			streamturn_abandon_all();
-			podcastcache_set_network_wanted(true);
-
-			char path[512];
-			if (!fetch_episode(&queued_episodes[index], path, sizeof(path))) {
-				snprintf(result_error, sizeof(result_error), "%s", podcastcache_last_error());
-				break;
-			}
-
-			// The queue: this episode and the ones AFTER it in the list, that is,
-			// going back in time. The others are not downloaded now -- they come
-			// down when their turn arrives (see podcastpage_prepare_track).
-			static char paths[PODCAST_QUEUE_MAX][512];
-			static const char *path_ptr[PODCAST_QUEUE_MAX];
-			int count = 0;
-			for (int i = index; i < queued_count && count < PODCAST_QUEUE_MAX; i++) {
-				if (i == index) {
-					snprintf(paths[count], sizeof(paths[0]), "%s", path);
-				} else if (!podcastcache_find(queued_episodes[i].id, paths[count], sizeof(paths[0]))) {
-					podcastcache_path(queued_episodes[i].id, queued_episodes[i].mime, paths[count],
-									  sizeof(paths[0]));
-
-					// The tags for the whole queue at once, as Qobuz does and
-					// for the same reason: they are text files of a few dozen
-					// bytes and cost nothing, and without them the Queue page
-					// would show the file name, which is the id, for every
-					// episode not yet downloaded. Not the cover: that is an
-					// image to download, and it is fetched when the episode's
-					// turn comes.
-					const podcast_episode_t *q = &queued_episodes[i];
-					podcastcache_write_sidecars(q->id, q->mime, q->title,
-												q->feed_title[0] ? q->feed_title : NULL, q->feed_id,
-												browsing_author, browsing_image, q->image, false);
+			if (index < 0) {
+				podcast_episode_t one;
+				if (!podcast_episode(job.id, &one)) {
+					snprintf(result_error, sizeof(result_error), "%s", podcast_last_error());
+					break;
 				}
-				path_ptr[count] = paths[count];
-				count++;
+				queued_episodes[0] = one;
+				queued_count = 1;
+				queued_complete = true;
+				index = 0;
 			}
-
-			// _ordered: a podcast queue already has its order, newest first
-			// going back. Plain device_state_play_list would shuffle the
-			// episodes whenever the play mode is random.
-			device_state_play_list_ordered(path_ptr, count, 0);
-			gui_post(play_started_async, NULL);
+			play_queued_from(index);
 			break;
 		}
 
@@ -1729,30 +2068,13 @@ static void row_clicked_cb(lv_event_t *e) {
 		return;
 	}
 
-	job_t job = {0};
-	if (list_kind == JOB_EPISODES) {
-		// No toast: a timed one would leave while the download it is about
-		// carries on. run_ex() puts the veil up instead, with the same words on
-		// it, and takes it down when the episode actually starts.
-		job.kind = JOB_PLAY;
-		job.index = index;
-		job.id = result_episodes[index].id;
-		run(&job);
+	if (list_kind == JOB_CARD) {
+		podcastcard_open(&card_shows[index]);
 		return;
 	}
 
-	// The author is taken HERE, where the podcast's whole record is available:
-	// the episodes answer does not carry it, and without it the sidecars would
-	// not be enough for the player's star.
-	snprintf(browsing_author, sizeof(browsing_author), "%s", result_feeds[index].author);
-	snprintf(browsing_image, sizeof(browsing_image), "%s", result_feeds[index].image);
-
-	job.kind = JOB_EPISODES;
-	job.id = result_feeds[index].id;
-	// The first step; the rest comes as the list is scrolled.
-	job.want = PODCAST_EPISODES_STEP;
-	snprintf(job.text, sizeof(job.text), "%s", result_feeds[index].title);
-	run(&job);
+	// A podcast: its page, with its record as the list has it.
+	podcastcard_open_feed(&result_feeds[index]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1804,7 +2126,7 @@ static void row_menu_cb(lv_event_t *e) {
 }
 
 // ---------------------------------------------------------------------------
-// keeping an episode: the long press, and the card that follows the download
+// keeping an episode: the card that follows the download
 // ---------------------------------------------------------------------------
 
 #define DL_POLL_MS 250
@@ -1813,8 +2135,18 @@ static lv_obj_t *dl_veil;
 static lv_obj_t *dl_name;
 static lv_obj_t *dl_bar;
 static lv_obj_t *dl_amount;
+static lv_obj_t *dl_title;
 static lv_timer_t *dl_timer;
-static int dl_row = -1;
+
+// The episodes waiting their turn: podcastdl.h keeps one at a time, so the
+// ones chosen together go down one after the other behind the same card.
+static podcast_episode_t *dl_queue;
+static int dl_queue_count;
+static int dl_queue_next;
+static int dl_queue_done;
+static int dl_queue_failed;
+static bool dl_queue_cancelled;
+static char dl_feed_title[PODCAST_TITLE_MAX];
 
 static void dl_close(void) {
 	lv_timer_pause(dl_timer);
@@ -1836,6 +2168,59 @@ static void dl_paint(long long done, long long total) {
 	}
 }
 
+static void dl_queue_free(void) {
+	free(dl_queue);
+	dl_queue = NULL;
+	dl_queue_count = 0;
+	dl_queue_next = 0;
+}
+
+// The next episode of the queue that is not on the card yet. False when none
+// is left to start.
+static bool dl_start_next(void) {
+	while (!dl_queue_cancelled && dl_queue_next < dl_queue_count) {
+		const podcast_episode_t *episode = &dl_queue[dl_queue_next++];
+		if (podcastdl_exists(episode, dl_feed_title)) {
+			continue;
+		}
+		if (!podcastdl_start(episode, dl_feed_title, browsing_author, browsing_image)) {
+			dl_queue_failed++;
+			continue;
+		}
+		lv_label_set_text(dl_name, episode->title);
+		if (dl_queue_count > 1) {
+			char count[48];
+			snprintf(count, sizeof(count), tr("podcast_download_count"), dl_queue_next, dl_queue_count);
+			lv_label_set_text_fmt(dl_title, "%s \xC2\xB7 %s", tr("podcast_downloading"), count);
+		} else {
+			lv_label_set_text(dl_title, tr("podcast_downloading"));
+		}
+		dl_paint(0, 0);
+		return true;
+	}
+	return false;
+}
+
+// What the queue came to, once it is over.
+static void dl_report(void) {
+	if (dl_queue_cancelled) {
+		return;
+	}
+	if (dl_queue_done == 0 && dl_queue_failed > 0) {
+		toast_error(tr("podcast_download_failed"));
+	} else if (dl_queue_done == 1 && dl_queue_failed == 0) {
+		toast_success(tr("podcast_download_done"));
+	} else if (dl_queue_done > 0) {
+		char text[96];
+		snprintf(text, sizeof(text), tr("podcast_downloads_done"), dl_queue_done);
+		if (dl_queue_failed > 0) {
+			toast_error(text);
+		} else {
+			toast_success(text);
+		}
+	}
+}
+
 static void dl_poll_cb(lv_timer_t *timer) {
 	(void)timer;
 	long long done = 0, total = 0;
@@ -1844,17 +2229,25 @@ static void dl_poll_cb(lv_timer_t *timer) {
 	if (state == PODCASTDL_RUNNING) {
 		return;
 	}
-	dl_close();
 	podcastdl_acknowledge();
 	if (state == PODCASTDL_DONE) {
-		toast_success(tr("podcast_download_done"));
+		dl_queue_done++;
 	} else if (state == PODCASTDL_FAILED) {
-		toast_error(tr("podcast_download_failed"));
+		dl_queue_failed++;
+	} else if (state == PODCASTDL_CANCELLED) {
+		dl_queue_cancelled = true;
 	}
+	if (dl_start_next()) {
+		return;
+	}
+	dl_close();
+	dl_report();
+	dl_queue_free();
 }
 
 static void dl_cancel_cb(lv_event_t *e) {
 	(void)e;
+	dl_queue_cancelled = true;
 	podcastdl_cancel();
 	lv_label_set_text(dl_amount, tr("podcast_download_cancelling"));
 }
@@ -1882,10 +2275,10 @@ static void dl_build(gui_config_t *cfg) {
 	lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
 	lv_obj_align(card, LV_ALIGN_CENTER, 0, cfg->top_bar_height / 2);
 
-	lv_obj_t *title = lv_label_create(card);
-	lv_label_set_text(title, tr("podcast_downloading"));
-	lv_obj_add_style(title, &theme_style_text, 0);
-	lv_obj_set_style_text_font(title, &font_ui_24, 0);
+	dl_title = lv_label_create(card);
+	lv_label_set_text(dl_title, tr("podcast_downloading"));
+	lv_obj_add_style(dl_title, &theme_style_text, 0);
+	lv_obj_set_style_text_font(dl_title, &font_ui_24, 0);
 
 	dl_name = lv_label_create(card);
 	lv_label_set_long_mode(dl_name, LV_LABEL_LONG_DOT);
@@ -1924,25 +2317,48 @@ static void dl_build(gui_config_t *cfg) {
 	lv_timer_pause(dl_timer);
 }
 
-static void download_cb(void *user) {
-	(void)user;
-	if (dl_row < 0 || dl_row >= list_count || list_kind != JOB_EPISODES) {
+void podcastpage_feed_download_many(const int *indices, int count, const char *feed_title) {
+	if (!indices || count <= 0) {
 		return;
 	}
-	const podcast_episode_t *episode = &result_episodes[dl_row];
-	if (podcastdl_exists(episode, list_feed_title)) {
-		toast_plain(tr("podcast_already_downloaded"));
-		return;
-	}
-	if (!podcastdl_start(episode, list_feed_title, browsing_author, browsing_image)) {
+	// One queue at a time: while it runs, its card covers the page.
+	if (dl_queue || podcastdl_busy()) {
 		toast_error(tr("podcast_download_failed"));
+		return;
+	}
+	dl_queue = calloc((size_t)count, sizeof(*dl_queue));
+	if (!dl_queue) {
+		toast_error(tr("podcast_download_failed"));
+		return;
+	}
+	dl_queue_count = 0;
+	bool all_there = true;
+	for (int i = 0; i < count; i++) {
+		if (indices[i] < 0 || indices[i] >= feed_count) {
+			continue;
+		}
+		dl_queue[dl_queue_count] = result_episodes[indices[i]];
+		all_there = all_there && podcastdl_exists(&dl_queue[dl_queue_count], feed_title);
+		dl_queue_count++;
+	}
+	snprintf(dl_feed_title, sizeof(dl_feed_title), "%s", feed_title ? feed_title : "");
+	dl_queue_next = 0;
+	dl_queue_done = 0;
+	dl_queue_failed = 0;
+	dl_queue_cancelled = false;
+	if (dl_queue_count > 0 && all_there) {
+		toast_plain(tr(dl_queue_count == 1 ? "podcast_already_downloaded" : "podcast_all_already_downloaded"));
+		dl_queue_free();
+		return;
+	}
+	if (!dl_start_next()) {
+		toast_error(tr("podcast_download_failed"));
+		dl_queue_free();
 		return;
 	}
 
 	// Theme colours are read at every opening: the card is built once.
 	lv_obj_set_style_bg_color(dl_bar, theme()->accent, LV_PART_INDICATOR);
-	lv_label_set_text(dl_name, episode->title);
-	dl_paint(0, 0);
 	lv_obj_set_hidden(dl_veil, false);
 	lv_obj_move_foreground(dl_veil);
 	power_hold_screen_on(true);
@@ -1950,44 +2366,105 @@ static void download_cb(void *user) {
 	lv_timer_resume(dl_timer);
 }
 
-// An episode: the long press offers to keep it on the card.
-static void row_long_cb(lv_event_t *e) {
-	if (list_kind != JOB_EPISODES || switcher_back_drag_active() || player_sheet_drag_active()) {
-		return;
-	}
-	dl_row = row_index_of(lv_event_get_current_target(e));
-	if (dl_row < 0 || dl_row >= list_count) {
-		return;
-	}
-	// The lift that ends this press would otherwise arrive as a click and
-	// start the episode.
-	lv_indev_t *indev = lv_indev_active();
-	if (indev) {
-		lv_indev_wait_release(indev);
-	}
-	static const popover_item_t ITEMS[] = {{"podcast_download", download_cb, NULL}};
-	popover_show(lv_event_get_current_target(e), ITEMS, 1);
+void podcastpage_feed_download(int index, const char *feed_title) {
+	podcastpage_feed_download_many(&index, 1, feed_title);
 }
+
+// ---------------------------------------------------------------------------
+// the rest of what a podcast's page asks for
+// ---------------------------------------------------------------------------
+
+void podcastpage_set_browsing(const podcast_feed_t *feed) {
+	if (!feed) {
+		return;
+	}
+	snprintf(browsing_author, sizeof(browsing_author), "%s", feed->author);
+	snprintf(browsing_image, sizeof(browsing_image), "%s", feed->image);
+}
+
+void podcastpage_feed_play(int index) {
+	if (index < 0 || index >= feed_count) {
+		return;
+	}
+	// No toast: a timed one would leave while the download it is about
+	// carries on. run_ex() puts the veil up instead, with the same words on
+	// it, and takes it down when the episode actually starts.
+	job_t job = {0};
+	job.kind = JOB_PLAY;
+	job.index = index;
+	job.id = result_episodes[index].id;
+	run(&job);
+}
+
+bool podcastpage_feed_play_next(int index) {
+	if (index < 0 || index >= feed_count) {
+		return false;
+	}
+	const podcast_episode_t *e = &result_episodes[index];
+	char path[512];
+	// Kept on the card, or already in the cache: that file. Otherwise the
+	// cache's name for it, with the tags written now, and the episode comes
+	// down when its turn arrives (podcastpage_prepare_track).
+	if (!podcastdl_path(e, e->feed_title, path, sizeof(path)) || access(path, F_OK) != 0) {
+		if (!podcastcache_find(e->id, path, sizeof(path))) {
+			podcastcache_path(e->id, e->mime, path, sizeof(path));
+			podcastcache_write_sidecars(e->id, e->mime, e->title, e->feed_title[0] ? e->feed_title : NULL,
+										e->feed_id, browsing_author, browsing_image, e->image, false);
+		}
+	}
+	if (!path[0]) {
+		return false;
+	}
+	return playlist_insert_next(path);
+}
+
+void podcastpage_resume(const podcaststate_t *state) {
+	if (!state || state->episode_id <= 0) {
+		return;
+	}
+	if (offline) {
+		toast_error(tr("enable_wi_fi_first"));
+		return;
+	}
+	job_t job = {0};
+	job.kind = JOB_RESUME;
+	job.id = state->episode_id;
+	job.feed = state->feed_id;
+	run(&job);
+}
+
+void podcastpage_hero_request(const char *url, int size) {
+	if (!url || !url[0]) {
+		return;
+	}
+	qobuzart_request(&podcast_art_owner, HERO_ART_SLOT, url, size);
+}
+
+bool podcastpage_hero_take(cover_image_t *out, bool *finished) {
+	return qobuzart_take(&podcast_art_owner, HERO_ART_SLOT, out, finished);
+}
+
+void podcastpage_hero_release(void) { qobuzart_release(&podcast_art_owner, HERO_ART_SLOT); }
 
 // ---------------------------------------------------------------------------
 // the page: pills on top, list below
 //
-// ONE screen. "My podcasts" and "Trending" are not different places: they are
-// two ways of looking at the same thing, exactly like All / Recent / Finished in
+// ONE screen. The followed podcasts, the ones on the card and the chart are not
+// different places: they are three ways of looking at the same thing, exactly like All / Recent / Finished in
 // the audiobooks. That is what pills are for -- they change what is underneath
 // without navigating away -- so the list sits on the same screen.
 //
-// The pills go away when a search or a podcast's episodes are underneath: there
-// they would no longer describe what is on screen, and a lit pill over a list
-// that is not its own is a lie.
+// The pills go away when a search is underneath: there they would no longer
+// describe what is on screen, and a lit pill over a list that is not its own
+// is a lie.
 // ---------------------------------------------------------------------------
 
 static void pill_clicked_cb(lv_event_t *e);
 
 static lv_obj_t *make_pill(lv_obj_t *parent, const char *text, job_kind_t kind) {
 	lv_obj_t *btn = lv_btn_create(parent);
-	lv_obj_set_size(btn, LV_SIZE_CONTENT, 56);
-	lv_obj_set_style_pad_hor(btn, 20, 0);
+	lv_obj_set_size(btn, LV_SIZE_CONTENT, 52);
+	lv_obj_set_style_pad_hor(btn, 18, 0);
 	lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0); // Adwaita-style pill
 	lv_obj_set_style_shadow_width(btn, 0, 0);
 	lv_obj_set_style_border_width(btn, 0, 0);
@@ -1995,7 +2472,7 @@ static lv_obj_t *make_pill(lv_obj_t *parent, const char *text, job_kind_t kind) 
 
 	lv_obj_t *label = lv_label_create(btn);
 	lv_label_set_text(label, tr(text));
-	lv_obj_set_style_text_font(label, &font_ui_22, 0);
+	lv_obj_set_style_text_font(label, &font_ui_20, 0);
 	lv_obj_center(label);
 
 	return btn;
@@ -2007,25 +2484,28 @@ static void paint_pill(lv_obj_t *btn, bool on) {
 	}
 	lv_obj_set_style_bg_color(btn, on ? theme()->accent : theme()->surface_pressed, 0);
 	lv_obj_set_style_text_color(lv_obj_get_child(btn, 0), on ? lv_color_white() : theme()->text_primary, 0);
+	// Greyed while it cannot be used: the two pills that need the network.
+	lv_obj_set_style_opa(btn, lv_obj_has_state(btn, LV_STATE_DISABLED) ? LV_OPA_40 : LV_OPA_COVER, 0);
 }
 
 // The corner buttons' visibility has a single owner, because two owners of one
 // flag means whichever runs last wins. The magnifier needs the keys, a network
-// and a home view (the two pills). The gear and the downloads need none of
-// that and stay up over the notices too: the podcast settings apply to the
-// downloaded episodes as well. From the edge: gear, downloads, magnifier.
+// and a home view (one of the pills). The gear needs none of that and stays up
+// over the notices too: the podcast settings apply to the episodes on the card
+// as well. From the edge: gear, magnifier.
 static void refresh_corner_buttons(void) {
-	bool home_view = list_kind == JOB_FOLLOWED || list_kind == JOB_TRENDING || list_kind == JOB_NONE;
+	bool home_view = list_kind == JOB_FOLLOWED || list_kind == JOB_TRENDING || list_kind == JOB_CARD ||
+					 list_kind == JOB_NONE;
 	bool online = podcast_configured() && network_up();
 	bool search = online && home_view;
 	bool local = home_view || !online;
 	if (list_title && g_cfg) {
 		// The heading gets the width the buttons are not using.
-		settingsrow_title_corner_slots(list_title, g_cfg, (search ? 1 : 0) + (local ? 2 : 0));
+		settingsrow_title_corner_slots(list_title, g_cfg, (search ? 1 : 0) + (local ? 1 : 0));
 	}
-	lv_obj_t *const buttons[] = {search_btn, settings_btn, saved_btn};
-	const bool shown[] = {search, local, local};
-	for (int i = 0; i < 3; i++) {
+	lv_obj_t *const buttons[] = {search_btn, settings_btn};
+	const bool shown[] = {search, local};
+	for (int i = 0; i < 2; i++) {
 		if (!buttons[i]) {
 			continue;
 		}
@@ -2041,7 +2521,496 @@ static void refresh_corner_buttons(void) {
 // its own: without this repaint the lit pill keeps the previous accent.
 static void refresh_pills(void) {
 	paint_pill(pill_followed, list_kind == JOB_FOLLOWED);
+	paint_pill(pill_card, list_kind == JOB_CARD);
 	paint_pill(pill_trending, list_kind == JOB_TRENDING);
+	for (int k = 0; k < LISTEN_ROWS; k++) {
+		if (listen[k].bar) {
+			lv_obj_set_style_bg_color(listen[k].bar, theme()->accent, LV_PART_INDICATOR);
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the line about the network, "Continue listening", and the empty card
+// ---------------------------------------------------------------------------
+
+static void offline_banner_cb(lv_event_t *e) {
+	(void)e;
+	if (podcast_configured() && !network_up()) {
+		switch_screen(wifisettings_screen);
+	}
+}
+
+static void build_offline_banner(lv_obj_t *column, gui_config_t *cfg) {
+	offline_banner = lv_btn_create(column);
+	lv_obj_set_width(offline_banner, cfg->screen_width - 2 * cfg->padding);
+	lv_obj_set_height(offline_banner, LV_SIZE_CONTENT);
+	lv_obj_set_style_margin_left(offline_banner, cfg->padding, 0);
+	lv_obj_add_style(offline_banner, &theme_style_card, 0);
+	lv_obj_set_style_radius(offline_banner, 12, 0);
+	lv_obj_set_style_border_width(offline_banner, 0, 0);
+	lv_obj_set_style_shadow_width(offline_banner, 0, 0);
+	lv_obj_set_style_pad_all(offline_banner, 12, 0);
+	lv_obj_set_style_pad_column(offline_banner, 12, 0);
+	lv_obj_set_scrollable(offline_banner, false);
+	lv_obj_set_flex_flow(offline_banner, LV_FLEX_FLOW_ROW);
+	lv_obj_set_flex_align(offline_banner, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+	lv_obj_set_event_bubble(offline_banner, true);
+	lv_obj_add_event_cb(offline_banner, offline_banner_cb, LV_EVENT_CLICKED, NULL);
+
+	lv_obj_t *icon = lv_image_create(offline_banner);
+	lv_image_set_src(icon, &icon_wifi_off);
+	lv_obj_add_style(icon, &theme_style_icon, 0);
+	lv_obj_set_event_bubble(icon, true);
+
+	offline_label = lv_label_create(offline_banner);
+	lv_label_set_long_mode(offline_label, LV_LABEL_LONG_WRAP);
+	lv_obj_set_flex_grow(offline_label, 1);
+	lv_obj_add_style(offline_label, &theme_style_text_dim, 0);
+	lv_obj_set_style_text_font(offline_label, &font_ui_18, 0);
+	lv_label_set_text(offline_label, "");
+	lv_obj_set_hidden(offline_banner, true);
+}
+
+// ---------------------------------------------------------------------------
+// "Now listening" and "Continue listening"
+// ---------------------------------------------------------------------------
+
+#define LISTEN_ROW_HEIGHT 96
+
+// The episode the first row shows: "" while it is hidden.
+static char listen_now_path[512];
+
+static bool listen_home(void) {
+	return (list_kind == JOB_FOLLOWED || list_kind == JOB_CARD) && (!note_label || lv_obj_is_hidden(note_label));
+}
+
+static void listen_thumb(listen_row_t *row, bool pictured) {
+	if (pictured) {
+		lv_obj_remove_style(row->thumb, &theme_style_icon, 0);
+		lv_obj_set_style_image_recolor_opa(row->thumb, LV_OPA_TRANSP, 0);
+		lv_obj_set_style_radius(row->thumb, 6, 0);
+		lv_obj_set_style_clip_corner(row->thumb, true, 0);
+		lv_image_set_src(row->thumb, &row->image.dsc);
+	} else {
+		lv_image_set_src(row->thumb, &icon_podcast_list);
+		lv_obj_add_style(row->thumb, &theme_style_icon, 0);
+		lv_obj_set_style_image_recolor_opa(row->thumb, LV_OPA_COVER, 0);
+		lv_obj_set_style_clip_corner(row->thumb, false, 0);
+	}
+}
+
+// The picture of row `k`: the cover of the file at `path`, or the microphone
+// when there is no file to take it from.
+static void listen_cover(int k, const char *path) {
+	listen_row_t *row = &listen[k];
+	char want[512] = "";
+	if (path && path[0] && access(path, F_OK) == 0 && !growfile_is_growing(path)) {
+		snprintf(want, sizeof(want), "%s", path);
+	}
+	if (strcmp(want, row->cover_path) == 0) {
+		return;
+	}
+	coverloader_release(PODCASTCARD_SLOT_LISTENING + k);
+	row->cover_waiting = false;
+	listen_thumb(row, false);
+	cover_free(&row->image);
+	snprintf(row->cover_path, sizeof(row->cover_path), "%s", want);
+	if (!want[0]) {
+		return;
+	}
+	cover_image_t image;
+	if (cover_thumb_cached(want, ROW_THUMB, &image)) {
+		row->image = image;
+		listen_thumb(row, true);
+		return;
+	}
+	coverloader_request(PODCASTCARD_SLOT_LISTENING + k, want, ROW_THUMB);
+	row->cover_waiting = true;
+	art_wake();
+}
+
+static void listen_art_poll(void) {
+	for (int k = 0; k < LISTEN_ROWS; k++) {
+		listen_row_t *row = &listen[k];
+		if (!row->cover_waiting) {
+			continue;
+		}
+		cover_image_t image;
+		bool finished = false;
+		if (coverloader_take(PODCASTCARD_SLOT_LISTENING + k, &image, &finished)) {
+			listen_thumb(row, false);
+			cover_free(&row->image);
+			row->image = image;
+			listen_thumb(row, true);
+			row->cover_waiting = false;
+		} else if (finished) {
+			row->cover_waiting = false;
+		}
+	}
+}
+
+// The title, the podcast and how much is left, on one row.
+static void listen_fill(listen_row_t *row, const char *title, const char *show, double position, double duration) {
+	lv_label_set_text(row->title, title);
+	char left[32] = "";
+	if (duration > position) {
+		format_duration((int)(duration - position), left, sizeof(left));
+	}
+	char detail[256];
+	if (left[0]) {
+		char rest[64];
+		snprintf(rest, sizeof(rest), tr("podcast_minutes_left"), left);
+		snprintf(detail, sizeof(detail), "%.*s%s%s", 160, show, show[0] ? " \xC2\xB7 " : "", rest);
+	} else {
+		snprintf(detail, sizeof(detail), "%s", show);
+	}
+	lv_label_set_text(row->detail, detail);
+	int permille = duration > 0 ? (int)(position * 1000.0 / duration) : 0;
+	if (permille > 1000) {
+		permille = 1000;
+	}
+	lv_bar_set_value(row->bar, permille, LV_ANIM_OFF);
+}
+
+// The list's rows start under the block above them, whatever it holds.
+static void place_list_body(void) {
+	if (!top_block || !list_body) {
+		return;
+	}
+	bool any = !lv_obj_is_hidden(now_header) || !lv_obj_is_hidden(continue_header) ||
+			   (card_empty && !lv_obj_is_hidden(card_empty));
+	lv_obj_set_hidden(top_block, !any);
+	int y = 0;
+	if (any) {
+		lv_obj_update_layout(top_block);
+		y = lv_obj_get_height(top_block) + ROW_GAP;
+	}
+	if (lv_obj_get_y(list_body) != y) {
+		lv_obj_set_y(list_body, y);
+		window_update();
+	}
+	// The empty notice sits under whatever is above the list.
+	if (list_empty && list_container) {
+		lv_obj_update_layout(list_container);
+		lv_obj_align_to(list_empty, list_container, LV_ALIGN_TOP_MID, 0, y + 60);
+	}
+}
+
+static void refresh_listening(void) {
+	if (!top_block) {
+		return;
+	}
+	bool home = listen_home();
+
+	static device_state_t now;
+	device_state_get(&now);
+	bool playing_one = home && !now.live && now.status != AUDIO_STATUS_STOPPED && podcastcache_is_episode(now.current_file);
+	static char now_id_path[512];
+	static long long now_id;
+	if (playing_one) {
+		if (strcmp(now_id_path, now.current_file) != 0) {
+			snprintf(now_id_path, sizeof(now_id_path), "%s", now.current_file);
+			now_id = podcastcache_episode_id(now.current_file);
+		}
+		listen_row_t *row = &listen[0];
+		podcaststate_t known;
+		bool described = podcaststate_get(now.current_file, &known) && known.title[0];
+		memset(&row->state, 0, sizeof(row->state));
+		snprintf(row->state.title, sizeof(row->state.title), "%.*s", (int)sizeof(row->state.title) - 1,
+				 described ? known.title : now.metadata.title);
+		snprintf(row->state.show, sizeof(row->state.show), "%.*s", (int)sizeof(row->state.show) - 1,
+				 described ? known.show : now.metadata.album);
+		listen_fill(row, row->state.title, row->state.show, now.progress_current_secs, now.progress_total_secs);
+		lv_image_set_src(row->action_icon, now.status == AUDIO_STATUS_PLAYING ? &icon_pause_small : &icon_play_small);
+		listen_cover(0, now.current_file);
+		snprintf(listen_now_path, sizeof(listen_now_path), "%s", now.current_file);
+	} else {
+		listen_now_path[0] = '\0';
+		listen_cover(0, NULL);
+	}
+	lv_obj_set_hidden(now_header, !playing_one);
+	lv_obj_set_hidden(listen[0].button, !playing_one);
+
+	int shown = 0;
+	if (home) {
+		static podcaststate_t found[LISTEN_ROWS * 2];
+		int n = podcaststate_in_progress(found, LISTEN_ROWS * 2);
+		for (int i = 0; i < n && shown < LISTEN_ROWS - 1; i++) {
+			const podcaststate_t *st = &found[i];
+			// The episode in the player is the row above.
+			if (playing_one && ((st->path[0] && strcmp(st->path, now.current_file) == 0) ||
+								(now_id > 0 && st->episode_id == now_id))) {
+				continue;
+			}
+			bool on_card = st->path[0] && access(st->path, F_OK) == 0 && !growfile_is_growing(st->path);
+			bool reachable = st->episode_id > 0 && !offline;
+			if (!on_card && !reachable) {
+				continue;
+			}
+			listen_row_t *row = &listen[1 + shown];
+			row->state = *st;
+			listen_fill(row, st->title, st->show, st->position, st->duration);
+			listen_cover(1 + shown, on_card ? st->path : NULL);
+			lv_obj_set_hidden(row->button, false);
+			shown++;
+		}
+	}
+	for (int k = 1 + shown; k < LISTEN_ROWS; k++) {
+		lv_obj_set_hidden(listen[k].button, true);
+		listen_cover(k, NULL);
+	}
+	lv_obj_set_hidden(continue_header, shown == 0);
+	place_list_body();
+}
+
+// Once a second: how far the episode in the player has got, and whether it is
+// playing. Anything more than that -- another episode, or none -- draws the
+// block again.
+static void listen_tick(void) {
+	if (!top_block) {
+		return;
+	}
+	static device_state_t now;
+	device_state_get(&now);
+	bool playing_one = listen_home() && !now.live && now.status != AUDIO_STATUS_STOPPED &&
+					   podcastcache_is_episode(now.current_file);
+	if (strcmp(playing_one ? now.current_file : "", listen_now_path) != 0) {
+		refresh_listening();
+		return;
+	}
+	if (!playing_one) {
+		return;
+	}
+	listen_row_t *row = &listen[0];
+	listen_fill(row, row->state.title, row->state.show, now.progress_current_secs, now.progress_total_secs);
+	lv_image_set_src(row->action_icon, now.status == AUDIO_STATUS_PLAYING ? &icon_pause_small : &icon_play_small);
+}
+
+static void continue_play(const podcaststate_t *st) {
+	// An episode of the catalogue goes back through its podcast's list when
+	// the network allows, so the episodes after it follow it; a file on the
+	// card, or anything without the network, plays from where it is.
+	bool kept = st->path[0] && podcastdl_owns(st->path);
+	if (st->episode_id > 0 && !offline && !kept) {
+		browsing_author[0] = '\0';
+		snprintf(browsing_image, sizeof(browsing_image), "%.*s", (int)sizeof(browsing_image) - 1, st->image);
+		podcastpage_resume(st);
+		return;
+	}
+	if (!podcastcard_play(st)) {
+		toast_error(tr("podcast_that_episode_is_gone"));
+	}
+}
+
+static void listen_row_cb(lv_event_t *e) {
+	if (switcher_back_drag_active() || player_sheet_drag_active()) {
+		return;
+	}
+	listen_row_t *row = lv_event_get_user_data(e);
+	// The round button on the row answers for itself.
+	lv_obj_t *target = lv_event_get_target(e);
+	if (target == row->action || target == row->action_icon) {
+		return;
+	}
+	if (row == &listen[0]) {
+		player_refresh_now_playing();
+		switch_screen(player_screen);
+		return;
+	}
+	continue_play(&row->state);
+}
+
+static void listen_action_cb(lv_event_t *e) {
+	if (switcher_back_drag_active() || player_sheet_drag_active()) {
+		return;
+	}
+	listen_row_t *row = lv_event_get_user_data(e);
+	if (row == &listen[0]) {
+		player_key_play_pause();
+		listen_tick();
+		return;
+	}
+	continue_play(&row->state);
+}
+
+static lv_obj_t *make_header(lv_obj_t *parent, const char *text) {
+	lv_obj_t *label = lv_label_create(parent);
+	lv_label_set_text(label, tr(text));
+	lv_obj_add_style(label, &theme_style_text, 0);
+	lv_obj_set_style_text_font(label, &font_ui_22_bold, 0);
+	lv_obj_set_hidden(label, true);
+	return label;
+}
+
+static void build_listen_row(listen_row_t *row, lv_obj_t *parent) {
+	row->button = lv_btn_create(parent);
+	lv_obj_set_size(row->button, lv_pct(100), LISTEN_ROW_HEIGHT);
+	lv_obj_add_style(row->button, &theme_style_card, 0);
+	lv_obj_add_style(row->button, &theme_style_card_pressed, LV_STATE_PRESSED);
+	lv_obj_set_style_radius(row->button, 12, 0);
+	lv_obj_set_style_border_width(row->button, 0, 0);
+	lv_obj_set_style_shadow_width(row->button, 0, 0);
+	lv_obj_set_style_pad_hor(row->button, 14, 0);
+	lv_obj_set_style_pad_column(row->button, 12, 0);
+	lv_obj_set_scrollable(row->button, false);
+	lv_obj_set_flex_flow(row->button, LV_FLEX_FLOW_ROW);
+	lv_obj_set_flex_align(row->button, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+	lv_obj_set_event_bubble(row->button, true);
+	lv_obj_add_event_cb(row->button, listen_row_cb, LV_EVENT_CLICKED, row);
+
+	row->thumb = lv_image_create(row->button);
+	lv_obj_set_size(row->thumb, ROW_THUMB, ROW_THUMB);
+	lv_image_set_inner_align(row->thumb, LV_IMAGE_ALIGN_CENTER);
+	lv_obj_set_event_bubble(row->thumb, true);
+	listen_thumb(row, false);
+
+	lv_obj_t *texts = lv_obj_create(row->button);
+	lv_obj_remove_style_all(texts);
+	lv_obj_set_flex_grow(texts, 1);
+	lv_obj_set_height(texts, LV_SIZE_CONTENT);
+	lv_obj_set_style_pad_row(texts, 5, 0);
+	lv_obj_set_event_bubble(texts, true);
+	lv_obj_set_flex_flow(texts, LV_FLEX_FLOW_COLUMN);
+
+	row->title = lv_label_create(texts);
+	lv_label_set_long_mode(row->title, LV_LABEL_LONG_DOT);
+	lv_obj_set_width(row->title, lv_pct(100));
+	lv_obj_set_height(row->title, lv_font_get_line_height(&font_ui_20));
+	lv_obj_add_style(row->title, &theme_style_text, 0);
+	lv_obj_set_style_text_font(row->title, &font_ui_20, 0);
+
+	row->detail = lv_label_create(texts);
+	lv_label_set_long_mode(row->detail, LV_LABEL_LONG_DOT);
+	lv_obj_set_width(row->detail, lv_pct(100));
+	lv_obj_set_height(row->detail, lv_font_get_line_height(&font_ui_16));
+	lv_obj_add_style(row->detail, &theme_style_text_dim, 0);
+	lv_obj_set_style_text_font(row->detail, &font_ui_16, 0);
+
+	row->bar = lv_bar_create(texts);
+	lv_obj_set_size(row->bar, lv_pct(100), 5);
+	lv_bar_set_range(row->bar, 0, 1000);
+	lv_obj_set_style_bg_color(row->bar, theme()->surface_pressed, LV_PART_MAIN);
+	lv_obj_set_style_bg_opa(row->bar, LV_OPA_COVER, LV_PART_MAIN);
+	lv_obj_set_style_bg_color(row->bar, theme()->accent, LV_PART_INDICATOR);
+	lv_obj_set_style_radius(row->bar, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+	lv_obj_set_style_radius(row->bar, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
+	lv_obj_set_event_bubble(row->bar, true);
+
+	// Bubbling, so a swipe that starts on it still reaches the page.
+	row->action = lv_btn_create(row->button);
+	lv_obj_remove_style_all(row->action);
+	lv_obj_set_size(row->action, 52, 52);
+	lv_obj_set_style_radius(row->action, LV_RADIUS_CIRCLE, 0);
+	lv_obj_add_style(row->action, &theme_style_accent_bg, 0);
+	lv_obj_set_style_bg_opa(row->action, LV_OPA_COVER, 0);
+	lv_obj_set_event_bubble(row->action, true);
+	lv_obj_add_event_cb(row->action, listen_action_cb, LV_EVENT_CLICKED, row);
+	row->action_icon = lv_image_create(row->action);
+	lv_image_set_src(row->action_icon, &icon_play_small);
+	lv_obj_set_style_image_recolor(row->action_icon, lv_color_white(), 0);
+	lv_obj_set_style_image_recolor_opa(row->action_icon, LV_OPA_COVER, 0);
+	lv_obj_center(row->action_icon);
+	lv_obj_set_event_bubble(row->action_icon, true);
+
+	lv_obj_set_hidden(row->button, true);
+}
+
+static void build_top_block(int width) {
+	top_block = lv_obj_create(list_container);
+	lv_obj_remove_style_all(top_block);
+	lv_obj_set_size(top_block, width, LV_SIZE_CONTENT);
+	lv_obj_set_pos(top_block, 0, 0);
+	lv_obj_set_style_pad_row(top_block, 10, 0);
+	lv_obj_set_scrollable(top_block, false);
+	lv_obj_set_event_bubble(top_block, true);
+	lv_obj_set_flex_flow(top_block, LV_FLEX_FLOW_COLUMN);
+
+	now_header = make_header(top_block, "podcast_now_listening");
+	build_listen_row(&listen[0], top_block);
+	continue_header = make_header(top_block, "podcast_continue_listening");
+	for (int k = 1; k < LISTEN_ROWS; k++) {
+		build_listen_row(&listen[k], top_block);
+	}
+	lv_obj_set_hidden(top_block, true);
+}
+
+static void build_card_empty(lv_obj_t *parent) {
+	card_empty = lv_obj_create(parent);
+	lv_obj_remove_style_all(card_empty);
+	lv_obj_set_size(card_empty, lv_pct(100), LV_SIZE_CONTENT);
+	lv_obj_set_style_pad_row(card_empty, 10, 0);
+	lv_obj_set_scrollable(card_empty, false);
+	lv_obj_set_event_bubble(card_empty, true);
+	lv_obj_set_flex_flow(card_empty, LV_FLEX_FLOW_COLUMN);
+	lv_obj_set_flex_align(card_empty, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+	lv_obj_t *icon = lv_image_create(card_empty);
+	lv_image_set_src(icon, &icon_folder_open);
+	lv_obj_add_style(icon, &theme_style_icon, 0);
+	lv_obj_set_style_image_opa(icon, LV_OPA_60, 0);
+	lv_obj_set_event_bubble(icon, true);
+
+	lv_obj_t *title = lv_label_create(card_empty);
+	lv_label_set_text(title, tr("podcast_card_empty_title"));
+	lv_obj_add_style(title, &theme_style_text, 0);
+	lv_obj_set_style_text_font(title, &font_ui_22, 0);
+
+	lv_obj_t *text = lv_label_create(card_empty);
+	lv_label_set_text(text, tr("podcast_card_empty_text"));
+	lv_label_set_long_mode(text, LV_LABEL_LONG_WRAP);
+	lv_obj_set_width(text, lv_pct(100));
+	lv_obj_set_style_text_align(text, LV_TEXT_ALIGN_CENTER, 0);
+	lv_obj_add_style(text, &theme_style_text_dim, 0);
+	lv_obj_set_style_text_font(text, &font_ui_18, 0);
+
+	// What a filled folder looks like.
+	lv_obj_t *tree = lv_obj_create(card_empty);
+	lv_obj_set_size(tree, lv_pct(100), LV_SIZE_CONTENT);
+	lv_obj_add_style(tree, &theme_style_card, 0);
+	lv_obj_set_style_radius(tree, 12, 0);
+	lv_obj_set_style_border_width(tree, 0, 0);
+	lv_obj_set_style_shadow_width(tree, 0, 0);
+	lv_obj_set_style_pad_all(tree, 14, 0);
+	lv_obj_set_scrollable(tree, false);
+	lv_obj_set_event_bubble(tree, true);
+	lv_obj_t *tree_text = lv_label_create(tree);
+	lv_label_set_text_fmt(tree_text, "%s/\n    %s/\n        cover.jpg\n        2026-10-05 %s.mp3", PODCASTDL_FOLDER,
+						  tr("podcast_tree_show"), tr("podcast_tree_episode"));
+	lv_obj_add_style(tree_text, &theme_style_text, 0);
+	lv_obj_set_style_text_font(tree_text, &font_ui_18, 0);
+	lv_obj_set_style_text_line_space(tree_text, 4, 0);
+
+	lv_obj_set_hidden(card_empty, true);
+}
+
+// The empty card's explanation, in the list's place, only on that pill and
+// only while the Podcast folder holds nothing.
+static void refresh_card_empty(void) {
+	if (!card_empty) {
+		return;
+	}
+	bool show = list_kind == JOB_CARD && list_count == 0 && (!note_label || lv_obj_is_hidden(note_label));
+	lv_obj_set_hidden(card_empty, !show);
+}
+
+// The line about the network, and which pills can be used.
+static void refresh_offline(void) {
+	if (!offline_banner) {
+		return;
+	}
+	if (offline) {
+		lv_label_set_text(offline_label,
+						  tr(podcast_configured() ? "podcast_offline_no_wifi" : "podcast_offline_no_keys"));
+		lv_obj_set_hidden(offline_banner, false);
+		lv_obj_add_state(pill_followed, LV_STATE_DISABLED);
+		lv_obj_add_state(pill_trending, LV_STATE_DISABLED);
+	} else {
+		lv_obj_set_hidden(offline_banner, true);
+		lv_obj_remove_state(pill_followed, LV_STATE_DISABLED);
+		lv_obj_remove_state(pill_trending, LV_STATE_DISABLED);
+	}
+	refresh_pills();
 }
 
 static void build_page(gui_config_t *cfg) {
@@ -2052,10 +3021,10 @@ static void build_page(gui_config_t *cfg) {
 	podcast_list_screen = podcast_screen;
 	lv_obj_add_style(podcast_screen, &theme_style_screen, 0);
 
-	// The title follows what is on screen: "Podcasts" on the two home lists, the
-	// query on a search, the podcast's name on episodes.
+	// The title follows what is on screen: "Podcasts" on the three home lists, the
+	// query on a search.
 	list_title = settingsrow_title(podcast_screen, cfg, "podcasts");
-	settingsrow_title_corner_slots(list_title, cfg, 3);
+	settingsrow_title_corner_slots(list_title, cfg, 2);
 
 	int content_top = settingsrow_content_top(cfg);
 
@@ -2082,14 +3051,19 @@ static void build_page(gui_config_t *cfg) {
 	lv_obj_set_style_pad_ver(pill_row, 0, 0);
 	lv_obj_set_style_pad_hor(pill_row, cfg->padding, 0);
 	lv_obj_set_style_pad_gap(pill_row, 10, 0);
-	lv_obj_set_scrollable(pill_row, false);
+	// Sideways when a language's three names do not fit the width.
+	lv_obj_set_scroll_dir(pill_row, LV_DIR_HOR);
+	lv_obj_set_scrollbar_mode(pill_row, LV_SCROLLBAR_MODE_OFF);
 	lv_obj_set_flex_flow(pill_row, LV_FLEX_FLOW_ROW);
 	// Presses that miss a pill belong to the column below, which carries the
 	// swipe-back and the player sheet.
 	lv_obj_set_event_bubble(pill_row, true);
 
-	pill_followed = make_pill(pill_row, "podcast_my_podcasts", JOB_FOLLOWED);
-	pill_trending = make_pill(pill_row, "podcast_trending", JOB_TRENDING);
+	pill_followed = make_pill(pill_row, "podcast_pill_followed", JOB_FOLLOWED);
+	pill_card = make_pill(pill_row, "podcast_pill_card", JOB_CARD);
+	pill_trending = make_pill(pill_row, "podcast_pill_trending", JOB_TRENDING);
+
+	build_offline_banner(column, cfg);
 	refresh_pills();
 	theme_register_refresh(refresh_pills);
 
@@ -2120,6 +3094,11 @@ static void build_page(gui_config_t *cfg) {
 	// swipes never see a gesture that began on a row.
 	lv_obj_set_event_bubble(list_body, true);
 	build_rows(row_width);
+
+	// Above the rows, scrolling with them: the episodes being listened to, and
+	// what to do with an empty Podcast folder.
+	build_top_block(row_width);
+	build_card_empty(top_block);
 
 	// On the screen and not inside the container: it has to sit in the middle of
 	// the page, and inside the body it would have to be positioned against a
@@ -2305,8 +3284,37 @@ static bool show_followed_now(void) {
 	return true;
 }
 
+// The podcasts on the card, the same way: they are read from the card here and
+// now, with nothing to wait for.
+static bool show_card_now(void) {
+	pthread_mutex_lock(&job_lock);
+	bool busy = have_pending || result_pending;
+	pthread_mutex_unlock(&job_lock);
+	if (busy || inflight_valid) {
+		return false;
+	}
+
+	result_error[0] = '\0';
+	result_kind = JOB_CARD;
+	result_count = podcastcard_shows(card_shows, PODCASTCARD_MAX_SHOWS);
+	snprintf(result_title, sizeof(result_title), "%s", tr("podcast_pill_card"));
+	fill_list(0);
+
+	job_t root = {0};
+	root.kind = JOB_CARD;
+	snprintf(root.text, sizeof(root.text), "%s", result_title);
+	current_list_job = root;
+	have_current_list = true;
+	list_history_len = 0;
+	return true;
+}
+
 static void run_home_view(job_kind_t kind) {
 	if (kind == JOB_FOLLOWED && show_followed_now()) {
+		return;
+	}
+	if (kind == JOB_CARD) {
+		show_card_now();
 		return;
 	}
 	job_t job = {0};
@@ -2339,11 +3347,6 @@ static void open_search_cb(lv_event_t *e) {
 static void open_settings_cb(lv_event_t *e) {
 	(void)e;
 	switch_screen(settings_screen);
-}
-
-static void open_saved_cb(lv_event_t *e) {
-	(void)e;
-	switch_screen(podcastsaved_screen);
 }
 
 static lv_obj_t *corner_button(gui_config_t *cfg, int slot, const lv_image_dsc_t *glyph, lv_event_cb_t cb) {
@@ -2405,6 +3408,8 @@ static void show_note(const char *text) {
 		lv_obj_set_hidden(pill_row, true);
 		lv_obj_set_hidden(list_container, true);
 		lv_obj_set_hidden(list_empty, true);
+		lv_obj_set_hidden(offline_banner, true);
+		lv_obj_set_hidden(card_empty, true);
 		// The NETWORK notice brings the "Wi-Fi settings" row with it, as on the
 		// transfer page: it says what is missing AND where it is fixed. The other
 		// notices (the keys) do not.
@@ -2443,22 +3448,21 @@ static bool refresh_notes(void) {
 	// have it find a difference on every tick.
 	note_network_up = network_up();
 
+	// Without the keys or the network the catalogue is out of reach, but the
+	// podcasts on the card are not: the page stays, on those, with a line
+	// saying what is missing.
+	offline = !podcast_configured() || !note_network_up;
 	refresh_corner_buttons();
 
-	if (!podcast_configured()) {
-		show_note("api_keys_unavailable");
-		return false;
-	}
-
-	// With no network, the Wi-Fi notice in place of the page: the pills and the
-	// lists live off the catalogue, and a page that looks whole but does not
-	// answer is worse than a notice saying what is missing.
-	if (!note_network_up) {
-		show_note("enable_wi_fi_first");
+	// Without a card there is nothing at all: even an episode streamed from the
+	// catalogue is written to the card first.
+	if (!gui_card_available()) {
+		show_note("sd_card_missing");
 		return false;
 	}
 
 	show_note(NULL);
+	refresh_offline();
 	return true;
 }
 
@@ -2466,6 +3470,12 @@ static void refresh_page_state(void) {
 	if (!refresh_notes()) {
 		return;
 	}
+
+	if (offline) {
+		run_home_view(JOB_CARD);
+		return;
+	}
+	backfill_start();
 
 	if (!have_current_list) {
 		// First entry: start from the followed list, which asks nothing of the
@@ -2477,14 +3487,55 @@ static void refresh_page_state(void) {
 	// Re-entering the section rereads the followed list: a podcast may have been
 	// followed, or unfollowed, from the player's star while the user was
 	// elsewhere.
-	if (current_list_job.kind == JOB_FOLLOWED) {
-		run_home_view(JOB_FOLLOWED);
+	if (current_list_job.kind == JOB_FOLLOWED || current_list_job.kind == JOB_CARD) {
+		run_home_view(current_list_job.kind);
+		return;
 	}
+	// Anything else is a list from the catalogue, still on screen: only what
+	// has been heard meanwhile changes.
+	refresh_listening();
 }
 
 static void page_loaded_cb(lv_event_t *e) {
 	(void)e;
+	states_seen = podcaststate_revision();
 	refresh_page_state();
+}
+
+// What has been heard changes under the page while the player sits over it as
+// a sheet, and closing the sheet does not load the page again: the states are
+// followed once a second instead, while the page is in sight.
+
+static void states_follow(void) {
+	if (lv_screen_active() != podcast_screen || player_sheet_is_open()) {
+		return;
+	}
+	unsigned now = podcaststate_revision();
+	if (now == states_seen) {
+		listen_tick();
+		return;
+	}
+	states_seen = now;
+	if (list_kind == JOB_CARD && current_list_job.kind == JOB_CARD) {
+		// The same podcasts with new counts keep their rows, their pictures
+		// and the scroll; anything else is drawn again.
+		static podcastcard_show_t fresh[PODCASTCARD_MAX_SHOWS];
+		int n = podcastcard_shows(fresh, PODCASTCARD_MAX_SHOWS);
+		bool same = n == list_count;
+		for (int i = 0; i < n && same; i++) {
+			same = strcmp(fresh[i].folder, card_shows[i].folder) == 0;
+		}
+		if (same) {
+			memcpy(card_shows, fresh, sizeof(fresh[0]) * (size_t)n);
+			for (int i = 0; i < ROW_POOL; i++) {
+				rows[i].index = -2;
+			}
+			window_update();
+		} else {
+			show_card_now();
+		}
+	}
+	refresh_listening();
 }
 
 // The Wi-Fi can be switched on while this page is already open, so the page
@@ -2495,25 +3546,24 @@ static void wifi_watch_cb(lv_timer_t *timer) {
 	if (lv_screen_active() != podcast_screen) {
 		return;
 	}
+	states_follow();
 	bool up = network_up();
 	if (up == note_network_up) {
 		return;
 	}
 
-	if (!up) {
-		refresh_notes(); // the network went: the notice takes the page
+	bool was_offline = offline;
+	if (!refresh_notes()) {
 		return;
 	}
-	if (!refresh_notes()) {
-		return; // the network is back but something else is still missing
+	if (offline && !was_offline) {
+		// The network went: the card is what is left.
+		run_home_view(JOB_CARD);
+	} else if (!offline && was_offline) {
+		// Back: the catalogue's pills work again, and the card stays where it
+		// was until another is picked.
+		refresh_listening();
 	}
-
-	// The network is back, so the list the notice replaced has to be loaded
-	// again and not merely uncovered: the notice took the pills down with it,
-	// and only filling a list puts them back. Whichever of the two home views
-	// was showing is the one to return to; anything deeper was a step whose
-	// result the drop threw away.
-	run_home_view(current_list_job.kind == JOB_TRENDING ? JOB_TRENDING : JOB_FOLLOWED);
 }
 
 // ---------------------------------------------------------------------------
@@ -2643,6 +3693,9 @@ static void build_controls_page(gui_config_t *cfg) {
 
 static lv_obj_t *stop_episode_switch;
 static settingsrow_duration_t sleep_row;
+static lv_obj_t *order_pill[2];
+static lv_obj_t *margin_pill[3];
+static const int MARGIN_VALUES[3] = {30, 60, 120};
 
 static void refresh_settings_rows(void) {
 	if (stop_episode_switch) {
@@ -2657,6 +3710,39 @@ static void refresh_settings_rows(void) {
 	settingsrow_duration_set_minutes(&sleep_row, sleeptimer_minutes(SLEEPTIMER_PODCAST));
 	settingsrow_duration_expanded(&sleep_row, sleeptimer_enabled(SLEEPTIMER_PODCAST));
 	settingsrow_duration_repaint(&sleep_row);
+	bool oldest = podcastcard_oldest_first();
+	settingsrow_pill_active(order_pill[0], !oldest);
+	settingsrow_pill_active(order_pill[1], oldest);
+	int margin = podcaststate_margin();
+	for (int i = 0; i < 3; i++) {
+		settingsrow_pill_active(margin_pill[i], MARGIN_VALUES[i] == margin);
+	}
+}
+
+static void order_cb(lv_event_t *e) {
+	if (switcher_back_drag_active()) {
+		return;
+	}
+	podcastcard_set_oldest_first((int)(intptr_t)lv_event_get_user_data(e) != 0);
+	refresh_settings_rows();
+}
+
+static void margin_cb(lv_event_t *e) {
+	if (switcher_back_drag_active()) {
+		return;
+	}
+	podcaststate_set_margin((int)(intptr_t)lv_event_get_user_data(e));
+	refresh_settings_rows();
+}
+
+static void import_opml_row_cb(lv_event_t *e) {
+	(void)e;
+	podcastopml_open_import();
+}
+
+static void export_opml_cb(lv_event_t *e) {
+	(void)e;
+	podcastopml_export();
 }
 
 static void settings_rows_loaded_cb(lv_event_t *e) {
@@ -2692,6 +3778,20 @@ static void build_settings_page(gui_config_t *cfg) {
 	settingsrow_toggle_duration(container, "sleep_timer", sleep_toggle_cb, sleep_wheel_cb, &sleep_row);
 	settingsrow_duration_set_minutes(&sleep_row, sleeptimer_minutes(SLEEPTIMER_PODCAST));
 
+	// The subscriptions, in and out of other apps.
+	settingsrow_add(container, "podcast_opml_import", NULL, import_opml_row_cb, NULL);
+	settingsrow_action(container, "podcast_opml_export", export_opml_cb, NULL);
+
+	// The podcasts on the card.
+	lv_obj_t *pills = NULL;
+	settingsrow_pills(container, "podcast_episode_order", &pills);
+	order_pill[0] = settingsrow_pill(pills, "podcast_order_newest", 0, order_cb);
+	order_pill[1] = settingsrow_pill(pills, "podcast_order_oldest", 1, order_cb);
+	settingsrow_pills(container, "podcast_mark_heard_at", &pills);
+	margin_pill[0] = settingsrow_pill_text(pills, "30 s", 30, margin_cb);
+	margin_pill[1] = settingsrow_pill_text(pills, "60 s", 60, margin_cb);
+	margin_pill[2] = settingsrow_pill_text(pills, "2 min", 120, margin_cb);
+
 	refresh_settings_rows();
 	theme_register_refresh(refresh_settings_rows);
 	lv_obj_add_event_cb(settings_screen, settings_rows_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
@@ -2706,22 +3806,88 @@ static void build_settings_page(gui_config_t *cfg) {
 
 lv_obj_t *podcastpage_settings_screen(void) { return settings_screen; }
 
+void podcastpage_open_followed(void) {
+	switch_screen_return_to(podcast_screen);
+	if (!offline) {
+		run_home_view(JOB_FOLLOWED);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the feed addresses of podcasts followed before they were kept
+//
+// Asked of the catalogue once per run, in the background, the first time the
+// page opens with a network: one request per podcast missing it.
+// ---------------------------------------------------------------------------
+
+typedef struct {
+	long long id;
+	char url[PODCAST_FEED_URL_MAX];
+} backfill_t;
+
+static bool backfill_done;
+
+static void backfill_apply_cb(void *user) {
+	backfill_t *b = user;
+	podcastsubs_set_url(b->id, b->url);
+	free(b);
+}
+
+static void *backfill_main(void *arg) {
+	long long *ids = arg;
+	thread_be_background("podcast urls");
+	for (int i = 0; ids[i] > 0; i++) {
+		podcast_feed_t feed;
+		if (!podcast_feed(ids[i], &feed) || !feed.url[0]) {
+			continue;
+		}
+		backfill_t *b = calloc(1, sizeof(*b));
+		if (!b) {
+			break;
+		}
+		b->id = ids[i];
+		snprintf(b->url, sizeof(b->url), "%s", feed.url);
+		if (!gui_post(backfill_apply_cb, b)) {
+			free(b);
+		}
+	}
+	free(ids);
+	return NULL;
+}
+
+static void backfill_start(void) {
+	if (backfill_done || offline) {
+		return;
+	}
+	backfill_done = true;
+	long long *ids = calloc(PODCASTSUBS_MAX + 1, sizeof(*ids));
+	if (!ids) {
+		return;
+	}
+	int n = podcastsubs_missing_urls(ids, PODCASTSUBS_MAX);
+	if (n == 0) {
+		free(ids);
+		return;
+	}
+	pthread_t thread;
+	if (pthread_create(&thread, NULL, backfill_main, ids) == 0) {
+		pthread_detach(thread);
+	} else {
+		free(ids);
+	}
+}
+
 bool podcastpage_open_feed(long long feed_id, const char *title) {
 	if (feed_id <= 0 || !podcast_configured()) {
 		return false;
 	}
-	// Arriving from the player's "Show podcast", neither the author nor the
-	// feed's cover is known: they are cleared rather than carried over from the
-	// last podcast browsed, which would belong to another.
-	browsing_author[0] = '\0';
-	browsing_image[0] = '\0';
-
-	job_t job = {0};
-	job.kind = JOB_EPISODES;
-	job.id = feed_id;
-	job.want = PODCAST_EPISODES_STEP;
-	snprintf(job.text, sizeof(job.text), "%s", title && title[0] ? title : tr("podcasts"));
-	run(&job);
+	// Arriving from the player's "Show podcast", only the id and the name are
+	// known: the page asks the catalogue for the rest.
+	podcast_feed_t feed;
+	memset(&feed, 0, sizeof(feed));
+	feed.id = feed_id;
+	snprintf(feed.title, sizeof(feed.title), "%s", title && title[0] ? title : tr("podcasts"));
+	podcastcard_open_feed(&feed);
 	return true;
 }
 
@@ -2779,8 +3945,11 @@ static void queue_watch_cb(lv_timer_t *timer) {
 }
 
 void podcastpage_init(gui_config_t *cfg) {
-	for (int i = 0; i < QOBUZART_SLOTS; i++) {
+	for (int i = 0; i < ROW_ART_SLOTS; i++) {
 		slot_owner[i] = -1;
+	}
+	for (int i = 0; i < ROW_POOL; i++) {
+		card_slot_entry[i] = -1;
 	}
 	for (int i = 0; i < PODCAST_MAX_HELD; i++) {
 		row_image_source[i] = -1;
@@ -2789,14 +3958,14 @@ void podcastpage_init(gui_config_t *cfg) {
 	build_page(cfg);
 
 	// Slots are counted from the edge leftwards: the gear against it, the
-	// downloads beside it, the magnifier last.
+	// magnifier beside it. The downloaded episodes are the "on the card" pill.
 	settings_btn = corner_button(cfg, 0, &icon_music_settings, open_settings_cb);
-	saved_btn = corner_button(cfg, 1, &icon_podcast_downloaded, open_saved_cb);
-	search_btn = corner_button(cfg, 2, &icon_search, open_search_cb);
+	search_btn = corner_button(cfg, 1, &icon_search, open_search_cb);
 
 	build_search_page(cfg);
 	build_settings_page(cfg);
-	podcastsaved_init(cfg);
+	podcastcard_init(cfg);
+	podcastopml_init(cfg);
 	dl_build(cfg);
 	build_busy_layer();
 	podcastcache_set_slow_start_cb(NULL);

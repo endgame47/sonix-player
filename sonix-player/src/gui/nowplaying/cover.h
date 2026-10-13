@@ -84,6 +84,11 @@ bool cover_load_image_memory(const void *data, size_t size, int box_w, int box_h
 // the file's path, size and mtime, and the picture is not read again.
 uint64_t cover_source_id(const char *filepath);
 
+// True when the player will not need the picture embedded in `filepath` at
+// all: its id is kept (see above), and so is a cover made from it. Reads
+// neither the picture nor the cover, only the two tables. Any thread.
+bool cover_picture_known(const char *filepath);
+
 // Builds both images the player screen needs: the artwork itself, and the
 // upside-down blurred copy drawn behind the controls. A picture already shown
 // at this size comes out of the thumbnail database (one row per picture, shared
@@ -93,6 +98,12 @@ uint64_t cover_source_id(const char *filepath);
 // artwork at all, leaving both outputs zeroed.
 bool cover_load_player_images(const char *filepath, int cover_w, int cover_h, cover_image_t *cover_out,
 							  int backdrop_w, int backdrop_h, cover_image_t *backdrop_out);
+
+// Makes the player's cover of `filepath` at cover_w x cover_h and keeps it in
+// the thumbnail database, as cover_load_player_images() does, so that the
+// track's cover later comes out of the cache. Does nothing when the track has no
+// artwork or its cover is already kept at that size. Loader thread only.
+void cover_prefetch_player(const char *filepath, int cover_w, int cover_h);
 
 // The two pictures the screensaver needs from one photograph: the picture
 // itself filling the screen, and the blurred block along the bottom that the
@@ -158,6 +169,15 @@ uint32_t cover_tone_stretched(uint32_t tone);
 // size and kept there, so the player finds it the first time the record plays.
 // What an album's page puts at its head. Runs on the loader thread.
 bool cover_load_shared(const char *filepath, int player_w, int player_h, int size, cover_image_t *out);
+
+// A copy of `src` scaled to fill a square of `size`, with its colour kept. For
+// a picture already on screen that another page wants smaller, on the spot:
+// a scale, no decode.
+bool cover_scaled_copy(const cover_image_t *src, int size, cover_image_t *out);
+
+// The id cover_source_id() keeps for `filepath`, when it keeps one: from the
+// table only, nothing is read. False for a track not seen yet.
+bool cover_known_id(const char *filepath, uint64_t *id);
 
 void cover_free(cover_image_t *img);
 

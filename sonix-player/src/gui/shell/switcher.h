@@ -41,6 +41,11 @@ void switcher_set_back_guard_peek(lv_obj_t *screen, bool (*peek)(void));
 // artwork's corner, instead of on the (hidden) title row.
 void back_btn_player_mode(bool in_player);
 
+// True while the status bar stays up over the player as well: the chevron
+// there goes under the bar, as on every other page, and back_btn_centre_y()
+// says so to whatever lines up with it.
+void back_btn_player_below_bar(bool below);
+
 // True while the open player shows a loaded cover: the chevron sits on the
 // always-dark artwork backdrop, so it goes white regardless of the theme.
 void back_btn_over_cover(bool over_cover);

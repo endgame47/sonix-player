@@ -63,6 +63,14 @@ typedef struct {
 
 static id_job_t player_id_job;
 
+// The next track's cover, made only to be kept in the cache. No generation and
+// no result: a newer request just replaces the path while it waits.
+static struct {
+	char path[512];
+	int w, h;
+	bool pending;
+} prefetch_job;
+
 static dual_job_t player_job;
 static dual_job_t saver_job;
 
@@ -150,7 +158,8 @@ static void *worker(void *arg) {
 		pthread_mutex_lock(&lock);
 
 		while (next_pending() < 0 && !(player_id_job.pending && !player_id_job.running) &&
-			   !(player_job.pending && !player_job.running) && !(saver_job.pending && !saver_job.running)) {
+			   !(player_job.pending && !player_job.running) && !(saver_job.pending && !saver_job.running) &&
+			   !prefetch_job.pending) {
 			pthread_cond_wait(&wakeup, &lock);
 		}
 
@@ -186,9 +195,19 @@ static void *worker(void *arg) {
 
 		int index = next_pending();
 		if (index < 0 && saver_job.pending && !saver_job.running) {
-			// Last: it is a picture for a screen that is off, and nothing on
-			// screen is waiting for it.
+			// It is a picture for a screen that is off, and nothing on screen is
+			// waiting for it.
 			run_dual_job(&saver_job, cover_load_screensaver_images); // returns unlocked
+			continue;
+		}
+		if (index < 0 && prefetch_job.pending) {
+			// Last of all: a guess at what comes next, wanted by nobody yet.
+			char path[sizeof(prefetch_job.path)];
+			memcpy(path, prefetch_job.path, sizeof(path));
+			int w = prefetch_job.w, h = prefetch_job.h;
+			prefetch_job.pending = false;
+			pthread_mutex_unlock(&lock);
+			cover_prefetch_player(path, w, h);
 			continue;
 		}
 		if (index < 0) {
@@ -477,6 +496,19 @@ bool coverloader_take_player_id(uint64_t *id, bool *finished) {
 	}
 	pthread_mutex_unlock(&lock);
 	return done;
+}
+
+void coverloader_prefetch_player(const char *path, int cover_w, int cover_h) {
+	if (!path || !path[0] || cover_w <= 0 || cover_h <= 0) {
+		return;
+	}
+	pthread_mutex_lock(&lock);
+	snprintf(prefetch_job.path, sizeof(prefetch_job.path), "%s", path);
+	prefetch_job.w = cover_w;
+	prefetch_job.h = cover_h;
+	prefetch_job.pending = true;
+	pthread_cond_signal(&wakeup);
+	pthread_mutex_unlock(&lock);
 }
 
 void coverloader_request_screensaver(const char *path, int w, int h, int strip_w, int strip_h) {

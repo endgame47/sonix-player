@@ -1,6 +1,8 @@
 #include "trackmenu.h"
 
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -16,6 +18,7 @@
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/switcher.h"
 #include "src/gui/shell/theme.h"
+#include "src/gui/shell/toast.h"
 #include "src/gui/nowplaying/cover.h"
 #include "src/system/audio/audio.h"
 #include "src/system/audio/replaygain.h"
@@ -23,6 +26,7 @@
 #include "src/system/library/metadata.h"
 #include "src/system/playback/device_state.h"
 #include "src/system/core/lang.h"
+#include "src/gui/streaming/podcastcard.h"
 #include "src/gui/streaming/podcastpage.h"
 #include "src/system/streaming/podcastcache.h"
 #include "src/system/streaming/qobuzcache.h"
@@ -48,6 +52,7 @@ typedef struct {
 	lv_obj_t *button;
 	lv_obj_t *icon;
 	lv_obj_t *label;
+	lv_obj_t *check; // the tick on a chosen row while choosing
 	int index; // position in the queue, or -1
 	bool has_thumb;
 	cover_image_t thumb;
@@ -58,6 +63,17 @@ static lv_obj_t *queue_body; // fixed-height canvas the pool rows sit on
 static lv_obj_t *queue_empty;
 static queue_row_t queue_rows[QUEUE_ROW_POOL];
 static int queue_total; // how many tracks the queue holds, from its first
+static lv_obj_t *queue_title;
+
+// Choosing what to take out of the queue: a long press on a row starts it, a
+// tap then chooses a row or lets it go, and letting go of the last one ends
+// it. The track playing cannot be chosen. The corner holds the two buttons:
+// take the chosen ones out, and close.
+static bool queue_selecting;
+static uint8_t *queue_chosen; // one per entry of the queue, while choosing
+static int queue_chosen_count;
+static lv_obj_t *queue_remove_btn;
+static lv_obj_t *queue_close_btn;
 
 static lv_obj_t *details_card;
 static lv_obj_t *details_scroll;
@@ -67,12 +83,143 @@ static gui_config_t *g_cfg;
 // Queue: the current track and the ones after it, tappable to jump.
 // ---------------------------------------------------------------------------
 
+static void queue_row_paint_check(queue_row_t *row) {
+	bool on = queue_selecting && queue_chosen && row->index >= 0 && row->index < queue_total && queue_chosen[row->index];
+	if (on) {
+		lv_obj_set_style_image_recolor(row->check, theme()->accent, 0);
+	}
+	lv_obj_set_hidden(row->check, !on);
+}
+
+static void queue_selection_show(void) {
+	lv_obj_set_hidden(queue_remove_btn, !queue_selecting);
+	lv_obj_set_hidden(queue_close_btn, !queue_selecting);
+	settingsrow_title_corner_slots(queue_title, g_cfg, queue_selecting ? 2 : 0);
+	for (int i = 0; i < QUEUE_ROW_POOL; i++) {
+		queue_row_paint_check(&queue_rows[i]);
+	}
+}
+
+static void queue_selection_stop(void) {
+	if (!queue_selecting) {
+		return;
+	}
+	queue_selecting = false;
+	free(queue_chosen);
+	queue_chosen = NULL;
+	queue_chosen_count = 0;
+	queue_selection_show();
+}
+
+static bool queue_selection_start(void) {
+	if (queue_selecting) {
+		return true;
+	}
+	if (queue_total <= 0) {
+		return false;
+	}
+	queue_chosen = calloc((size_t)queue_total, 1);
+	if (!queue_chosen) {
+		return false;
+	}
+	queue_selecting = true;
+	queue_chosen_count = 0;
+	queue_selection_show();
+	return true;
+}
+
+// Chooses the row, or lets it go. Letting go of the last one leaves the mode.
+static void queue_selection_toggle(queue_row_t *row) {
+	int index = row->index;
+	if (!queue_selecting || index < 0 || index >= queue_total || index == playlist_current_index()) {
+		return;
+	}
+	queue_chosen[index] = !queue_chosen[index];
+	if (queue_chosen[index]) {
+		queue_chosen_count++;
+	} else if (--queue_chosen_count == 0) {
+		queue_selection_stop();
+		return;
+	}
+	queue_row_paint_check(row);
+}
+
+static queue_row_t *queue_row_of(lv_obj_t *button) {
+	for (int i = 0; i < QUEUE_ROW_POOL; i++) {
+		if (queue_rows[i].button == button && queue_rows[i].index >= 0) {
+			return &queue_rows[i];
+		}
+	}
+	return NULL;
+}
+
+static void queue_row_long_cb(lv_event_t *e) {
+	if (player_sheet_drag_active() || switcher_back_drag_active()) {
+		return;
+	}
+	queue_row_t *row = queue_row_of(lv_event_get_current_target(e));
+	if (!row || row->index == playlist_current_index()) {
+		return;
+	}
+	// The lift that ends this press would otherwise arrive as a click and
+	// take the row straight back out of the selection.
+	lv_indev_t *indev = lv_indev_active();
+	if (indev) {
+		lv_indev_wait_release(indev);
+	}
+	if (!queue_selection_start()) {
+		return;
+	}
+	if (!queue_chosen[row->index]) {
+		queue_selection_toggle(row);
+	}
+}
+
+static void queue_rebuild(void);
+
+static void queue_remove_cb(lv_event_t *e) {
+	(void)e;
+	if (!queue_selecting || queue_chosen_count == 0) {
+		return;
+	}
+	int *indices = malloc((size_t)queue_chosen_count * sizeof(*indices));
+	int n = 0;
+	for (int i = 0; indices && i < queue_total && n < queue_chosen_count; i++) {
+		if (queue_chosen[i]) {
+			indices[n++] = i;
+		}
+	}
+	queue_selection_stop();
+	bool removed = indices && playlist_remove(indices, n);
+	free(indices);
+	if (!removed) {
+		return;
+	}
+	// Written down now, as an addition is: the mirror on disk is otherwise
+	// refreshed only when a track is loaded.
+	device_state_queue_changed();
+	toast_success("queue_tracks_removed");
+	queue_rebuild();
+}
+
+static void queue_close_cb(lv_event_t *e) {
+	(void)e;
+	queue_selection_stop();
+}
+
 static void queue_row_clicked_cb(lv_event_t *e) {
 	if (player_sheet_drag_active() || switcher_back_drag_active()) {
 		return;
 	}
 
 	lv_obj_t *button = lv_event_get_current_target(e);
+	if (queue_selecting) {
+		queue_row_t *row = queue_row_of(button);
+		if (row) {
+			queue_selection_toggle(row);
+		}
+		return;
+	}
 	for (int i = 0; i < QUEUE_ROW_POOL; i++) {
 		if (queue_rows[i].button == button && queue_rows[i].index >= 0) {
 			if (device_state_play_queue_index(queue_rows[i].index)) {
@@ -173,6 +320,7 @@ static void queue_row_bind(queue_row_t *row, int index) {
 	lv_label_set_text(row->label, title);
 
 	queue_row_paint_mark(row);
+	queue_row_paint_check(row);
 }
 
 static void queue_window_update(void) {
@@ -246,9 +394,34 @@ static void queue_loaded_cb(lv_event_t *e) {
 	queue_rebuild();
 }
 
+static void queue_unloaded_cb(lv_event_t *e) {
+	(void)e;
+	queue_selection_stop();
+}
+
+static lv_obj_t *queue_corner_button(gui_config_t *cfg, int slot, const lv_image_dsc_t *glyph, lv_event_cb_t cb) {
+	lv_obj_t *button = lv_btn_create(queue_screen);
+	lv_obj_set_size(button, 56, 56);
+	lv_obj_set_style_bg_opa(button, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_border_width(button, 0, 0);
+	lv_obj_set_style_shadow_width(button, 0, 0);
+	lv_obj_set_style_pad_all(button, 0, 0);
+	lv_obj_align(button, LV_ALIGN_TOP_RIGHT, -cfg->padding - slot * (56 + 6), cfg->padding + cfg->top_bar_height);
+	lv_obj_add_event_cb(button, cb, LV_EVENT_CLICKED, NULL);
+	lv_obj_t *icon = lv_image_create(button);
+	lv_image_set_src(icon, glyph);
+	lv_obj_add_style(icon, &theme_style_icon, 0);
+	lv_obj_set_style_image_recolor_opa(icon, LV_OPA_COVER, 0);
+	lv_obj_center(icon);
+	lv_obj_set_hidden(button, true);
+	return button;
+}
+
 static void build_queue_page(gui_config_t *cfg) {
 	lv_obj_add_style(queue_screen, &theme_style_screen, 0);
-	settingsrow_title(queue_screen, cfg, "trackmenu_queue");
+	queue_title = settingsrow_title(queue_screen, cfg, "trackmenu_queue");
+	queue_close_btn = queue_corner_button(cfg, 0, &icon_close, queue_close_cb);
+	queue_remove_btn = queue_corner_button(cfg, 1, &icon_list_x, queue_remove_cb);
 
 	int content_top = settingsrow_content_top(cfg);
 	int width = cfg->screen_width - 2 * cfg->padding;
@@ -299,6 +472,7 @@ static void build_queue_page(gui_config_t *cfg) {
 		lv_obj_set_hidden(row->button, true);
 		lv_obj_set_event_bubble(row->button, true);
 		lv_obj_add_event_cb(row->button, queue_row_clicked_cb, LV_EVENT_CLICKED, NULL);
+		lv_obj_add_event_cb(row->button, queue_row_long_cb, LV_EVENT_LONG_PRESSED, NULL);
 		lv_obj_set_flex_flow(row->button, LV_FLEX_FLOW_ROW);
 		lv_obj_set_flex_align(row->button, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
@@ -313,6 +487,13 @@ static void build_queue_page(gui_config_t *cfg) {
 		lv_obj_add_style(row->label, &theme_style_text, 0);
 		lv_obj_set_style_text_font(row->label, &font_ui_24, 0);
 
+		row->check = lv_image_create(row->button);
+		lv_image_set_src(row->check, &icon_check);
+		lv_obj_add_style(row->check, &theme_style_icon, 0);
+		lv_obj_set_style_image_recolor_opa(row->check, LV_OPA_COVER, 0);
+		lv_obj_set_clickable(row->check, false);
+		lv_obj_set_hidden(row->check, true);
+
 		row->index = -1;
 		row->has_thumb = false;
 	}
@@ -321,6 +502,7 @@ static void build_queue_page(gui_config_t *cfg) {
 	// list being read. The swipe-back drag still works from here.
 	switcher_attach_back_gesture(queue_list);
 	lv_obj_add_event_cb(queue_screen, queue_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
+	lv_obj_add_event_cb(queue_screen, queue_unloaded_cb, LV_EVENT_SCREEN_UNLOADED, NULL);
 }
 
 // ---------------------------------------------------------------------------
@@ -672,7 +854,7 @@ static void open_album_cb(void *user) {
 			gui_notify_popup("trackmenu_podcast_failed");
 			return;
 		}
-		switcher_set_player_return(podcast_list_screen);
+		switcher_set_player_return(podcastcard_feed_screen);
 		return;
 	}
 
@@ -723,7 +905,11 @@ static void open_album_cb(void *user) {
 
 	player_sheet_close(false);
 	medialist_open(album, LIBRARY_LIST_TRACKS, LIBRARY_FILTER_ALBUM, album);
-	switcher_set_player_return(medialist_tracks_screen);
+	// Over a track list the album takes that list's place on the same page,
+	// and the page brings the list back with the player over it itself.
+	if (!medialist_step_back_to_player()) {
+		switcher_set_player_return(medialist_tracks_screen);
+	}
 }
 
 static void open_settings_cb(void *user) {

@@ -1,6 +1,7 @@
 #ifndef PLAYER_H
 #define PLAYER_H
 
+#include "src/gui/nowplaying/cover.h"
 #include "src/gui/shell/gui.h"
 #include "src/system/library/library.h"
 #include "src/system/streaming/podcast.h" // podcast_feed_t
@@ -143,6 +144,16 @@ void player_set_cover_release_cb(void (*cb)(void));
 // same cover asks for it at this size, so the player's table of covers serves
 // both (coverloader_request_shared). 0 x 0 before the player is built.
 void player_cover_box(int *w, int *h);
+
+// The cover the player shows now, scaled to a square of `size`, with its
+// colour; `id` is the picture's cover_source_id(), 0 while not known yet.
+// False with no cover up, or one still on its way.
+bool player_cover_copy(int size, cover_image_t *out, uint64_t *id);
+
+// The status bar kept up over the player too (Settings > Appearance > Always
+// show the status bar). Not saved here: the settings page writes the config.
+void player_set_statusbar_always(bool on);
+bool player_statusbar_always(void);
 
 
 #endif

@@ -5856,6 +5856,129 @@ static void prune_names(void) {
 		 "ALBUM_GROUP_TABLE.album AND m.album_key = ALBUM_GROUP_TABLE.album_key)");
 }
 
+// The file a row stands for: its own path, or for a track of a sheet the
+// sheet's, which is everything before "?track=".
+static void row_file(const char *path, char *out, size_t size) {
+	const char *mark = strstr(path, "?track=");
+	size_t len = mark ? (size_t)(mark - path) : strlen(path);
+	snprintf(out, size, "%.*s", (int)(len < size ? len : size - 1), path);
+}
+
+int library_forget_deleted(const char *const *paths, int count) {
+	if (!paths || count <= 0) {
+		return 0;
+	}
+	pthread_mutex_lock(&db_lock);
+	if (!db) {
+		pthread_mutex_unlock(&db_lock);
+		return 0;
+	}
+
+	// The rows the paths stand for -- a file's own, a sheet's tracks, and
+	// everything under a folder -- and of those, the ones whose file is gone.
+	// Asked of the card and not assumed: a delete that stopped halfway leaves
+	// some of a folder behind, and those stay.
+	static const char *const SELECT_SQL =
+		"SELECT rowid, path FROM MEDIA_TABLE WHERE path = ?1 OR (path >= ?1 || '?track=' AND path < ?1 || '?track>')"
+		" OR (path >= ?1 || '/' AND path < ?1 || '0')";
+	int removed = 0, unfavoured = 0;
+	bool in_transaction = exec("BEGIN");
+	sqlite3_stmt *select = NULL, *del = NULL, *fav = NULL, *plays = NULL;
+	sqlite3_prepare_v2(db, SELECT_SQL, -1, &select, NULL);
+	sqlite3_prepare_v2(db, "DELETE FROM MEDIA_TABLE WHERE rowid = ?1", -1, &del, NULL);
+	sqlite3_prepare_v2(db, "DELETE FROM FAVOURITES WHERE path = ?1", -1, &fav, NULL);
+	sqlite3_prepare_v2(db, "DELETE FROM PLAY_COUNTS WHERE path = ?1", -1, &plays, NULL);
+	for (int i = 0; select && del && i < count; i++) {
+		if (!paths[i] || !paths[i][0]) {
+			continue;
+		}
+		sqlite3_reset(select);
+		sqlite3_bind_text(select, 1, paths[i], -1, SQLITE_TRANSIENT);
+		while (sqlite3_step(select) == SQLITE_ROW) {
+			sqlite3_int64 rowid = sqlite3_column_int64(select, 0);
+			const char *path = (const char *)sqlite3_column_text(select, 1);
+			char file[600];
+			struct stat st;
+			row_file(path ? path : "", file, sizeof(file));
+			if (!file[0] || stat(file, &st) == 0) {
+				continue;
+			}
+			sqlite3_reset(del);
+			sqlite3_bind_int64(del, 1, rowid);
+			sqlite3_step(del);
+			removed += sqlite3_changes(db);
+			// A favourite or a count of plays of a file deleted on purpose has
+			// nothing left to point at.
+			sqlite3_stmt *const owned[] = {fav, plays};
+			for (size_t k = 0; k < sizeof(owned) / sizeof(owned[0]); k++) {
+				if (!owned[k]) {
+					continue;
+				}
+				sqlite3_reset(owned[k]);
+				sqlite3_bind_text(owned[k], 1, path, -1, SQLITE_TRANSIENT);
+				sqlite3_step(owned[k]);
+				if (owned[k] == fav) {
+					unfavoured += sqlite3_changes(db);
+				}
+			}
+		}
+	}
+	sqlite3_finalize(select);
+	sqlite3_finalize(del);
+	sqlite3_finalize(fav);
+	sqlite3_finalize(plays);
+
+	// A folder that is gone takes what the walk wrote down about it too, so the
+	// next look for changes does not go looking for it.
+	static const char *const UNDER[] = {
+		"DELETE FROM FOLDER_TABLE WHERE path = ?3 OR (path >= ?1 AND path < ?2)",
+		"DELETE FROM CUE_STATE WHERE path = ?3 OR (path >= ?1 AND path < ?2)",
+	};
+	for (int i = 0; i < count; i++) {
+		struct stat st;
+		if (!paths[i] || !paths[i][0] || stat(paths[i], &st) == 0) {
+			continue;
+		}
+		for (size_t q = 0; q < sizeof(UNDER) / sizeof(UNDER[0]); q++) {
+			sqlite3_stmt *stmt = NULL;
+			if (sqlite3_prepare_v2(db, UNDER[q], -1, &stmt, NULL) == SQLITE_OK) {
+				bind_under(stmt, paths[i]);
+				sqlite3_bind_text(stmt, 3, paths[i], -1, SQLITE_TRANSIENT);
+				sqlite3_step(stmt);
+				sqlite3_finalize(stmt);
+			}
+		}
+	}
+
+	if (removed > 0) {
+		prune_links();
+		prune_names();
+		exec("DELETE FROM COUNT_TABLE");
+		char sql[128];
+		snprintf(sql, sizeof(sql), "INSERT INTO COUNT_TABLE(cn) VALUES(%d)",
+				 count_rows("SELECT COUNT(*) FROM MEDIA_TABLE"));
+		exec(sql);
+	}
+	if (in_transaction && !exec("COMMIT")) {
+		exec("ROLLBACK");
+		removed = 0;
+		unfavoured = 0;
+	}
+	if (removed > 0) {
+		// The open lists hold row ids, some of which are gone now.
+		bump_generation(GEN_MEDIA);
+	}
+	if (unfavoured > 0) {
+		bump_generation(GEN_FAVOURITES);
+	}
+	pthread_mutex_unlock(&db_lock);
+
+	if (removed > 0) {
+		printf("library: %d deleted track(s) taken out of the index\n", removed);
+	}
+	return removed;
+}
+
 // Takes out what the walk found gone. Returns how many tracks went, or -1
 // when it would not.
 //

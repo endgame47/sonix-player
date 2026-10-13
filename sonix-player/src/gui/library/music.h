@@ -28,8 +28,7 @@ typedef enum {
 } music_tile_t;
 
 // The tiles on the page, in order, and the ones left out. Read by the page that
-// arranges them (Music settings > Display options > Library > Rearrange main
-// page), which moves them with the two calls below; every move is saved and the
+// arranges them (Music settings > Library > Rearrange main page), which moves them with the two calls below; every move is saved and the
 // page's tiles are rebuilt.
 int music_tiles_in_use_count(void);
 music_tile_t music_tiles_in_use_at(int position);

@@ -48,12 +48,19 @@ static int8_t back_btn_top_bar_height;
 // air it keeps instead, and what the player's own header row is aligned to.
 #define BACK_BTN_PLAYER_TOP 14
 
+// Whether the status bar stays up over the player too (back_btn_player_below_bar).
+static bool player_bar_shown;
+
+// How far down the chevron sits on the player.
+static int player_top(void) { return player_bar_shown ? back_btn_top_bar_height : BACK_BTN_PLAYER_TOP; }
+
 static void place_back_btn(bool below_top_bar) {
 	// Same offsets as the corner buttons on the right (playlists, settings,
 	// options): the whole header row of round buttons sits on one line. On
 	// the player (below_top_bar false) the status bar is not there to sit
-	// under, so the chevron takes the offset above.
-	int y = back_btn_padding + (below_top_bar ? back_btn_top_bar_height : BACK_BTN_PLAYER_TOP);
+	// under, so the chevron takes the offset above -- unless the bar has been
+	// asked to stay up there too, and then it goes under it as anywhere else.
+	int y = back_btn_padding + (below_top_bar ? back_btn_top_bar_height : player_top());
 	lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, back_btn_padding, y);
 }
 
@@ -170,9 +177,16 @@ void back_btn_translate(int32_t x) { back_btn_set_drag_offset(x); }
 
 int back_btn_centre_y(void) {
 	if (!back_btn) {
-		return back_btn_padding + BACK_BTN_PLAYER_TOP;
+		return back_btn_padding + player_top();
 	}
-	return back_btn_padding + BACK_BTN_PLAYER_TOP + lv_obj_get_height(back_btn) / 2;
+	return back_btn_padding + player_top() + lv_obj_get_height(back_btn) / 2;
+}
+
+void back_btn_player_below_bar(bool below) {
+	player_bar_shown = below;
+	if (back_btn && chevron_in_player) {
+		place_back_btn(false);
+	}
 }
 
 static void back_underlay_destroy(void) {

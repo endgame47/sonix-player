@@ -67,6 +67,11 @@ bool playlist_insert_next(const char *path);
 // stored (out of memory).
 bool playlist_insert_at(const char *path, int slot);
 
+// Takes the entries at `indices` (positions in playback order) out of the
+// queue. The one playing is never taken out, and the others keep their order.
+// The queue becomes a custom list of paths. False when nothing was taken out.
+bool playlist_remove(const int *indices, int count);
+
 // True while the queue is a custom list rather than a folder.
 bool playlist_is_custom(void);
 

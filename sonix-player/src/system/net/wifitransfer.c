@@ -499,6 +499,66 @@ static bool install_page(const char *web_root) {
 	return ok;
 }
 
+// thttpd serves nothing that "others" may not read, root or not: a directory
+// without o+r and o+x, the document root above all, answers 403 "resolves to
+// a file which is not world-readable", and a CGI without o+x is not run.
+//
+// The tree is only as open as it arrived. The copy under /usr/data is made
+// once, by `cp -a`, and keeps the modes of the shipped tree at that moment --
+// which a firmware image packed from a checkout made under a strict umask
+// carries as 700 and 600 -- for as long as the copy exists. So the modes are
+// put right here, every start, rather than trusted: read for everyone, and
+// execute for everyone wherever the owner has it. Nothing is taken away.
+// Symbolic links are left alone; they have no mode of their own.
+#define WEB_TREE_DEPTH 4
+
+static int open_up_tree(const char *path, int depth) {
+	struct stat st;
+	if (lstat(path, &st) != 0 || S_ISLNK(st.st_mode)) {
+		return 0;
+	}
+	int fixed = 0;
+	mode_t want = st.st_mode | S_IRUSR | S_IRGRP | S_IROTH;
+	if (S_ISDIR(st.st_mode) || (st.st_mode & S_IXUSR)) {
+		want |= S_IXUSR | S_IXGRP | S_IXOTH;
+	}
+	if ((want & 07777) != (st.st_mode & 07777)) {
+		if (chmod(path, want & 07777) == 0) {
+			fixed++;
+		} else if (errno != EROFS) { // the shipped tree, served as it is
+			printf("wifitransfer: cannot open up %s: %s\n", path, strerror(errno));
+		}
+	}
+	if (!S_ISDIR(st.st_mode) || depth >= WEB_TREE_DEPTH) {
+		return fixed;
+	}
+	DIR *dir = opendir(path);
+	if (!dir) {
+		return fixed;
+	}
+	struct dirent *de;
+	while ((de = readdir(dir)) != NULL) {
+		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) {
+			continue;
+		}
+		char child[PATH_MAX];
+		if (snprintf(child, sizeof(child), "%s/%s", path, de->d_name) >= (int)sizeof(child)) {
+			continue;
+		}
+		fixed += open_up_tree(child, depth + 1);
+	}
+	closedir(dir);
+	return fixed;
+}
+
+static void open_up_web_root(const char *web_root) {
+	int fixed = open_up_tree(web_root, 0);
+	if (fixed > 0) {
+		printf("wifitransfer: %d entr%s under %s made readable for the server\n", fixed, fixed == 1 ? "y" : "ies",
+			   web_root);
+	}
+}
+
 static const char *prepare_web_root(void) {
 	if (!exists(WEB_DIR)) {
 		mkdir(WEB_PARENT, 0755);
@@ -515,6 +575,7 @@ static const char *prepare_web_root(void) {
 			install_page(WEB_SRC);
 			link_fonts(WEB_SRC);
 			link_self_as_cgi(WEB_SRC);
+			open_up_web_root(WEB_SRC);
 			return WEB_SRC;
 		}
 	}
@@ -522,6 +583,7 @@ static const char *prepare_web_root(void) {
 	install_page(WEB_DIR);
 	link_fonts(WEB_DIR);
 	link_self_as_cgi(WEB_DIR);
+	open_up_web_root(WEB_DIR);
 	return WEB_DIR;
 }
 

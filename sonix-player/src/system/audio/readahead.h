@@ -1,6 +1,8 @@
 #ifndef READAHEAD_H
 #define READAHEAD_H
 
+#include <stdbool.h>
+
 // ---------------------------------------------------------------------------
 // The next track, read off the card before it is needed.
 //
@@ -22,6 +24,12 @@
 // One file at a time, the newest asked for wins, on a thread below the
 // interface.
 // ---------------------------------------------------------------------------
+
+// The cover embedded in a track is only read to compare it with the one on
+// screen. `known` answers, for a path, whether that comparison can already be
+// made without reading it -- and then the picture is not read ahead. Called on
+// the read-ahead's own thread. Unset, every picture is read.
+void readahead_set_picture_known(bool (*known)(const char *path));
 
 // Reads ahead the parts of `path` that opening it will need. Returns at once;
 // asking for the file already read, or being read, does nothing. Anything

@@ -44,4 +44,20 @@ bool podcastsubs_is_followed(long long feed_id);
 void podcastsubs_follow(const podcast_feed_t *feed);
 void podcastsubs_unfollow(long long feed_id);
 
+// Follows several at once with a single write: the OPML import. Ones already
+// followed are skipped, and nothing is dropped to make room -- the list stops
+// at PODCASTSUBS_MAX. Returns how many were added.
+int podcastsubs_follow_batch(const podcast_feed_t *feeds, int count);
+
+// The followed podcasts whose feed address is not known yet: followed from the
+// player's star, which knows only the id, or before the address was kept.
+// Fills `ids_out` and returns how many.
+int podcastsubs_missing_urls(long long *ids_out, int max);
+
+// Records a podcast's feed address, once the catalogue has given it.
+void podcastsubs_set_url(long long feed_id, const char *url);
+
+// Whether a podcast with this feed address is followed.
+bool podcastsubs_is_followed_url(const char *url);
+
 #endif /* PODCASTSUBS_H */

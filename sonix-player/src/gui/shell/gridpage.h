@@ -61,4 +61,11 @@ lv_obj_t *gridpage_empty_panel(lv_obj_t *screen, gui_config_t *cfg, const lv_ima
 // Either the tiles or the panel.
 void gridpage_show_empty(lv_obj_t *grid, lv_obj_t *panel, bool empty);
 
+// The same panel saying there is no card instead -- none in the slot, or the
+// card is at a computer over USB -- with no Scan button: the index lives on
+// the card, so there is nothing to scan. While it shows, the card is looked
+// for every second; when it is back, `card_back` is called (the page decides
+// again between its tiles and the scan panel).
+void gridpage_show_no_card(lv_obj_t *grid, lv_obj_t *panel, void (*card_back)(void));
+
 #endif /* GRIDPAGE_H */

@@ -1,5 +1,7 @@
 #include "gridpage.h"
 
+#include <stdlib.h>
+
 #include "lvgl/lvgl.h"
 
 #include "src/gui/nowplaying/coverflow.h"
@@ -7,8 +9,10 @@
 #include "src/gui/nowplaying/player.h"
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/switcher.h"
+#include "src/gui/shell/icons.h"
 #include "src/gui/shell/theme.h"
 #include "src/system/core/lang.h"
+#include "src/system/device/usb.h"
 
 #define GRID_GAP 14
 #define TILE_RADIUS 12 // Adwaita card radius
@@ -207,6 +211,18 @@ void gridpage_hint_scroll(lv_obj_t *grid) {
 	lv_timer_set_repeat_count(scroll_hint_timer, 1);
 }
 
+// What the empty panel was built with, so it can go back to saying "scan"
+// after it has said "no card", and the check that waits for the card.
+typedef struct {
+	const lv_image_dsc_t *icon;
+	const char *text;
+	lv_timer_t *card_timer;
+	void (*card_back)(void);
+} empty_panel_t;
+
+// How often a panel saying "no card" looks for the card again.
+#define CARD_CHECK_MS 1000
+
 lv_obj_t *gridpage_empty_panel(lv_obj_t *screen, gui_config_t *cfg, const lv_image_dsc_t *icon, const char *text,
 							   lv_event_cb_t scan_cb) {
 	int top = settingsrow_content_top(cfg);
@@ -251,7 +267,66 @@ lv_obj_t *gridpage_empty_panel(lv_obj_t *screen, gui_config_t *cfg, const lv_ima
 	lv_obj_set_style_text_color(button_label, lv_color_white(), 0);
 	lv_obj_center(button_label);
 
+	empty_panel_t *state = calloc(1, sizeof(*state));
+	if (state) {
+		state->icon = icon;
+		state->text = text;
+	}
+	lv_obj_set_user_data(panel, state);
+
 	return panel;
+}
+
+// The panel's picture, line and button, in the order gridpage_empty_panel()
+// creates them.
+static void empty_panel_say(lv_obj_t *panel, const lv_image_dsc_t *icon, const char *text, bool button) {
+	lv_image_set_src(lv_obj_get_child(panel, 0), icon);
+	lv_label_set_text(lv_obj_get_child(panel, 1), tr(text));
+	lv_obj_set_hidden(lv_obj_get_child(panel, 2), !button);
+}
+
+static void stop_card_check(empty_panel_t *state) {
+	if (state && state->card_timer) {
+		lv_timer_pause(state->card_timer);
+	}
+}
+
+static void card_check_cb(lv_timer_t *timer) {
+	lv_obj_t *panel = lv_timer_get_user_data(timer);
+	empty_panel_t *state = lv_obj_get_user_data(panel);
+	// Only while the panel is up on the page on show; a page left behind looks
+	// again when it is opened.
+	if (!state || lv_obj_is_hidden(panel) || lv_obj_get_screen(panel) != lv_screen_active()) {
+		lv_timer_pause(timer);
+		return;
+	}
+	if (gui_card_available()) {
+		lv_timer_pause(timer);
+		if (state->card_back) {
+			state->card_back();
+		}
+	}
+}
+
+void gridpage_show_no_card(lv_obj_t *grid, lv_obj_t *panel, void (*card_back)(void)) {
+	if (grid) {
+		lv_obj_set_hidden(grid, true);
+	}
+	if (!panel) {
+		return;
+	}
+	empty_panel_say(panel, &icon_sd_card, usb_storage_active() ? "usb_storage_shared" : "sd_card_missing", false);
+	lv_obj_set_hidden(panel, false);
+
+	empty_panel_t *state = lv_obj_get_user_data(panel);
+	if (!state) {
+		return;
+	}
+	state->card_back = card_back;
+	if (!state->card_timer) {
+		state->card_timer = lv_timer_create(card_check_cb, CARD_CHECK_MS, panel);
+	}
+	lv_timer_resume(state->card_timer);
 }
 
 void gridpage_show_empty(lv_obj_t *grid, lv_obj_t *panel, bool empty) {
@@ -263,6 +338,11 @@ void gridpage_show_empty(lv_obj_t *grid, lv_obj_t *panel, bool empty) {
 		}
 	}
 	if (panel) {
+		empty_panel_t *state = lv_obj_get_user_data(panel);
+		stop_card_check(state);
+		if (state) {
+			empty_panel_say(panel, state->icon, state->text, true);
+		}
 		if (empty) {
 			// The accent may have changed since the panel was built.
 			lv_obj_set_style_bg_color(lv_obj_get_child(panel, 2), theme()->accent, 0);

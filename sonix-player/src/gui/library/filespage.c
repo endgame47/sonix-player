@@ -27,6 +27,7 @@
 #include "src/system/core/lang.h"
 #include "src/system/core/utils.h"
 #include "src/system/device/system.h"
+#include "src/system/library/library.h"
 #include "src/system/playback/playlist.h"
 
 lv_obj_t *filespage_screen;
@@ -613,8 +614,18 @@ static void delete_confirmed(void *user) {
 	}
 
 	char full[PATH_MAX_LEN + NAME_MAX + 2];
-	bool ok = child_path(acting_on, full, sizeof(full)) && remove_tree(full);
+	bool named = child_path(acting_on, full, sizeof(full));
+	bool ok = named && remove_tree(full);
 	acting_on[0] = '\0';
+
+	// Music that was in the library leaves it with the files, at once, rather
+	// than at the next look for changes. Asked even after a failure: what did
+	// go, went. Only tracks the index holds are touched, which means only what
+	// is in the folders chosen for the scan.
+	if (named) {
+		const char *const gone[] = {full};
+		library_forget_deleted(gone, 1);
+	}
 
 	if (ok) {
 		toast_success("files_deleted");

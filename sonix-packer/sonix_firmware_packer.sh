@@ -517,6 +517,18 @@ build_one() {
 	# enough to cause it, which is why this is checked rather than assumed.
 	step "[$MODEL_NAME] making the boot path executable"
 
+	# Readable by everyone first, as the stock tree is. tar brings every mode
+	# along -- the directories' too, the top one included -- so an assets folder
+	# checked out under a strict umask (700 directories, 600 files) makes those
+	# parts of the image readable by root alone. Some of what reads them checks
+	# for "others" whoever it runs as: thttpd answers 403 "not world-readable"
+	# for the Wi-Fi transfer page in a directory like that. Only read, and
+	# execute where a directory or the owner already has it, is added; nothing
+	# is taken away. Not through symlinks: chmod follows them, and their
+	# targets are paths on the device, not in the image.
+	( cd "$ASSETS_DIR/$MODEL_DIR" && find . ! -type l -print0 ) | ( cd "$SQUASH_DIR" && xargs -0 chmod go+rX )
+	say "    everything the assets added is readable by all"
+
 	for rel in "$NEW_LAUNCHER" "$INIT_SCRIPT" usr/bin/bluealsa usr/bin/shairport_on.sh etc/init.d/S80_bt_init; do
 		if [ -f "$SQUASH_DIR/$rel" ]; then
 			chmod 755 "$SQUASH_DIR/$rel"

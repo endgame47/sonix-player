@@ -1907,20 +1907,47 @@ static void radio_buffer_prefill(radio_buffer_t *b, unsigned mine) {
 	printf("radio: %d KB buffered before the first frame\n", level / 1024);
 }
 
+static bool is_png(const unsigned char *b, size_t len) {
+	return len >= 8 && b[0] == 0x89 && b[1] == 'P' && b[2] == 'N' && b[3] == 'G';
+}
+
+// The biggest picture inside a Windows icon that is a PNG, which is how icons
+// of any size have been made for years; the older bitmap kind is not drawn.
+// False when there is none.
+static bool ico_png(const unsigned char *b, size_t len, size_t *at, size_t *size) {
+	if (len < 6 || b[0] != 0 || b[1] != 0 || b[2] != 1 || b[3] != 0) {
+		return false;
+	}
+	int count = b[4] | (b[5] << 8);
+	size_t best = 0;
+	for (int i = 0; i < count && 6 + (size_t)(i + 1) * 16 <= len; i++) {
+		const unsigned char *e = b + 6 + (size_t)i * 16;
+		size_t bytes = (size_t)e[8] | ((size_t)e[9] << 8) | ((size_t)e[10] << 16) | ((size_t)e[11] << 24);
+		size_t offset = (size_t)e[12] | ((size_t)e[13] << 8) | ((size_t)e[14] << 16) | ((size_t)e[15] << 24);
+		if (offset < len && bytes <= len - offset && bytes > best && is_png(b + offset, bytes)) {
+			best = bytes;
+			*at = offset;
+			*size = bytes;
+		}
+	}
+	return best > 0;
+}
+
+// The icon of the station before, deleted when the next one's comes in. Under
+// now_lock.
+static char favicon_file[64];
+
 // Pulls the station's icon down so the player has something to show. Best
 // effort in every sense: no icon, an icon that is not an image, a server that
 // does not answer -- all of them just mean the radio placeholder stays up.
+//
+// Over HTTPS as well as HTTP, which is how most of the directory's icons are
+// served now: the same connection code as the stations' own, so wherever a
+// station on HTTPS plays, its icon comes.
 static void fetch_favicon(const char *url) {
-	if (!url || strncasecmp(url, "http://", 7) != 0) {
+	bool secure = url && strncasecmp(url, "https://", 8) == 0;
+	if (!url || (!secure && strncasecmp(url, "http://", 7) != 0) || (secure && !tls_available())) {
 		return;
-	}
-
-	const char *ext = ".jpg";
-	const char *dot = strrchr(url, '.');
-	if (dot && (strcasecmp(dot, ".png") == 0)) {
-		ext = ".png";
-	} else if (dot && strcasecmp(dot, ".gif") == 0) {
-		return; // nothing here decodes GIF covers
 	}
 
 	char *body = NULL;
@@ -1931,29 +1958,49 @@ static void fetch_favicon(const char *url) {
 	}
 
 	// Trust the bytes, not the file name: half the favicons in the directory
-	// are called .png and are JPEGs, or the other way round.
+	// are called .png and are JPEGs, or the other way round. A GIF is kept
+	// under .png too, because a picture file is told apart by its extension
+	// and only .jpg and .png are looked at; what decodes it goes by the bytes.
 	const unsigned char *b = (const unsigned char *)body;
-	if (b[0] == 0x89 && b[1] == 'P' && b[2] == 'N' && b[3] == 'G') {
+	const char *ext = NULL;
+	size_t at = 0, size = len;
+	if (is_png(b, len)) {
 		ext = ".png";
 	} else if (b[0] == 0xFF && b[1] == 0xD8) {
 		ext = ".jpg";
+	} else if (memcmp(b, "GIF8", 4) == 0) {
+		ext = ".png";
+	} else if (ico_png(b, len, &at, &size)) {
+		ext = ".png";
 	} else {
 		free(body);
 		return; // not something the cover decoder can read
 	}
 
-	char path[256];
-	snprintf(path, sizeof(path), "/tmp/sonix-radio-cover%s", ext);
+	// One name per icon, from its address: the player compares the path to
+	// tell a new picture from the one it is showing, and two stations with
+	// the same kind of icon must not look like the same picture to it.
+	uint32_t hash = 2166136261u;
+	for (const char *p = url; *p; p++) {
+		hash = (hash ^ (uint8_t)*p) * 16777619u;
+	}
+	char path[64];
+	snprintf(path, sizeof(path), "/tmp/sonix-radio-cover-%08x%s", (unsigned)hash, ext);
 
 	FILE *f = fopen(path, "wb");
 	if (f) {
-		fwrite(body, 1, len, f);
-		fclose(f);
-
-		pthread_mutex_lock(&now_lock);
-		snprintf(now_state.cover_path, sizeof(now_state.cover_path), "%s", path);
-		now_touch();
-		pthread_mutex_unlock(&now_lock);
+		bool ok = fwrite(body + at, 1, size, f) == size;
+		ok = fclose(f) == 0 && ok;
+		if (ok) {
+			pthread_mutex_lock(&now_lock);
+			if (favicon_file[0] && strcmp(favicon_file, path) != 0) {
+				unlink(favicon_file);
+			}
+			snprintf(favicon_file, sizeof(favicon_file), "%s", path);
+			snprintf(now_state.cover_path, sizeof(now_state.cover_path), "%s", path);
+			now_touch();
+			pthread_mutex_unlock(&now_lock);
+		}
 	}
 	free(body);
 }

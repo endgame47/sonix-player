@@ -1,8 +1,8 @@
 /*
- * The single translation unit that compiles stb_image. Only JPEG and PNG are
- * built in: those are the two formats used for embedded cover art and for
- * cover.jpg/folder.png files, and leaving the rest out keeps the target binary
- * meaningfully smaller.
+ * The single translation unit that compiles stb_image. Only JPEG, PNG and GIF
+ * are built in: the first two are the formats used for embedded cover art and
+ * for cover.jpg/folder.png files, GIF is what many radio stations' icons are,
+ * and leaving the rest out keeps the target binary meaningfully smaller.
  *
  * jpeg_planes_decode() lives here too, because it is the one caller that needs
  * stb's internals: it takes the decoded Y/Cb/Cr planes before stb interleaves

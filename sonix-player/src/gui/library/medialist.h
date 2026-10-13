@@ -27,7 +27,7 @@ extern lv_obj_t *medialist_albums_screen;
 void medialist_init(gui_config_t *cfg);
 
 // Whether tapping an artist or a genre opens its records or its tracks. On by
-// default; Music > Display options turns it off, and an artist or genre page is
+// default; Music > Library turns it off, and an artist or genre page is
 // then a flat list of tracks (an artist's with the album grouping on the corner
 // button).
 bool medialist_album_view(void);
@@ -37,17 +37,24 @@ void medialist_set_album_view(bool on);
 // cover, title, artist, genre and year and three buttons -- shuffle, play and a
 // track into the queue, circle-play's choices -- which scrolls away with the
 // rows. The page takes the sleeve's colour, and the rows carry track numbers
-// instead of covers. Off by default; Music > Display options > Library. On a record of more than one disc there is a
-// "Disc N" heading above the first track of each disc either way.
+// instead of covers. Off by default; Music > Library. On a record of more
+// than one disc there is a "Disc N" heading above the first track of each disc
+// either way.
 bool medialist_album_head(void);
 void medialist_set_album_head(bool on);
 
 // "Go to the current track": All tracks, Albums, Artists, Album artists and
 // Genres open scrolled to the row of what is playing -- the track itself in
 // All tracks, its album, artist, album artist or genre in the others. Off by
-// default; Music > Display options.
+// default; Music > Library.
 bool medialist_go_to_current(void);
 void medialist_set_go_to_current(bool on);
+
+// "Allow deleting tracks": selection mode on a list of tracks gets a bin, which
+// deletes the chosen tracks from the card and from the library after asking.
+// Off by default; Music > Library.
+bool medialist_allow_delete(void);
+void medialist_set_allow_delete(bool on);
 
 // Whether a track row wears a small badge saying what it is -- lossy, CD,
 // hi-res or DSD -- under its title. Off by default.
@@ -84,7 +91,18 @@ void medialist_sort_prefs(unsigned *desc_mask, unsigned *added_mask, bool *artis
 // Loads the list and switches to the right screen. For LIBRARY_LIST_TRACKS
 // the filter narrows to one album/artist/genre (LIBRARY_FILTER_NONE = all);
 // for the name kinds both filter arguments are ignored.
+//
+// A different list opened on the screen already showing -- "Show album" from
+// Favourites, say -- takes the place of the one there, and the chevron brings
+// that one back, where it was scrolled to, before it leaves the page.
 void medialist_open(const char *title, library_list_t kind, library_filter_t filter, const char *filter_value);
+
+// For the player's menu, right after its medialist_open(): true when the list
+// opened on the page already under the player -- in place of another list, or
+// over the same one. The step back then reopens what was there with the player
+// over it, so the caller must not also ask the switcher to return to the
+// player.
+bool medialist_step_back_to_player(void);
 
 // Opens one artist the way their disc button was last left: the records, or
 // the tracks strung out. What the search opens an artist with.

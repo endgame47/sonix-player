@@ -1041,9 +1041,22 @@ static void section_scan_cb(lv_event_t *e) {
 	start_scan(NULL);
 }
 
+// The tiles, a note that the card is missing -- the books and their index are
+// on it -- or the scan panel while nothing is indexed.
+static void section_show(void) {
+	if (!gui_card_available()) {
+		gridpage_show_no_card(section_grid, section_empty, section_show);
+		return;
+	}
+	gridpage_show_empty(section_grid, section_empty, !audiobookdb_scan_running() && audiobookdb_count() == 0);
+}
+
 static void section_loaded_cb(lv_event_t *e) {
 	(void)e;
-	gridpage_show_empty(section_grid, section_empty, !audiobookdb_scan_running() && audiobookdb_count() == 0);
+	section_show();
+	if (!gui_card_available()) {
+		return;
+	}
 	if (!upgrade_offered && audiobookdb_needs_rescan()) {
 		upgrade_offered = true;
 		// After this page's own load has finished, not inside it.
