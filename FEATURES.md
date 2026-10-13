@@ -143,16 +143,17 @@ certificate checking, and HLS.
   > Pictures need to be exactly 480x720 jpegs non progressive.
 
 - **Power** - standby, LED behaviour, automatic power-off from thirty seconds to
-  six hours, and a charge limit from 80 to 100 %.
+  six hours, and a charge limit from 80 to 100 %. A warning at 5 % battery, and
+  a shutdown with a ten second countdown at 1 %, also checked during standby.
 - **Date and time** - set by hand and written to the RTC, 24-hour clock, and a
   time zone with its own standard and daylight choice.
-- **Language** - English, Italiano, Deutsch, Español, Français, Russian, Chinese,
-  Japanese. Titles and tags in Korean, Thai and Arabic are shown too, Arabic
-  right to left.
+- **Language** - English, Italiano, Deutsch, Español, Français, Nederlands,
+  Polski, Português BR, Čeština, Russian, Chinese, Japanese. Titles and tags in
+  Korean, Thai and Arabic are shown too, Arabic right to left.
 - **Remap buttons** - the three media buttons and the two volume buttons, each
   assignable to nothing, play/pause, previous, next, volume up or volume down.
-- **Keyboard layout** - six layouts: English, Italian, German, Spanish, French
-  and Russian.
+- **Keyboard layout** - ten layouts: English, Italian, German, Spanish, French,
+  Dutch, Polish, Brazilian Portuguese, Czech and Russian.
 - **Screenshots** - under More: volume up and the power key save the screen to
   the card.
 - **System** - device, DAC, serial number, card space, OS version, firmware

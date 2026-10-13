@@ -9,6 +9,7 @@
 
 #include "src/system/core/utils.h"
 #include "src/system/db/sqlite3.h"
+#include "src/system/streaming/podcastrss.h"
 
 // Followed podcasts, in an SQLite database: <card>/.local/podcast.db.
 //
@@ -63,6 +64,25 @@ static void add_url_column(sqlite3 *db) {
 	}
 }
 
+// How many episodes the podcast has, for its row in the list: added in place
+// like the address, 0 until the catalogue or the feed says.
+static void add_episodes_column(sqlite3 *db) {
+	sqlite3_stmt *stmt = NULL;
+	bool found = false;
+	if (sqlite3_prepare_v2(db, "PRAGMA table_info(PODCAST_SUBS)", -1, &stmt, NULL) == SQLITE_OK) {
+		while (sqlite3_step(stmt) == SQLITE_ROW) {
+			const char *name = (const char *)sqlite3_column_text(stmt, 1);
+			if (name && strcmp(name, "episodes") == 0) {
+				found = true;
+			}
+		}
+		sqlite3_finalize(stmt);
+	}
+	if (!found) {
+		exec(db, "ALTER TABLE PODCAST_SUBS ADD COLUMN episodes INTEGER DEFAULT 0");
+	}
+}
+
 static sqlite3 *open_db(void) {
 	if (!db_path[0]) {
 		return NULL;
@@ -87,6 +107,8 @@ static sqlite3 *open_db(void) {
 			 "id INTEGER PRIMARY KEY, title TEXT, author TEXT, image TEXT,"
 			 "followed_at INTEGER DEFAULT 0)");
 	add_url_column(db);
+	add_episodes_column(db);
+	exec(db, "CREATE TABLE IF NOT EXISTS PODCAST_RSS(id INTEGER PRIMARY KEY, url TEXT)");
 	return db;
 }
 
@@ -106,7 +128,9 @@ static void save(void) {
 	exec(db, "DELETE FROM PODCAST_SUBS");
 
 	sqlite3_stmt *stmt = NULL;
-	if (sqlite3_prepare_v2(db, "INSERT INTO PODCAST_SUBS(id,title,author,image,followed_at,url) VALUES(?,?,?,?,?,?)",
+	if (sqlite3_prepare_v2(db,
+						   "INSERT INTO PODCAST_SUBS(id,title,author,image,followed_at,url,episodes) "
+						   "VALUES(?,?,?,?,?,?,?)",
 						   -1, &stmt, NULL) == SQLITE_OK) {
 		for (int i = 0; i < subs_count; i++) {
 			sqlite3_bind_int64(stmt, 1, (sqlite3_int64)subs[i].id);
@@ -117,6 +141,7 @@ static void save(void) {
 			// followed and takes the highest number.
 			sqlite3_bind_int(stmt, 5, subs_count - i);
 			sqlite3_bind_text(stmt, 6, subs[i].url, -1, SQLITE_STATIC);
+			sqlite3_bind_int(stmt, 7, subs[i].episode_count);
 			if (sqlite3_step(stmt) != SQLITE_DONE) {
 				fprintf(stderr, "podcastsubs: insert failed: %s\n", sqlite3_errmsg(db));
 			}
@@ -136,8 +161,8 @@ static void load(void) {
 		return;
 	}
 	sqlite3_stmt *stmt = NULL;
-	if (sqlite3_prepare_v2(db, "SELECT id,title,author,image,url FROM PODCAST_SUBS ORDER BY followed_at DESC", -1,
-						   &stmt, NULL) == SQLITE_OK) {
+	if (sqlite3_prepare_v2(db, "SELECT id,title,author,image,url,episodes FROM PODCAST_SUBS ORDER BY followed_at DESC",
+						   -1, &stmt, NULL) == SQLITE_OK) {
 		while (subs_count < PODCASTSUBS_MAX && sqlite3_step(stmt) == SQLITE_ROW) {
 			podcast_feed_t feed = {0};
 			feed.id = (long long)sqlite3_column_int64(stmt, 0);
@@ -152,6 +177,9 @@ static void load(void) {
 			snprintf(feed.author, sizeof(feed.author), "%s", author ? author : "");
 			snprintf(feed.image, sizeof(feed.image), "%s", image ? image : "");
 			snprintf(feed.url, sizeof(feed.url), "%s", url ? url : "");
+			feed.episode_count = sqlite3_column_int(stmt, 5);
+			// A podcast read from its feed is found again by this address.
+			podcastrss_remember(feed.id, feed.url);
 			subs[subs_count++] = feed;
 		}
 		sqlite3_finalize(stmt);
@@ -292,23 +320,36 @@ bool podcastsubs_is_followed(long long feed_id) {
 	return false;
 }
 
-void podcastsubs_follow(const podcast_feed_t *feed) {
-	if (!feed || feed->id <= 0) {
+void podcastsubs_follow(const podcast_feed_t *given) {
+	if (!given || given->id <= 0) {
 		return;
 	}
+	// The player's star follows from the sidecar, which has no address: a
+	// podcast read from its feed this run still has it, and one met in an
+	// earlier run has it kept.
+	podcast_feed_t copy = *given;
+	if (!copy.url[0] && !podcastrss_url_for(copy.id, copy.url, sizeof(copy.url))) {
+		podcastsubs_address(copy.id, copy.url, sizeof(copy.url));
+	}
+	podcastrss_remember(copy.id, copy.url);
+	const podcast_feed_t *feed = &copy;
 
 	// Already followed: refresh the stored entry (the title may have changed)
 	// and move it to the head, which is the order the list is read in. The
-	// player's star follows from the sidecar, which has no feed address, so an
-	// address already known is kept rather than wiped.
+	// player's star follows from the sidecar, which has no feed address and no
+	// count, so what is already known of those is kept rather than wiped.
 	for (int i = 0; i < subs_count; i++) {
 		if (subs[i].id == feed->id) {
 			char url[sizeof(subs[0].url)];
 			snprintf(url, sizeof(url), "%s", subs[i].url);
+			int episodes = subs[i].episode_count;
 			memmove(&subs[1], &subs[0], sizeof(subs[0]) * (size_t)i);
 			subs[0] = *feed;
 			if (!subs[0].url[0]) {
 				snprintf(subs[0].url, sizeof(subs[0].url), "%s", url);
+			}
+			if (subs[0].episode_count <= 0) {
+				subs[0].episode_count = episodes;
 			}
 			save();
 			return;
@@ -331,6 +372,11 @@ void podcastsubs_unfollow(long long feed_id) {
 		if (subs[i].id != feed_id) {
 			continue;
 		}
+		// Its episodes may still be on the card or half heard: the podcast must
+		// stay reachable from them.
+		if (podcastrss_is_id(feed_id)) {
+			podcastsubs_keep_address(feed_id, subs[i].url);
+		}
 		memmove(&subs[i], &subs[i + 1], sizeof(subs[0]) * (size_t)(subs_count - i - 1));
 		subs_count--;
 		save();
@@ -350,6 +396,7 @@ int podcastsubs_follow_batch(const podcast_feed_t *feeds, int count) {
 		if (feed->id <= 0 || podcastsubs_is_followed(feed->id)) {
 			continue;
 		}
+		podcastrss_remember(feed->id, feed->url);
 		memmove(&subs[1], &subs[0], sizeof(subs[0]) * (size_t)subs_count);
 		subs[0] = *feed;
 		subs_count++;
@@ -396,4 +443,100 @@ bool podcastsubs_is_followed_url(const char *url) {
 		}
 	}
 	return false;
+}
+
+void podcastsubs_update(const podcast_feed_t *feed) {
+	if (!feed || feed->id <= 0) {
+		return;
+	}
+	for (int i = 0; i < subs_count; i++) {
+		if (subs[i].id != feed->id) {
+			continue;
+		}
+		bool changed = false;
+		if (!subs[i].url[0] && feed->url[0]) {
+			snprintf(subs[i].url, sizeof(subs[i].url), "%s", feed->url);
+			changed = true;
+		}
+		if (feed->episode_count > 0 && subs[i].episode_count != feed->episode_count) {
+			subs[i].episode_count = feed->episode_count;
+			changed = true;
+		}
+		if (!subs[i].author[0] && feed->author[0]) {
+			snprintf(subs[i].author, sizeof(subs[i].author), "%s", feed->author);
+			changed = true;
+		}
+		if (!subs[i].image[0] && feed->image[0]) {
+			snprintf(subs[i].image, sizeof(subs[i].image), "%s", feed->image);
+			changed = true;
+		}
+		if (changed) {
+			save();
+		}
+		return;
+	}
+}
+
+int podcastsubs_missing_details(long long *ids_out, int max) {
+	int n = 0;
+	for (int i = 0; i < subs_count && n < max; i++) {
+		if (!subs[i].url[0] || subs[i].episode_count <= 0) {
+			ids_out[n++] = subs[i].id;
+		}
+	}
+	return n;
+}
+
+void podcastsubs_keep_address(long long feed_id, const char *url) {
+	if (!podcastrss_is_id(feed_id) || !url || !url[0]) {
+		return;
+	}
+	sqlite3 *db = open_db();
+	if (!db) {
+		return;
+	}
+	sqlite3_busy_timeout(db, 1000);
+	sqlite3_stmt *stmt = NULL;
+	if (sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO PODCAST_RSS(id,url) VALUES(?,?)", -1, &stmt, NULL) ==
+		SQLITE_OK) {
+		sqlite3_bind_int64(stmt, 1, (sqlite3_int64)feed_id);
+		sqlite3_bind_text(stmt, 2, url, -1, SQLITE_STATIC);
+		if (sqlite3_step(stmt) != SQLITE_DONE) {
+			fprintf(stderr, "podcastsubs: cannot keep a feed address: %s\n", sqlite3_errmsg(db));
+		}
+		sqlite3_finalize(stmt);
+	}
+	sqlite3_close(db);
+}
+
+bool podcastsubs_address(long long feed_id, char *out, size_t size) {
+	if (!out || size == 0) {
+		return false;
+	}
+	out[0] = '\0';
+	for (int i = 0; i < subs_count; i++) {
+		if (subs[i].id == feed_id && subs[i].url[0]) {
+			snprintf(out, size, "%s", subs[i].url);
+			return true;
+		}
+	}
+	if (!podcastrss_is_id(feed_id)) {
+		return false;
+	}
+	sqlite3 *db = open_db();
+	if (!db) {
+		return false;
+	}
+	sqlite3_busy_timeout(db, 1000);
+	sqlite3_stmt *stmt = NULL;
+	if (sqlite3_prepare_v2(db, "SELECT url FROM PODCAST_RSS WHERE id=?", -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_int64(stmt, 1, (sqlite3_int64)feed_id);
+		if (sqlite3_step(stmt) == SQLITE_ROW) {
+			const char *url = (const char *)sqlite3_column_text(stmt, 0);
+			snprintf(out, size, "%s", url ? url : "");
+		}
+		sqlite3_finalize(stmt);
+	}
+	sqlite3_close(db);
+	return out[0] != '\0';
 }

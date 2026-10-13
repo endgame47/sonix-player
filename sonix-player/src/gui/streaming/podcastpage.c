@@ -23,6 +23,7 @@
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/spinner.h"
 #include "src/gui/shell/switcher.h"
+#include "src/gui/shell/tabbar.h"
 #include "src/gui/shell/theme.h"
 #include "src/gui/wireless/wifisettings.h"
 #include "src/system/decode/growfile.h"
@@ -98,14 +99,15 @@ static lv_obj_t *busy_label;
 static lv_obj_t *search_btn;
 static lv_obj_t *settings_btn;
 
-// The three pills at the top -- the followed podcasts, the ones on the card and
+// The three tabs at the top -- the followed podcasts, the ones on the card and
 // the chart -- and the row that holds them. Shown only while one of the lists
 // they name is underneath: on search results they would not be telling the
 // truth, because what is on screen is none of them.
 static lv_obj_t *pill_row;
-static lv_obj_t *pill_followed;
-static lv_obj_t *pill_card;
-static lv_obj_t *pill_trending;
+static tabbar_t section_tabs;
+#define TAB_FOLLOWED 0
+#define TAB_CARD 1
+#define TAB_TRENDING 2
 
 // Without a network, or without the keys, the line that says so above the
 // podcasts on the card -- which are all that can be listened to then.
@@ -216,6 +218,7 @@ static bool refresh_notes(void);
 static void refresh_corner_buttons(void);
 static bool network_up(void);
 static void paint_pill(lv_obj_t *btn, bool on);
+static void refresh_section_tabs(void);
 static void row_clicked_cb(lv_event_t *e);
 static bool job_is_list(job_kind_t kind);
 static void list_nav_drop(void);
@@ -1055,6 +1058,9 @@ static void format_duration(int seconds, char *out, size_t size) {
 		return;
 	}
 	int minutes = (seconds + 30) / 60;
+	if (minutes < 1) {
+		minutes = 1;
+	}
 	if (minutes < 60) {
 		snprintf(out, size, "%d min", minutes);
 	} else {
@@ -1160,9 +1166,7 @@ static void fill_list(int from) {
 	// The magnifier and the gear belong to the SECTION, not to what is inside
 	// it: on search results they go away together with the pills.
 	refresh_corner_buttons();
-	paint_pill(pill_followed, list_kind == JOB_FOLLOWED);
-	paint_pill(pill_card, list_kind == JOB_CARD);
-	paint_pill(pill_trending, list_kind == JOB_TRENDING);
+	refresh_section_tabs();
 	if (list_title) {
 		lv_label_set_text(list_title, home_view ? tr("podcasts") : result_title);
 	}
@@ -1407,6 +1411,7 @@ static void maybe_load_more(void) {
 static pthread_mutex_t fetch_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t fetch_ready = PTHREAD_COND_INITIALIZER;
 static long long fetch_want_id;
+static long long fetch_want_feed; // its podcast, from the sidecar: what a feed read directly needs
 static bool fetch_started;
 static bool waiting_for_episode;
 
@@ -1511,8 +1516,14 @@ static void prefetch_urgent(const char *wanted_path) {
 
 	podcastcache_set_network_wanted(true);
 
+	long long feed = 0;
+	if (wanted_path) {
+		podcastcache_feed_id(wanted_path, &feed);
+	}
+
 	pthread_mutex_lock(&fetch_lock);
 	fetch_want_id = wanted;
+	fetch_want_feed = feed;
 	pthread_cond_broadcast(&fetch_ready);
 	pthread_mutex_unlock(&fetch_lock);
 }
@@ -1546,6 +1557,7 @@ static void *fetch_main(void *arg) {
 			pthread_cond_wait(&fetch_ready, &fetch_lock);
 		}
 		long long id = fetch_want_id;
+		long long feed = fetch_want_feed;
 		pthread_mutex_unlock(&fetch_lock);
 
 		podcast_episode_t episode;
@@ -1566,7 +1578,7 @@ static void *fetch_main(void *arg) {
 		// on the next episode. One catalogue request by id settles it.
 		if (!known) {
 			fprintf(stderr, "podcast: %lld is not in the list we know, asking the catalogue\n", id);
-			if (!podcast_episode(id, &episode)) {
+			if (!podcast_episode_in_feed(feed, id, &episode)) {
 				fprintf(stderr, "podcast: %lld not found there either: %s\n", id, podcast_last_error());
 				pthread_mutex_lock(&fetch_lock);
 				if (fetch_want_id == id) {
@@ -2015,7 +2027,7 @@ static void *worker_main(void *arg) {
 			}
 			if (index < 0) {
 				podcast_episode_t one;
-				if (!podcast_episode(job.id, &one)) {
+				if (!podcast_episode_in_feed(job.feed, job.id, &one)) {
 					snprintf(result_error, sizeof(result_error), "%s", podcast_last_error());
 					break;
 				}
@@ -2461,21 +2473,12 @@ void podcastpage_hero_release(void) { qobuzart_release(&podcast_art_owner, HERO_
 
 static void pill_clicked_cb(lv_event_t *e);
 
-static lv_obj_t *make_pill(lv_obj_t *parent, const char *text, job_kind_t kind) {
-	lv_obj_t *btn = lv_btn_create(parent);
-	lv_obj_set_size(btn, LV_SIZE_CONTENT, 52);
-	lv_obj_set_style_pad_hor(btn, 18, 0);
-	lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0); // Adwaita-style pill
-	lv_obj_set_style_shadow_width(btn, 0, 0);
-	lv_obj_set_style_border_width(btn, 0, 0);
-	lv_obj_add_event_cb(btn, pill_clicked_cb, LV_EVENT_CLICKED, (void *)(intptr_t)kind);
-
-	lv_obj_t *label = lv_label_create(btn);
-	lv_label_set_text(label, tr(text));
-	lv_obj_set_style_text_font(label, &font_ui_20, 0);
-	lv_obj_center(label);
-
-	return btn;
+static void refresh_section_tabs(void) {
+	int active = list_kind == JOB_FOLLOWED ? TAB_FOLLOWED
+				 : list_kind == JOB_CARD   ? TAB_CARD
+				 : list_kind == JOB_TRENDING ? TAB_TRENDING
+											 : -1;
+	tabbar_set_active(&section_tabs, active);
 }
 
 static void paint_pill(lv_obj_t *btn, bool on) {
@@ -2484,7 +2487,6 @@ static void paint_pill(lv_obj_t *btn, bool on) {
 	}
 	lv_obj_set_style_bg_color(btn, on ? theme()->accent : theme()->surface_pressed, 0);
 	lv_obj_set_style_text_color(lv_obj_get_child(btn, 0), on ? lv_color_white() : theme()->text_primary, 0);
-	// Greyed while it cannot be used: the two pills that need the network.
 	lv_obj_set_style_opa(btn, lv_obj_has_state(btn, LV_STATE_DISABLED) ? LV_OPA_40 : LV_OPA_COVER, 0);
 }
 
@@ -2517,12 +2519,10 @@ static void refresh_corner_buttons(void) {
 	}
 }
 
-// The pill colours are set by hand, so a theme change does not touch them on
-// its own: without this repaint the lit pill keeps the previous accent.
+// The tab colours are set by hand, so a theme change does not touch them on
+// its own: without this repaint the lit tab keeps the previous accent.
 static void refresh_pills(void) {
-	paint_pill(pill_followed, list_kind == JOB_FOLLOWED);
-	paint_pill(pill_card, list_kind == JOB_CARD);
-	paint_pill(pill_trending, list_kind == JOB_TRENDING);
+	refresh_section_tabs();
 	for (int k = 0; k < LISTEN_ROWS; k++) {
 		if (listen[k].bar) {
 			lv_obj_set_style_bg_color(listen[k].bar, theme()->accent, LV_PART_INDICATOR);
@@ -2577,6 +2577,9 @@ static void build_offline_banner(lv_obj_t *column, gui_config_t *cfg) {
 // ---------------------------------------------------------------------------
 
 #define LISTEN_ROW_HEIGHT 96
+// Between the block and the rows: wider than the gap between two rows, so the
+// list of podcasts reads as starting there.
+#define TOP_BLOCK_GAP (ROW_GAP + 18)
 
 // The episode the first row shows: "" while it is hidden.
 static char listen_now_path[512];
@@ -2684,7 +2687,7 @@ static void place_list_body(void) {
 	int y = 0;
 	if (any) {
 		lv_obj_update_layout(top_block);
-		y = lv_obj_get_height(top_block) + ROW_GAP;
+		y = lv_obj_get_height(top_block) + TOP_BLOCK_GAP;
 	}
 	if (lv_obj_get_y(list_body) != y) {
 		lv_obj_set_y(list_body, y);
@@ -2994,7 +2997,8 @@ static void refresh_card_empty(void) {
 	lv_obj_set_hidden(card_empty, !show);
 }
 
-// The line about the network, and which pills can be used.
+// The line about the network, and which tabs can be used: the two that need
+// the network are greyed without it.
 static void refresh_offline(void) {
 	if (!offline_banner) {
 		return;
@@ -3003,12 +3007,12 @@ static void refresh_offline(void) {
 		lv_label_set_text(offline_label,
 						  tr(podcast_configured() ? "podcast_offline_no_wifi" : "podcast_offline_no_keys"));
 		lv_obj_set_hidden(offline_banner, false);
-		lv_obj_add_state(pill_followed, LV_STATE_DISABLED);
-		lv_obj_add_state(pill_trending, LV_STATE_DISABLED);
+		tabbar_set_enabled(&section_tabs, TAB_FOLLOWED, false);
+		tabbar_set_enabled(&section_tabs, TAB_TRENDING, false);
 	} else {
 		lv_obj_set_hidden(offline_banner, true);
-		lv_obj_remove_state(pill_followed, LV_STATE_DISABLED);
-		lv_obj_remove_state(pill_trending, LV_STATE_DISABLED);
+		tabbar_set_enabled(&section_tabs, TAB_FOLLOWED, true);
+		tabbar_set_enabled(&section_tabs, TAB_TRENDING, true);
 	}
 	refresh_pills();
 }
@@ -3050,18 +3054,15 @@ static void build_page(gui_config_t *cfg) {
 	lv_obj_set_style_border_width(pill_row, 0, 0);
 	lv_obj_set_style_pad_ver(pill_row, 0, 0);
 	lv_obj_set_style_pad_hor(pill_row, cfg->padding, 0);
-	lv_obj_set_style_pad_gap(pill_row, 10, 0);
-	// Sideways when a language's three names do not fit the width.
-	lv_obj_set_scroll_dir(pill_row, LV_DIR_HOR);
-	lv_obj_set_scrollbar_mode(pill_row, LV_SCROLLBAR_MODE_OFF);
-	lv_obj_set_flex_flow(pill_row, LV_FLEX_FLOW_ROW);
-	// Presses that miss a pill belong to the column below, which carries the
+	lv_obj_set_scrollable(pill_row, false);
+	// Presses that miss a tab belong to the column below, which carries the
 	// swipe-back and the player sheet.
 	lv_obj_set_event_bubble(pill_row, true);
 
-	pill_followed = make_pill(pill_row, "podcast_pill_followed", JOB_FOLLOWED);
-	pill_card = make_pill(pill_row, "podcast_pill_card", JOB_CARD);
-	pill_trending = make_pill(pill_row, "podcast_pill_trending", JOB_TRENDING);
+	tabbar_create(&section_tabs, pill_row);
+	tabbar_add(&section_tabs, "podcast_pill_followed", pill_clicked_cb, (void *)(intptr_t)JOB_FOLLOWED);
+	tabbar_add(&section_tabs, "podcast_pill_card", pill_clicked_cb, (void *)(intptr_t)JOB_CARD);
+	tabbar_add(&section_tabs, "podcast_pill_trending", pill_clicked_cb, (void *)(intptr_t)JOB_TRENDING);
 
 	build_offline_banner(column, cfg);
 	refresh_pills();
@@ -3205,7 +3206,7 @@ static void build_search_page(gui_config_t *cfg) {
 
 	search_field = lv_textarea_create(search_screen);
 	lv_textarea_set_one_line(search_field, true);
-	lv_textarea_set_placeholder_text(search_field, tr("podcast_name"));
+	lv_textarea_set_placeholder_text(search_field, tr("podcast_name_or_address"));
 	lv_obj_set_size(search_field, cfg->screen_width - 2 * cfg->padding, 62);
 	lv_obj_set_scrollbar_mode(search_field, LV_SCROLLBAR_MODE_OFF);
 	lv_obj_align(search_field, LV_ALIGN_TOP_LEFT, cfg->padding, top);
@@ -3814,44 +3815,81 @@ void podcastpage_open_followed(void) {
 }
 
 // ---------------------------------------------------------------------------
-// the feed addresses of podcasts followed before they were kept
+// the feed addresses and episode counts of followed podcasts
 //
 // Asked of the catalogue once per run, in the background, the first time the
-// page opens with a network: one request per podcast missing it.
+// page opens with a network: one request per podcast missing either. The
+// player's star follows with neither, and a list kept before they were has
+// none at all.
 // ---------------------------------------------------------------------------
-
-typedef struct {
-	long long id;
-	char url[PODCAST_FEED_URL_MAX];
-} backfill_t;
 
 static bool backfill_done;
 
 static void backfill_apply_cb(void *user) {
-	backfill_t *b = user;
-	podcastsubs_set_url(b->id, b->url);
-	free(b);
+	podcast_feed_t *feed = user;
+	podcastsubs_update(feed);
+	free(feed);
+}
+
+// The followed list on screen takes the counts and authors in at the end, all
+// at once and in place: the rows keep their covers and the list where it was
+// scrolled.
+static void backfill_finished_cb(void *user) {
+	(void)user;
+	if (list_kind != JOB_FOLLOWED) {
+		return;
+	}
+	pthread_mutex_lock(&job_lock);
+	bool busy = have_pending || result_pending;
+	pthread_mutex_unlock(&job_lock);
+	if (busy || inflight_valid) {
+		return;
+	}
+	podcast_feed_t *subs = malloc(sizeof(*subs) * PODCASTSUBS_MAX);
+	if (!subs) {
+		return;
+	}
+	int n = podcastsubs_list(subs, PODCASTSUBS_MAX);
+	for (int i = 0; i < list_count; i++) {
+		for (int k = 0; k < n; k++) {
+			if (subs[k].id == result_feeds[i].id) {
+				result_feeds[i].episode_count = subs[k].episode_count;
+				snprintf(result_feeds[i].author, sizeof(result_feeds[i].author), "%s", subs[k].author);
+				break;
+			}
+		}
+	}
+	free(subs);
+	for (int i = 0; i < ROW_POOL; i++) {
+		rows[i].index = -2;
+	}
+	window_update();
 }
 
 static void *backfill_main(void *arg) {
 	long long *ids = arg;
 	thread_be_background("podcast urls");
+	bool any = false;
 	for (int i = 0; ids[i] > 0; i++) {
-		podcast_feed_t feed;
-		if (!podcast_feed(ids[i], &feed) || !feed.url[0]) {
-			continue;
-		}
-		backfill_t *b = calloc(1, sizeof(*b));
-		if (!b) {
+		podcast_feed_t *feed = calloc(1, sizeof(*feed));
+		if (!feed) {
 			break;
 		}
-		b->id = ids[i];
-		snprintf(b->url, sizeof(b->url), "%s", feed.url);
-		if (!gui_post(backfill_apply_cb, b)) {
-			free(b);
+		if (!podcast_feed(ids[i], feed) || (!feed->url[0] && feed->episode_count <= 0)) {
+			free(feed);
+			continue;
+		}
+		feed->id = ids[i];
+		if (gui_post(backfill_apply_cb, feed)) {
+			any = true;
+		} else {
+			free(feed);
 		}
 	}
 	free(ids);
+	if (any) {
+		gui_post(backfill_finished_cb, NULL);
+	}
 	return NULL;
 }
 
@@ -3864,7 +3902,7 @@ static void backfill_start(void) {
 	if (!ids) {
 		return;
 	}
-	int n = podcastsubs_missing_urls(ids, PODCASTSUBS_MAX);
+	int n = podcastsubs_missing_details(ids, PODCASTSUBS_MAX);
 	if (n == 0) {
 		free(ids);
 		return;

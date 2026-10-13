@@ -292,6 +292,19 @@ void sync_battery_from_sysfs(void) {
 
 char *read_battery_percent() { return battery_cache; }
 
+int read_battery_millivolts(void) {
+	if (g_battery_cfg && g_battery_cfg->battery_capacity_file) {
+		return -1;
+	}
+	char text[24];
+	if (!battery_source[0] || !read_sysfs_line(POWER_SUPPLY_DIR, battery_source, "voltage_now", text, sizeof(text)) ||
+		text[0] < '0' || text[0] > '9') {
+		return -1;
+	}
+	long microvolts = atol(text);
+	return microvolts > 0 ? (int)(microvolts / 1000) : -1;
+}
+
 // Set while something has deliberately stopped the charger -- DAC mode with
 // charging switched off. The hardware may still report a healthy charger on
 // the other end of the cable; what the user is told has to follow the choice

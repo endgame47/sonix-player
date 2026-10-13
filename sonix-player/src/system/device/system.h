@@ -47,6 +47,10 @@ char *read_battery_percent();
 // True while the charger is plugged in (sysfs status "Charging" or "Full").
 bool read_battery_charging(void);
 
+// The cell's voltage in millivolts, from the supply the level is read from, or
+// -1 when that supply does not say.
+int read_battery_millivolts(void);
+
 // Hides the charging indication (battery icon, status LED) while something has
 // deliberately turned the charger off -- DAC mode with charging disabled.
 void system_suppress_charging(bool suppressed);

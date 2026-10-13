@@ -21,6 +21,7 @@
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/spinner.h"
 #include "src/gui/shell/switcher.h"
+#include "src/gui/shell/tabbar.h"
 #include "src/gui/shell/theme.h"
 #include "src/gui/shell/toast.h"
 #include "src/gui/streaming/podcastpage.h"
@@ -431,8 +432,7 @@ typedef struct {
 	lv_obj_t *detail;
 	lv_obj_t *bar;
 	lv_obj_t *menu_btn;
-	lv_obj_t *mark; // while choosing, in the status's place: the tick on a chosen row,
-	lv_obj_t *ring; // and an empty ring on the others
+	lv_obj_t *mark; // the tick on a chosen row while choosing, where the three dots are
 	int index; // into shown[]; -1 for none, -2 to force a rebind
 } ep_row_t;
 
@@ -449,7 +449,7 @@ typedef struct {
 	lv_obj_t *hero_left; // the card's: how many, or how long, still to hear
 	lv_obj_t *resume_btn;
 	lv_obj_t *online_row; // the card's: the same podcast in the catalogue
-	lv_obj_t *filter_pills[3];
+	tabbar_t filters;
 	lv_obj_t *body;
 	lv_obj_t *more_spinner; // the catalogue's: the next step coming
 	lv_obj_t *loader;		// the catalogue's: the first step coming
@@ -735,8 +735,18 @@ static void titles_done_cb(void *user) {
 typedef struct {
 	unsigned generation;
 	int count;
-	char **paths; // copies: the array may be rebuilt meanwhile
+	char **paths;	 // copies: the array may be rebuilt meanwhile
+	uint8_t *stateless; // per path: no state was found under the file
 } titles_job_t;
+
+static void titles_job_free(titles_job_t *job) {
+	for (int i = 0; i < job->count; i++) {
+		free(job->paths[i]);
+	}
+	free(job->paths);
+	free(job->stateless);
+	free(job);
+}
 
 static void *titles_main(void *arg) {
 	titles_job_t *job = arg;
@@ -748,6 +758,11 @@ static void *titles_main(void *arg) {
 		pthread_mutex_unlock(&titles_lock);
 		if (stale) {
 			break;
+		}
+		// A download whose episode was played before it was saved: its state
+		// still names the other file. Once it names this one the page redraws.
+		if (job->stateless[i]) {
+			podcaststate_downloaded(podcastcache_episode_id(job->paths[i]), job->paths[i]);
 		}
 		char title[PODCAST_TITLE_MAX] = "";
 		if (!podcastcache_tag(job->paths[i], "title", title, sizeof(title))) {
@@ -774,12 +789,16 @@ static void *titles_main(void *arg) {
 	}
 	free(m);
 	gui_post(titles_done_cb, (void *)(uintptr_t)job->generation);
-	for (int i = 0; i < job->count; i++) {
-		free(job->paths[i]);
-	}
-	free(job->paths);
-	free(job);
+	titles_job_free(job);
 	return NULL;
+}
+
+static void titles_job_add(titles_job_t *job, const episode_t *e) {
+	job->paths[job->count] = strdup(e->path);
+	if (job->paths[job->count]) {
+		job->stateless[job->count] = e->touched == 0;
+		job->count++;
+	}
 }
 
 static void titles_start(void) {
@@ -789,8 +808,9 @@ static void titles_start(void) {
 		return;
 	}
 	job->paths = calloc((size_t)(p->count > 0 ? p->count : 1), sizeof(char *));
-	if (!job->paths) {
-		free(job);
+	job->stateless = calloc((size_t)(p->count > 0 ? p->count : 1), 1);
+	if (!job->paths || !job->stateless) {
+		titles_job_free(job);
 		return;
 	}
 	// A reader still at work on an older list notices the generation has moved
@@ -800,10 +820,7 @@ static void titles_start(void) {
 	pthread_mutex_unlock(&titles_lock);
 	// The order shown, so the rows on screen get their titles first.
 	for (int k = 0; k < p->shown_count; k++) {
-		job->paths[job->count] = strdup(p->episodes[p->shown[k]].path);
-		if (job->paths[job->count]) {
-			job->count++;
-		}
+		titles_job_add(job, &p->episodes[p->shown[k]]);
 	}
 	for (int i = 0; i < p->count; i++) {
 		bool listed = false;
@@ -811,21 +828,14 @@ static void titles_start(void) {
 			listed = p->shown[k] == i;
 		}
 		if (!listed) {
-			job->paths[job->count] = strdup(p->episodes[i].path);
-			if (job->paths[job->count]) {
-				job->count++;
-			}
+			titles_job_add(job, &p->episodes[i]);
 		}
 	}
 	pthread_t thread;
 	if (pthread_create(&thread, NULL, titles_main, job) == 0) {
 		pthread_detach(thread);
 	} else {
-		for (int i = 0; i < job->count; i++) {
-			free(job->paths[i]);
-		}
-		free(job->paths);
-		free(job);
+		titles_job_free(job);
 	}
 }
 
@@ -884,21 +894,15 @@ static void episode_detail(const episode_t *e, char *out, size_t size) {
 // the page
 // ---------------------------------------------------------------------------
 
-// While choosing, the episode's status gives way to a tick or an empty ring,
-// on the left where the round button in the corner cannot cover it, and the
-// three dots go.
+// While choosing, the three dots go and a chosen row has the tick in their
+// place, as on the library lists.
 static void row_paint_choice(page_t *p, ep_row_t *row) {
 	int index = row->index;
 	bool on = p->selecting && index >= 0 && index < p->shown_count && p->chosen[p->shown[index]];
-	if (p->selecting) {
-		lv_obj_set_hidden(row->dot, true);
-		lv_obj_set_hidden(row->arc, true);
-		lv_obj_set_hidden(row->check, true);
+	if (on) {
 		lv_obj_set_style_image_recolor(row->mark, theme()->accent, 0);
-		lv_obj_set_style_border_color(row->ring, theme()->text_primary, 0);
 	}
 	lv_obj_set_hidden(row->mark, !on);
-	lv_obj_set_hidden(row->ring, !p->selecting || on);
 	lv_obj_set_hidden(row->menu_btn, p->selecting);
 }
 
@@ -1006,20 +1010,18 @@ static int count_heard(const page_t *p, bool heard_ones) {
 static void paint_pills(page_t *p) {
 	const char *const TAGS[3] = {"podcast_filter_unheard", "podcast_filter_all", "podcast_filter_heard"};
 	const int counts[3] = {count_heard(p, false), p->count, count_heard(p, true)};
-	for (int i = 0; i < 3; i++) {
-		if (!p->filter_pills[i]) {
-			continue;
-		}
-		lv_obj_t *label = lv_obj_get_child(p->filter_pills[i], 0);
+	for (int i = 0; i < p->filters.count; i++) {
 		// The catalogue's list arrives a step at a time: a count would be the
 		// count of what has arrived so far.
+		char text[96];
 		if (p->feed) {
-			lv_label_set_text(label, tr(TAGS[i]));
+			snprintf(text, sizeof(text), "%s", tr(TAGS[i]));
 		} else {
-			lv_label_set_text_fmt(label, "%s  %d", tr(TAGS[i]), counts[i]);
+			snprintf(text, sizeof(text), "%s %d", tr(TAGS[i]), counts[i]);
 		}
-		settingsrow_pill_active(p->filter_pills[i], (int)p->filter == i);
+		tabbar_set_text(&p->filters, i, text);
 	}
+	tabbar_set_active(&p->filters, (int)p->filter);
 }
 
 static void refresh_counts_card(page_t *p) {
@@ -1538,7 +1540,9 @@ static void selection_show(page_t *p) {
 	if (p->selecting) {
 		lv_obj_move_foreground(p->sel_action_btn);
 	}
-	// Drawn again: leaving the mode puts each row's status back.
+	// Room under the last row while the round button is up, so that row can be
+	// scrolled clear of it.
+	lv_obj_set_style_pad_bottom(p->page, p->selecting ? g_cfg->padding + SEL_FAB_SIZE + 12 : g_cfg->padding, 0);
 	rows_invalidate(p);
 	window_update(p);
 }
@@ -1744,6 +1748,8 @@ void podcastcard_feed_loaded(unsigned ticket, int count, const char *error, cons
 		if (info->episode_count > 0) {
 			open_feed.episode_count = info->episode_count;
 		}
+		// A followed podcast's row in the list says the same.
+		podcastsubs_update(&open_feed);
 		if (!open_feed.title[0] && info->title[0]) {
 			snprintf(open_feed.title, sizeof(open_feed.title), "%s", info->title);
 			lv_label_set_text(p->page_title, open_feed.title);
@@ -1782,7 +1788,7 @@ void podcastcard_open_feed(const podcast_feed_t *feed) {
 		}
 		lv_label_set_text(p->page_title, open_feed.title[0] ? open_feed.title : tr("podcasts"));
 		podcastpage_set_browsing(&open_feed);
-		feed_request(PODCASTPAGE_FEED_STEP, !open_feed.author[0] || !open_feed.image[0]);
+		feed_request(PODCASTPAGE_FEED_STEP, !open_feed.author[0] || !open_feed.image[0] || open_feed.episode_count <= 0);
 		refill(p, false);
 	} else {
 		// The same podcast again: whatever this record knows that the page
@@ -1813,8 +1819,8 @@ static void filter_cb(lv_event_t *e) {
 	if (switcher_back_drag_active()) {
 		return;
 	}
-	lv_obj_t *pill = lv_event_get_current_target(e);
-	page_t *p = lv_obj_get_parent(lv_obj_get_parent(pill)) == card_page.page ? &card_page : &feed_page;
+	lv_obj_t *tab = lv_event_get_current_target(e);
+	page_t *p = lv_obj_get_parent(tab) == card_page.filters.bar ? &card_page : &feed_page;
 	p->filter = (filter_t)(intptr_t)lv_event_get_user_data(e);
 	refill(p, false);
 	if (!p->feed) {
@@ -1911,23 +1917,6 @@ static void build_rows(page_t *p, int width) {
 		lv_obj_set_clickable(row->arc, false);
 		lv_obj_set_event_bubble(row->arc, true);
 
-		row->ring = lv_obj_create(status);
-		lv_obj_remove_style_all(row->ring);
-		lv_obj_set_size(row->ring, 24, 24);
-		lv_obj_set_style_radius(row->ring, LV_RADIUS_CIRCLE, 0);
-		lv_obj_set_style_border_width(row->ring, 2, 0);
-		lv_obj_set_style_border_opa(row->ring, LV_OPA_50, 0);
-		lv_obj_center(row->ring);
-		lv_obj_set_event_bubble(row->ring, true);
-		lv_obj_set_hidden(row->ring, true);
-
-		row->mark = lv_image_create(status);
-		lv_image_set_src(row->mark, &icon_check_small);
-		lv_obj_set_style_image_recolor_opa(row->mark, LV_OPA_COVER, 0);
-		lv_obj_center(row->mark);
-		lv_obj_set_event_bubble(row->mark, true);
-		lv_obj_set_hidden(row->mark, true);
-
 		row->check = lv_image_create(status);
 		lv_image_set_src(row->check, &icon_check_small);
 		lv_obj_set_style_image_recolor(row->check, lv_color_hex(0x57c26a), 0);
@@ -1980,6 +1969,15 @@ static void build_rows(page_t *p, int width) {
 		lv_obj_add_style(dots, &theme_style_icon, 0);
 		lv_obj_set_style_image_recolor_opa(dots, LV_OPA_COVER, 0);
 		lv_obj_center(dots);
+
+		row->mark = lv_image_create(row->button);
+		lv_image_set_src(row->mark, &icon_check);
+		lv_obj_add_style(row->mark, &theme_style_icon, 0);
+		lv_obj_set_style_image_recolor_opa(row->mark, LV_OPA_COVER, 0);
+		lv_obj_set_style_margin_right(row->mark, 6, 0);
+		lv_obj_set_clickable(row->mark, false);
+		lv_obj_set_event_bubble(row->mark, true);
+		lv_obj_set_hidden(row->mark, true);
 
 
 		row->index = -1;
@@ -2075,7 +2073,7 @@ static void feed_loaded_cb(lv_event_t *e) {
 	(void)e;
 	page_t *p = &feed_page;
 	if (!feed_loaded && !feed_loading && open_feed.id > 0) {
-		feed_request(PODCASTPAGE_FEED_STEP, !open_feed.author[0] || !open_feed.image[0]);
+		feed_request(PODCASTPAGE_FEED_STEP, !open_feed.author[0] || !open_feed.image[0] || open_feed.episode_count <= 0);
 		refill(p, false);
 		return;
 	}
@@ -2103,22 +2101,6 @@ void podcastcard_open(const podcastcard_show_t *show) {
 		card_hero_load();
 	}
 	switch_screen(podcastcard_screen);
-}
-
-static lv_obj_t *make_filter_pill(page_t *p, lv_obj_t *parent, filter_t which) {
-	(void)p;
-	lv_obj_t *btn = lv_btn_create(parent);
-	lv_obj_set_size(btn, LV_SIZE_CONTENT, 48);
-	lv_obj_set_style_pad_hor(btn, 16, 0);
-	lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0);
-	lv_obj_set_style_shadow_width(btn, 0, 0);
-	lv_obj_set_style_border_width(btn, 0, 0);
-	lv_obj_add_event_cb(btn, filter_cb, LV_EVENT_CLICKED, (void *)(intptr_t)which);
-	lv_obj_t *label = lv_label_create(btn);
-	lv_label_set_text(label, "");
-	lv_obj_set_style_text_font(label, &font_ui_20, 0);
-	lv_obj_center(label);
-	return btn;
 }
 
 static void build_page(page_t *p, gui_config_t *cfg) {
@@ -2258,17 +2240,11 @@ static void build_page(page_t *p, gui_config_t *cfg) {
 		lv_obj_set_hidden(p->online_row, true);
 	}
 
-	lv_obj_t *pills = lv_obj_create(p->page);
-	lv_obj_remove_style_all(pills);
-	lv_obj_set_size(pills, width, LV_SIZE_CONTENT);
-	lv_obj_set_style_pad_column(pills, 8, 0);
-	lv_obj_set_event_bubble(pills, true);
-	lv_obj_set_scroll_dir(pills, LV_DIR_HOR);
-	lv_obj_set_scrollbar_mode(pills, LV_SCROLLBAR_MODE_OFF);
-	lv_obj_set_flex_flow(pills, LV_FLEX_FLOW_ROW);
-	p->filter_pills[0] = make_filter_pill(p, pills, FILTER_UNHEARD);
-	p->filter_pills[1] = make_filter_pill(p, pills, FILTER_ALL);
-	p->filter_pills[2] = make_filter_pill(p, pills, FILTER_HEARD);
+	tabbar_create(&p->filters, p->page);
+	lv_obj_set_width(p->filters.bar, width);
+	tabbar_add(&p->filters, "podcast_filter_unheard", filter_cb, (void *)(intptr_t)FILTER_UNHEARD);
+	tabbar_add(&p->filters, "podcast_filter_all", filter_cb, (void *)(intptr_t)FILTER_ALL);
+	tabbar_add(&p->filters, "podcast_filter_heard", filter_cb, (void *)(intptr_t)FILTER_HEARD);
 
 	// The rows slide over this, which is exactly as tall as the list.
 	p->body = lv_obj_create(p->page);

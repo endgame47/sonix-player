@@ -1239,6 +1239,8 @@ static void show_if(lv_obj_t *obj, bool show) {
 	}
 }
 
+static void window_update(panel_t *p);
+
 // Selection mode's buttons, four on every list: the queue first, close last,
 // and in between what fits the list. A playlist trades "add to a playlist" for
 // "take out of this one", the favourites trade the star for its removal.
@@ -1252,8 +1254,21 @@ static void sel_buttons_show(panel_t *p, bool on) {
 	show_if(p->sel_unlist_btn, on && playlist);
 	show_if(p->sel_close_btn, on);
 	if (p->sel_delete_btn) {
-		show_if(p->sel_delete_btn, on && allow_delete && !p->from_paths);
+		bool bin = on && allow_delete && !p->from_paths;
+		show_if(p->sel_delete_btn, bin);
 		lv_obj_move_foreground(p->sel_delete_btn);
+		// Room under the last row while the bin is up, so that row can be
+		// scrolled clear of it.
+		lv_obj_set_style_pad_bottom(p->list, bin ? p->cfg->padding + DELETE_FAB_SIZE + 12 : 0, 0);
+		if (!bin) {
+			// The room gone, a list scrolled into it goes back to its end.
+			int limit = body_height(p) - lv_obj_get_height(p->list);
+			limit = limit > 0 ? limit : 0;
+			if (lv_obj_get_scroll_y(p->list) > limit) {
+				lv_obj_scroll_to_y(p->list, limit, LV_ANIM_OFF);
+				window_update(p);
+			}
+		}
 	}
 }
 

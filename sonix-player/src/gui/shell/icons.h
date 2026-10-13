@@ -58,6 +58,7 @@ extern const lv_image_dsc_t icon_volume_low;
 extern const lv_image_dsc_t icon_volume_high;
 extern const lv_image_dsc_t icon_power_off;
 extern const lv_image_dsc_t icon_reboot;
+extern const lv_image_dsc_t icon_battery_warning;
 extern const lv_image_dsc_t icon_music2;
 extern const lv_image_dsc_t icon_artist;
 extern const lv_image_dsc_t icon_podcast_list;

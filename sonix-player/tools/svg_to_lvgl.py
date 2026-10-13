@@ -113,6 +113,8 @@ ICONS = [
     # Power menu.
     ("power-off.svg", "power_off", 56),
     ("reboot.svg", "reboot", 56),
+    # The low battery warning and the countdown to the shutdown at 1 %.
+    ("battery-warning.svg", "battery_warning", 56),
     # Library pages. One glyph per index, and the stand-in for artwork that is
     # not there: they ride inside the 72 px thumbnail box on a library row and
     # the 56 px one on a search hit.

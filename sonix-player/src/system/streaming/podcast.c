@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 
 #include "src/system/core/config.h"
@@ -10,6 +11,8 @@
 #include "src/system/core/json.h"
 #include "src/system/core/lang.h"
 #include "src/system/core/sha1.h"
+#include "src/system/streaming/podcastrss.h"
+#include "src/system/streaming/podcastsubs.h"
 #include "src/system/streaming/streamkeys.h"
 
 // The default endpoint. Configurable for the same reason the Qobuz and Tidal
@@ -29,6 +32,8 @@ static __thread char last_error[256];
 const char *podcast_last_error(void) { return last_error; }
 
 static void set_error(const char *what) { snprintf(last_error, sizeof(last_error), "%s", what ? what : ""); }
+
+void podcast_set_last_error(const char *what) { set_error(what); }
 
 bool podcast_configured(void) { return streamkeys_podcast_key() && streamkeys_podcast_secret(); }
 
@@ -64,6 +69,9 @@ static const char *interface_language_code(void) {
 		{"Russian", "ru"},
 		{"Chinese", "zh,zh-cn"},
 		{"Portugu\xC3\xAAs BR", "pt,pt-br"},
+		{"\xC4\x8C"
+		 "e\xC5\xA1tina",
+		 "cs"},
 	};
 	const char *current = lang_current();
 	for (size_t i = 0; i < sizeof(MAP) / sizeof(MAP[0]); i++) {
@@ -275,9 +283,27 @@ static int fetch_list(const char *path, const char *array_key, void *out, int ma
 // the calls
 // ---------------------------------------------------------------------------
 
+// Whether a query is the address of a feed rather than words to search for.
+static bool looks_like_address(const char *query) {
+	return strncasecmp(query, "http://", 7) == 0 || strncasecmp(query, "https://", 8) == 0;
+}
+
 int podcast_search(const char *query, podcast_feed_t *out, int max) {
 	if (!query || !query[0] || !out || max <= 0) {
 		return -1;
+	}
+	// An address: the catalogue's podcast when it has one, the feed itself
+	// read otherwise.
+	if (looks_like_address(query)) {
+		last_raw_count = 1;
+		if (podcast_configured() && podcast_feed_by_url(query, out) > 0) {
+			return 1;
+		}
+		if (!podcastrss_read_feed(query, out)) {
+			return -1;
+		}
+		podcastsubs_keep_address(out->id, query);
+		return 1;
 	}
 	char encoded[512];
 	http_url_encode(query, encoded, sizeof(encoded));
@@ -309,9 +335,23 @@ int podcast_trending(podcast_feed_t *out, int max) {
 	return n;
 }
 
+// A podcast read from its feed is found by its address, which the reader
+// holds only for the feeds met since startup: the others are asked of the
+// database it was kept in.
+static void rss_find(long long feed_id) {
+	char url[PODCAST_FEED_URL_MAX];
+	if (!podcastrss_url_for(feed_id, url, sizeof(url)) && podcastsubs_address(feed_id, url, sizeof(url))) {
+		podcastrss_remember(feed_id, url);
+	}
+}
+
 int podcast_episodes(long long feed_id, podcast_episode_t *out, int max) {
 	if (feed_id <= 0 || !out || max <= 0) {
 		return -1;
+	}
+	if (podcastrss_is_id(feed_id)) {
+		rss_find(feed_id);
+		return podcastrss_episodes(feed_id, out, max, &last_raw_count);
 	}
 	char path[128];
 	snprintf(path, sizeof(path), "/episodes/byfeedid?id=%lld&max=%d", feed_id,
@@ -322,6 +362,10 @@ int podcast_episodes(long long feed_id, podcast_episode_t *out, int max) {
 bool podcast_feed(long long feed_id, podcast_feed_t *out) {
 	if (feed_id <= 0 || !out) {
 		return false;
+	}
+	if (podcastrss_is_id(feed_id)) {
+		rss_find(feed_id);
+		return podcastrss_feed(feed_id, out);
 	}
 	char path[128];
 	snprintf(path, sizeof(path), "/podcasts/byfeedid?id=%lld", feed_id);
@@ -396,6 +440,11 @@ bool podcast_episode(long long episode_id, podcast_episode_t *out) {
 	if (episode_id <= 0 || !out) {
 		return false;
 	}
+	// Read from a feed: only its feed knows it (podcast_episode_in_feed).
+	if (podcastrss_is_id(episode_id)) {
+		set_error(tr("podcast_episode_gone"));
+		return false;
+	}
 	char path[128];
 	snprintf(path, sizeof(path), "/episodes/byid?id=%lld", episode_id);
 
@@ -421,6 +470,14 @@ bool podcast_episode(long long episode_id, podcast_episode_t *out) {
 		set_error(tr("podcast_episode_gone"));
 	}
 	return ok;
+}
+
+bool podcast_episode_in_feed(long long feed_id, long long episode_id, podcast_episode_t *out) {
+	if (podcastrss_is_id(episode_id)) {
+		rss_find(feed_id);
+		return podcastrss_episode(feed_id, episode_id, out);
+	}
+	return podcast_episode(episode_id, out);
 }
 
 // ---------------------------------------------------------------------------

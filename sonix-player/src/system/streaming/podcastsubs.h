@@ -60,4 +60,20 @@ void podcastsubs_set_url(long long feed_id, const char *url);
 // Whether a podcast with this feed address is followed.
 bool podcastsubs_is_followed_url(const char *url);
 
+// What a newer record of a followed podcast knows that the list does not: how
+// many episodes it has, and its feed address, author and artwork where the list
+// has none. Nothing for one not followed.
+void podcastsubs_update(const podcast_feed_t *feed);
+
+// The followed podcasts without a feed address or an episode count, for the
+// page to ask the catalogue about. Fills `ids_out` and returns how many.
+int podcastsubs_missing_details(long long *ids_out, int max);
+
+// The address of a podcast read from its feed (podcastrss.h), kept in the same
+// database: its id is a hash of the address and cannot be turned back into it,
+// and its episodes on the card or half heard outlive the run it was found in.
+// Kept for one searched by its address and for one no longer followed.
+void podcastsubs_keep_address(long long feed_id, const char *url);
+bool podcastsubs_address(long long feed_id, char *out, size_t size);
+
 #endif /* PODCASTSUBS_H */

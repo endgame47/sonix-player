@@ -82,7 +82,7 @@ sonix_player_host
 usr/
 └── resource/
     └── sonix/
-        ├── language/                    the 7 .ini files
+        ├── language/                    the 12 .ini files
         ├── components/
         │   ├── streaming-keys.bin       Tidal / Qobuz / Podcast Index / Last.fm keys, sealed - see "Streaming keys" below.
         │   └── system-info.json         its device-name picks the player the simulator plays
@@ -229,7 +229,7 @@ assets/R3PII/                           (and assets/R1/, the same shape)
 │   ├── lib/                         the bluealsa ALSA plugin, and OpenSSL, libupnp, libsndfile and fdk-aac (see "System libraries" below)
 │   ├── resource/
 │   │   └── sonix/
-│   │       ├── language/            the 8 .ini files
+│   │       ├── language/            the 12 .ini files
 │   │       ├── components/
 │   │       │   ├── streaming-keys.bin   Tidal / Qobuz / Podcast Index / Last.fm keys, sealed - see "Streaming keys" below.
 │   │       │   ├── system-info.json     required: names the player, and the packer writes to it

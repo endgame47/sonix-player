@@ -7,6 +7,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "src/system/core/config.h"
 #include "src/system/core/utils.h"
@@ -217,12 +218,27 @@ static void upsert(sqlite3 *db, const char *key, const podcaststate_t *s) {
 	sqlite3_finalize(stmt);
 }
 
+// An episode of the catalogue kept in the Podcast folder stays tied to that
+// file when it is played from anywhere else (the cache, a stream): the card's
+// pages find its state by the file. Called with db_lock held.
+static void keep_download(sqlite3 *db, const char *key, podcaststate_t *s) {
+	if (strncmp(key, "e:", 2) != 0 || (s->path[0] && podcastdl_owns(s->path))) {
+		return;
+	}
+	podcaststate_t old;
+	if (select_key(db, key, &old) && old.path[0] && podcastdl_owns(old.path) && access(old.path, F_OK) == 0) {
+		snprintf(s->path, sizeof(s->path), "%s", old.path);
+	}
+}
+
 static void write_now(const char *key, const podcaststate_t *s) {
 	revision++;
+	podcaststate_t record = *s;
 	pthread_mutex_lock(&db_lock);
 	sqlite3 *db = open_db();
 	if (db) {
-		upsert(db, key, s);
+		keep_download(db, key, &record);
+		upsert(db, key, &record);
 	}
 	pthread_mutex_unlock(&db_lock);
 }
@@ -616,12 +632,14 @@ void podcaststate_forget(const char *path) {
 	if (!path || !path[0] || !db_path[0]) {
 		return;
 	}
+	// A file copied by hand has no state apart from its file, and goes with
+	// it. An episode of the catalogue keeps where it was left and whether it was
+	// heard: it can still be streamed, and its row moves to its copy in the
+	// cache, or to no file at all.
 	char key[600];
-	if (!key_for(path, podcastcache_episode_id(path), key, sizeof(key))) {
-		return;
-	}
+	bool own_row = key_for(path, 0, key, sizeof(key));
 	pthread_mutex_lock(&current_lock);
-	if (current_valid && strcmp(current_key, key) == 0) {
+	if (current_valid && strcmp(current.path, path) == 0) {
 		current_valid = false;
 	}
 	pthread_mutex_unlock(&current_lock);
@@ -631,9 +649,64 @@ void podcaststate_forget(const char *path) {
 	revision++;
 	if (db) {
 		sqlite3_stmt *stmt = NULL;
-		if (sqlite3_prepare_v2(db, "DELETE FROM PODCAST_EPISODES WHERE key=?", -1, &stmt, NULL) == SQLITE_OK) {
+		if (own_row &&
+			sqlite3_prepare_v2(db, "DELETE FROM PODCAST_EPISODES WHERE key=?", -1, &stmt, NULL) == SQLITE_OK) {
 			sqlite3_bind_text(stmt, 1, key, -1, SQLITE_STATIC);
 			sqlite3_step(stmt);
+			sqlite3_finalize(stmt);
+		}
+		// One episode at most, in practice: a file is one episode's.
+		long long episodes[4];
+		int count = 0;
+		stmt = NULL;
+		if (sqlite3_prepare_v2(db, "SELECT episode_id FROM PODCAST_EPISODES WHERE path=? AND episode_id>0", -1,
+							   &stmt, NULL) == SQLITE_OK) {
+			sqlite3_bind_text(stmt, 1, relative(path), -1, SQLITE_STATIC);
+			while (count < 4 && sqlite3_step(stmt) == SQLITE_ROW) {
+				episodes[count++] = (long long)sqlite3_column_int64(stmt, 0);
+			}
+			sqlite3_finalize(stmt);
+		}
+		for (int i = 0; i < count; i++) {
+			char cached[512] = "";
+			if (!podcastcache_find(episodes[i], cached, sizeof(cached))) {
+				cached[0] = '\0';
+			}
+			char episode_key[64];
+			snprintf(episode_key, sizeof(episode_key), "e:%lld", episodes[i]);
+			stmt = NULL;
+			if (sqlite3_prepare_v2(db, "UPDATE PODCAST_EPISODES SET path=? WHERE key=?", -1, &stmt, NULL) ==
+				SQLITE_OK) {
+				sqlite3_bind_text(stmt, 1, cached[0] ? relative(cached) : "", -1, SQLITE_STATIC);
+				sqlite3_bind_text(stmt, 2, episode_key, -1, SQLITE_STATIC);
+				sqlite3_step(stmt);
+				sqlite3_finalize(stmt);
+			}
+		}
+	}
+	pthread_mutex_unlock(&db_lock);
+}
+
+void podcaststate_downloaded(long long episode_id, const char *path) {
+	if (episode_id <= 0 || !path || !path[0] || !db_path[0] || !podcastdl_owns(path)) {
+		return;
+	}
+	char key[64];
+	snprintf(key, sizeof(key), "e:%lld", episode_id);
+	pthread_mutex_lock(&db_lock);
+	sqlite3 *db = open_db();
+	podcaststate_t old;
+	// Never played: nothing to move. Already on a file of the folder that is
+	// still there: that one stays.
+	if (db && select_key(db, key, &old) && strcmp(old.path, path) != 0 &&
+		!(old.path[0] && podcastdl_owns(old.path) && access(old.path, F_OK) == 0)) {
+		sqlite3_stmt *stmt = NULL;
+		if (sqlite3_prepare_v2(db, "UPDATE PODCAST_EPISODES SET path=? WHERE key=?", -1, &stmt, NULL) == SQLITE_OK) {
+			sqlite3_bind_text(stmt, 1, relative(path), -1, SQLITE_STATIC);
+			sqlite3_bind_text(stmt, 2, key, -1, SQLITE_STATIC);
+			if (sqlite3_step(stmt) == SQLITE_DONE) {
+				revision++;
+			}
 			sqlite3_finalize(stmt);
 		}
 	}
@@ -669,7 +742,12 @@ static int select_many(const char *where, const char *text, const char *text_end
 				const char *key = (const char *)sqlite3_column_text(stmt, 10);
 				pthread_mutex_lock(&current_lock);
 				if (current_valid && key && strcmp(key, current_key) == 0) {
+					// The file stays the row's: the episode may be playing from
+					// the cache while the row points at its download.
+					char path[sizeof(s.path)];
+					snprintf(path, sizeof(path), "%s", s.path);
 					s = current;
+					snprintf(s.path, sizeof(s.path), "%s", path);
 					s.touched = PODCASTSTATE_TOUCHED_NOW;
 				}
 				pthread_mutex_unlock(&current_lock);

@@ -37,6 +37,7 @@
 #include "src/gui/gearboy/gearboysettings.h"
 #include "src/gui/flappybird/flappybird.h"
 #include "src/gui/gearboy/gearboyplay.h"
+#include "src/gui/shell/lowbattery.h"
 #include "src/gui/shell/main_menu.h"
 #include "src/gui/library/medialist.h"
 #include "src/gui/library/filespage.h"
@@ -755,6 +756,7 @@ void gui_init(gui_config_t *cfg) {
 	powersettings_init(cfg);
 	confirm_init(cfg);
 	toast_init(cfg);
+	lowbattery_init(cfg);
 
 	// The screensaver is drawn both when the panel goes dark (so the wake opens
 	// on it rather than on the page) and when it lights up again; and the

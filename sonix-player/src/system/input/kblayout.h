@@ -19,9 +19,9 @@
 //
 // The letters are the layouts real keyboards have. English, Italian, Dutch and
 // Polish carry the same ones, as they do on a phone; what differs is German
-// (QWERTZ and the umlauts), Spanish (the ñ), French (AZERTY), Brazilian
-// Portuguese (the ç) and Russian (ЙЦУКЕН). Accented letters come from holding
-// a key (kblayout_variant), on every layout.
+// (QWERTZ and the umlauts), Czech (QWERTZ), Spanish (the ñ), French (AZERTY),
+// Brazilian Portuguese (the ç) and Russian (ЙЦУКЕН). Accented letters come from
+// holding a key (kblayout_variant), on every layout.
 
 typedef enum {
 	KB_LAYOUT_ENGLISH = 0,
@@ -33,6 +33,7 @@ typedef enum {
 	KB_LAYOUT_DUTCH,
 	KB_LAYOUT_POLISH,
 	KB_LAYOUT_PORTUGUESE,
+	KB_LAYOUT_CZECH,
 	KB_LAYOUT_COUNT,
 } kblayout_t;
 
@@ -58,7 +59,7 @@ int kblayout_variant_count(const char *key);
 const char *kblayout_variant(const char *key, int index);
 
 // The nine-key phone keypad, for the same alphabet. Key 0 is the punctuation
-// key; the rest carry the letters, four or five to a key.
+// key; the rest carry the letters, three to six to a key.
 #define KB_LAYOUT_T9_KEYS 9
 
 int kblayout_t9_len(kblayout_t layout, int key);
@@ -70,6 +71,11 @@ kblayout_t kblayout_in_use_at(int position);
 int kblayout_others_count(void);
 kblayout_t kblayout_others_at(int position);
 kblayout_t kblayout_default(void);
+
+// The interface language has changed. While no layout has been chosen on the
+// settings page, the lists are worked out again from the new language: the
+// first boot reads them in English, before the language is picked.
+void kblayout_language_changed(void);
 
 // True while `layout` is one of the ones in use.
 bool kblayout_is_in_use(kblayout_t layout);

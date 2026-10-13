@@ -13,6 +13,7 @@
 #include "src/system/device/system.h"
 #include "src/system/net/http.h"
 #include "src/system/core/utils.h"
+#include "src/system/streaming/podcaststate.h"
 
 #define DL_TIMEOUT_SECS 20
 #define DL_CHUNK 32768
@@ -295,6 +296,7 @@ static void *download_main(void *arg) {
 			utime(job->path, &times);
 		}
 		write_tags(job);
+		podcaststate_downloaded(job->episode.id, job->path);
 		fetch_cover(job->folder, job->image);
 	}
 	sync();

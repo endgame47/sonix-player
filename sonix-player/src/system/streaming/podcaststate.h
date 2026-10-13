@@ -21,7 +21,8 @@
 // is gone from the card by the next boot.
 
 typedef struct {
-	char path[512];						// the file it last played from, absolute; "" if unknown
+	char path[512];						// absolute: its file in the Podcast folder when it has one,
+										// otherwise the file it last played from; "" if unknown
 	char title[PODCAST_TITLE_MAX];
 	char show[PODCAST_TITLE_MAX];		// the podcast's name
 	char image[PODCAST_URL_MAX];		// the podcast's artwork address, for an episode of the catalogue
@@ -68,8 +69,14 @@ bool podcaststate_get_episode(long long episode_id, podcaststate_t *out);
 // zero; not heard leaves the position as it was.
 void podcaststate_set_played(const char *path, bool played);
 
-// Forgets an episode: its file has been deleted.
+// Its file has been deleted. A file copied by hand is forgotten; an episode of
+// the catalogue keeps its state and only loses the file.
 void podcaststate_forget(const char *path);
+
+// An episode of the catalogue that has a file in the Podcast folder: its row,
+// when it has one, points there from now on. Called when a download completes
+// and for files saved before that was done.
+void podcaststate_downloaded(long long episode_id, const char *path);
 
 // Every row whose file is inside `folder` (absolute), and every row of the
 // podcast `feed_id`. The callback runs once per row, on the caller's thread.
