@@ -5464,6 +5464,7 @@ void player_init(gui_config_t *cfg) {
 	// The generated visualizer is a sibling of the artwork panel. It has no
 	// image source or artwork child and is hidden until the cover panel opens it.
 	visualizer_canvas = lv_canvas_create(cover_panel);
+	player_sheet_attach_drag(visualizer_canvas, false);
 	lv_obj_set_size(visualizer_canvas, cover_size, cover_size);
 	lv_obj_set_pos(visualizer_canvas, 0, 0);
 	lv_obj_set_clickable(visualizer_canvas, true);
