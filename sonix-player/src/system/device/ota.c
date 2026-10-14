@@ -41,8 +41,11 @@ static long progress_done, progress_total;
 static bool cancel_requested;
 static http_stream_t *active_stream; // the download's stream, for ota_cancel() to wake
 
-static ota_release_t release;
+static ota_release_t release = {.notes = ""};
 static bool release_valid;
+// What release.notes points at when the release has a description: as long
+// as the description, so a long changelog is not cut at a fixed size.
+static char *notes_text;
 
 // Set on the interface thread when a check starts.
 static char repo[128];
@@ -255,12 +258,26 @@ static ota_result_t pick_release(const json_doc_t *doc) {
 	}
 
 	memset(&release, 0, sizeof(release));
+	release.notes = "";
+	free(notes_text);
+	notes_text = NULL;
 	json_obj_str(doc, best_rel, "tag_name", release.tag, sizeof(release.tag));
 	if (!json_obj_str(doc, best_rel, "name", release.name, sizeof(release.name)) || !release.name[0]) {
 		snprintf(release.name, sizeof(release.name), "%s", release.tag);
 	}
-	json_obj_str(doc, best_rel, "body", release.notes, sizeof(release.notes));
-	trim_partial_utf8(release.notes);
+	// Unescaped, the text is never longer than it is in the JSON.
+	int body = json_get(doc, best_rel, "body");
+	if (body >= 0 && doc->toks[body].type == JSON_STRING) {
+		size_t size = (size_t)(doc->toks[body].end - doc->toks[body].start) + 1;
+		if (size > OTA_NOTES_MAX) {
+			size = OTA_NOTES_MAX;
+		}
+		notes_text = malloc(size);
+		if (notes_text && json_str(doc, body, notes_text, size)) {
+			trim_partial_utf8(notes_text);
+			release.notes = notes_text;
+		}
+	}
 	release.size = json_obj_long(doc, best_asset, "size", 0);
 	json_obj_str(doc, best_asset, "browser_download_url", release.url, sizeof(release.url));
 

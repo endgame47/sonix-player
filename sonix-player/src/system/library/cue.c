@@ -198,6 +198,42 @@ static bool match_in_dir(const char *dir, const char *name, char *out, size_t si
 	return found;
 }
 
+// The audio a sheet names under another extension: a disc ripped to WAV with
+// its sheet and converted afterwards, the sheet still naming the .wav. Looks in
+// `dir` for a file with the same name before the dot, ignoring case, and one
+// of the extensions below, the earlier ones first.
+static bool match_other_extension(const char *dir, const char *name, char *out, size_t size) {
+	static const char *const EXTS[] = {".flac", ".wav", ".wv", ".ape", ".m4a", ".alac", ".aif", ".aiff",
+									   ".mp3", ".ogg", ".opus", ".dsf", ".dff"};
+	const char *dot = strrchr(name, '.');
+	size_t stem = dot ? (size_t)(dot - name) : strlen(name);
+	if (stem == 0) {
+		return false;
+	}
+	DIR *d = opendir(dir);
+	if (!d) {
+		return false;
+	}
+	int best = -1;
+	char found[256] = "";
+	struct dirent *de;
+	while ((de = readdir(d)) != NULL) {
+		if (strncasecmp(de->d_name, name, stem) != 0 || de->d_name[stem] != '.') {
+			continue;
+		}
+		for (int i = 0; i < (int)(sizeof(EXTS) / sizeof(EXTS[0])); i++) {
+			if (strcasecmp(de->d_name + stem, EXTS[i]) == 0 && (best < 0 || i < best) &&
+				strlen(de->d_name) < sizeof(found)) {
+				best = i;
+				snprintf(found, sizeof(found), "%s", de->d_name);
+				break;
+			}
+		}
+	}
+	closedir(d);
+	return best >= 0 && (size_t)snprintf(out, size, "%s/%s", dir, found) < size && file_exists(out);
+}
+
 // Turns the FILE field into an absolute path on the card, or gives up.
 static bool resolve_audio(const char *cue_path, const char *field, char *out, size_t size) {
 	if (!field[0]) {
@@ -262,6 +298,9 @@ static bool resolve_audio(const char *cue_path, const char *field, char *out, si
 		return true;
 	}
 	if (match_in_dir(dir, base, out, size)) {
+		return true;
+	}
+	if (match_other_extension(dir, base, out, size)) {
 		return true;
 	}
 

@@ -737,12 +737,12 @@ static void walk_items(FILE *f, const ape_tag_t *tag,
 
 // The item names of interest, compared case-insensitively. APEv2 has no naming
 // standard: the album artist appears as "Album Artist", "AlbumArtist" and
-// "album_artist" (ffmpeg), the year as "Year" and "date"; whichever is there
-// answers.
+// "album_artist" (ffmpeg), the year as "Year" and "date", the disc as "Disc"
+// and "DiscNumber"; whichever is there answers.
 static const char *const TAG_ITEMS[] = {
 	"Title",		 "Artist", "Album", "Album Artist",	 "AlbumArtist",			  "album_artist",
 	"Genre",		 "Track",  "Year",	"date",			 "replaygain_track_gain", "replaygain_track_peak",
-	"replaygain_album_gain", "replaygain_album_peak", "Compilation",
+	"replaygain_album_gain", "replaygain_album_peak", "Compilation", "Disc", "DiscNumber", "TrackNumber",
 };
 
 typedef struct {

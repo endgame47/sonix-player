@@ -162,6 +162,25 @@ static bool stream_find(oggtags_value_t *r, bool *opus) {
 	return false;
 }
 
+// Steps over the ID3v2 tags a tagger that knows only MP3 may have put in front
+// of the first page. Leaves `f` at the first byte that is not part of one.
+static void skip_id3(FILE *f) {
+	for (int tags = 0; tags < 4; tags++) {
+		off_t at = ftello(f);
+		uint8_t h[10];
+		if (at < 0 || fread(h, 1, sizeof(h), f) != sizeof(h) || memcmp(h, "ID3", 3) != 0) {
+			fseeko(f, at, SEEK_SET);
+			return;
+		}
+		uint32_t size = ((uint32_t)(h[6] & 0x7F) << 21) | ((uint32_t)(h[7] & 0x7F) << 14) |
+						((uint32_t)(h[8] & 0x7F) << 7) | (uint32_t)(h[9] & 0x7F);
+		off_t footer = (h[3] >= 4 && (h[5] & 0x10)) ? 10 : 0;
+		if (fseeko(f, (off_t)size + footer, SEEK_CUR) != 0) {
+			return;
+		}
+	}
+}
+
 bool oggtags_key_is_picture(const char *key, size_t key_len) {
 	return (key_len == 22 && strncasecmp(key, "METADATA_BLOCK_PICTURE", 22) == 0) ||
 		   (key_len == 8 && strncasecmp(key, "COVERART", 8) == 0);
@@ -189,6 +208,7 @@ bool oggtags_walk(const char *path, size_t max_text, bool (*small)(void *user, c
 	r.f = f;
 
 	bool opus = false;
+	skip_id3(f);
 	bool ok = stream_find(&r, &opus) && page_next(&r);
 
 	// "OpusTags", or packet type 3 and "vorbis"; then the vendor string.

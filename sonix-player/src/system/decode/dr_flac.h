@@ -6712,14 +6712,20 @@ static void drflac__free_from_callbacks(void* p, const drflac_allocation_callbac
 static drflac_bool32 drflac__read_and_decode_metadata(drflac_read_proc onRead, drflac_seek_proc onSeek, drflac_tell_proc onTell, drflac_meta_proc onMeta, void* pUserData, void* pUserDataMD, drflac_uint64* pFirstFramePos, drflac_uint64* pSeektablePos, drflac_uint32* pSeekpointCount, drflac_allocation_callbacks* pAllocationCallbacks)
 {
     /*
-    We want to keep track of the byte position in the stream of the seektable. At the time of calling this function we know that
-    we'll be sitting on byte 42.
+    We want to keep track of the byte position in the stream of the seektable. At the time of calling this function we are
+    sitting on byte 42 of the FLAC stream, which is further into the file when an ID3 tag comes before it: the position is
+    asked of onTell when it can answer, so the seek back below and the positions handed out are those of the file.
     */
     drflac_uint64 runningFilePos   = 42;
     drflac_uint64 seektablePos     = 0;
     drflac_uint32 seektableSize    = 0;
     drflac_int64  fileSize         = 0;
+    drflac_int64  startPos         = 0;
     drflac_bool32 hasKnownFileSize = DRFLAC_FALSE;
+
+    if (onTell != NULL && onTell(pUserData, &startPos) && startPos >= 42 && startPos <= 0x7FFFFFFF) {
+        runningFilePos = (drflac_uint64)startPos;
+    }
 
     /* We'll be doing some memory allocations here against untrusted data. We'll do a basic validation check that they don't exceed the size of the file. */
     if (onTell != NULL && onSeek != NULL) {
@@ -6728,7 +6734,7 @@ static drflac_bool32 drflac__read_and_decode_metadata(drflac_read_proc onRead, d
                 hasKnownFileSize = DRFLAC_TRUE;
             }
 
-            onSeek(pUserData, (int)runningFilePos, DRFLAC_SEEK_SET);    /* Safe cast because runningFilePos should always be 42 at this point. */
+            onSeek(pUserData, (int)runningFilePos, DRFLAC_SEEK_SET);    /* Safe cast: checked above, or 42. */
         }
     }
 

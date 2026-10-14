@@ -39,15 +39,17 @@ typedef enum {
 	OTA_CANCELLED,
 } ota_result_t;
 
-#define OTA_NOTES_MAX 6000
+// The longest description kept, in bytes. GitHub allows 125,000 characters;
+// a changelog that long would take the card a while to lay out.
+#define OTA_NOTES_MAX (64 * 1024)
 
 typedef struct {
 	char tag[32];
-	char name[128];			  // the release title, the tag when it has none
-	char notes[OTA_NOTES_MAX]; // the release description, Markdown as written, cut at OTA_NOTES_MAX
-	long size;				  // bytes
-	char url[512];			  // browser_download_url of the asset
-	char sha256[65];		  // from the asset's "digest", "" when GitHub gives none
+	char name[128];		// the release title, the tag when it has none
+	const char *notes;	// the release description, Markdown as written, cut at OTA_NOTES_MAX; never NULL
+	long size;			// bytes
+	char url[512];		// browser_download_url of the asset
+	char sha256[65];	// from the asset's "digest", "" when GitHub gives none
 } ota_release_t;
 
 // Starts looking for a release. False when a check or a download is already

@@ -48,7 +48,7 @@ static bool holding_screen;
 
 static enum { PHASE_NONE, PHASE_CHECK, PHASE_DOWNLOAD } phase;
 
-static char notes_line[1024];
+static char notes_line[4096];
 
 // ---------------------------------------------------------------------------
 // the card
