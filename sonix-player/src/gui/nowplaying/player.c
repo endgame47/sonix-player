@@ -1391,6 +1391,33 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 				}
 
 				/*
+				// Round the tops of the bars
+				int used_width = x_end - x_start;
+				int cap_radius = LV_MAX(1, LV_MIN(used_width / 2, LV_MAX(1, bar_height / 2)));
+				int cap_center_x = (x_start + x_end) / 2;
+				int cap_center_y = bar_top + cap_radius;
+				for (int y = bar_top; y <= cap_center_y; y++) {
+					int dy = y - cap_center_y;
+					int half_width = (int)sqrtf((float)cap_radius * cap_radius - (float)dy * dy);
+					if (half_width <= 0) {
+						continue;
+					}
+					int x0 = cap_center_x - half_width;
+					int x1 = cap_center_x + half_width;
+					for (int x = LV_MAX(x_start, x0); x <= LV_MIN(x_end - 1, x1); x++) {
+						float position = (float)(baseline - 1 - y) / LV_MAX(1, bar_height - 1);
+						lv_color_t color = lv_color_make(
+							(uint8_t)(accent.red + (complement.red - accent.red) * position),
+							(uint8_t)(accent.green + (complement.green - accent.green) * position),
+							(uint8_t)(accent.blue + (complement.blue - accent.blue) * position));
+						at = (size_t)y * width + x;
+						colour[at] = rgb888_to_rgb565(color);
+						alpha[at] = opa * 2;
+					}
+				}
+				*/
+
+				/*
 				// Reflection
 				int reflection_height = bar_height / 3;
 				for (int y = baseline + 1; y <= baseline + reflection_height && y < height; y++) {
