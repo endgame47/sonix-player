@@ -130,6 +130,7 @@ static lv_obj_t *tint_page;
 static lv_color_t tint_bg;
 static lv_color_t tint_ink;
 static bool tint_active;
+static bool tint_held; // topbar_tint_hold()
 static lv_style_t tint_text_style;
 static lv_style_t tint_icon_style;
 
@@ -1104,7 +1105,7 @@ static void tint_apply(void) {
 	if (!top_bar || over_art) {
 		return; // the artwork's look holds for as long as the player is up
 	}
-	bool active = tint_screen && tint_page == tint_screen;
+	bool active = tint_screen && tint_page == tint_screen && !tint_held;
 	if (active == tint_active && !active) {
 		return;
 	}
@@ -1190,6 +1191,14 @@ void topbar_tint_on_screen(lv_obj_t *screen, bool on, lv_color_t bg, lv_color_t 
 
 void topbar_page_shown(lv_obj_t *screen) {
 	tint_page = screen;
+	tint_apply();
+}
+
+void topbar_tint_hold(bool held) {
+	if (tint_held == held) {
+		return;
+	}
+	tint_held = held;
 	tint_apply();
 }
 

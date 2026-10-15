@@ -42,6 +42,7 @@
 #include "src/system/device/usb.h"
 #include "src/system/audio/usbdac.h"
 #include "src/system/gearboy/gearboy.h"
+#include "src/system/audio/metronome.h"
 #include "src/system/device/led.h"
 #include "src/system/device/sysinfo.h"
 #include "src/system/device/axpcharge.h"
@@ -1540,6 +1541,30 @@ void power_screen_off(void) {
 	fprintf(stderr, "power: screen off\n");
 }
 
+// LVGL starts the refresh timer again from its own handler of this event, sent
+// whenever anything is invalidated -- the elapsed time in the player, a title
+// that changes -- so the pause put on it at the blank lasted only until the
+// first of those, and from there every change was drawn into a framebuffer
+// nobody could see. Added after LVGL's handler, this puts the pause back at
+// once. Nothing is lost: the areas stay marked, and power_screen_on() redraws
+// the whole screen anyway; lv_refr_now() does not depend on the timer.
+static void refr_request_cb(lv_event_t *e) {
+	(void)e;
+	if (!g_screen_on && g_refr_timer) {
+		lv_timer_pause(g_refr_timer);
+	}
+}
+
+void power_keep_animations_paused(void) {
+	if (g_screen_on) {
+		return;
+	}
+	lv_timer_t *anim_timer = lv_anim_get_timer();
+	if (anim_timer && !lv_timer_get_paused(anim_timer)) {
+		lv_timer_pause(anim_timer);
+	}
+}
+
 void power_screen_on(void) {
 	waveform_set_screen_on(true);
 	if (g_screen_on) {
@@ -1584,6 +1609,14 @@ void power_screen_on(void) {
 		(void)g_wake_hook();
 	}
 
+	// Nothing is drawn while the panel is dark (refr_request_cb), and the
+	// unblank below presents whatever the framebuffer holds: the page as it was
+	// at the blank, with the last track's title and time on it, until the
+	// repaint further down. What changed in the meantime is drawn now, while the
+	// panel is still off -- only the areas that changed, as the dark used to
+	// draw them as they came.
+	lv_refr_now(g_disp);
+
 	screen_power(true);			 // panel, backlight and touch controller back up
 	usleep(SCREEN_ON_SETTLE_US); // let the panel + backlight finish re-initializing
 	set_indevs_enabled(true);
@@ -1602,6 +1635,11 @@ void power_screen_on(void) {
 	if (anim_timer) {
 		lv_timer_resume(anim_timer);
 	}
+	// Animations started or left running in the dark have been standing still
+	// (see power_keep_animations_paused). One pass brings each to where its
+	// clock says it is, and runs the completion of the ones already over, so
+	// the wake frame below shows a closed sheet closed rather than half way.
+	lv_anim_refr_now();
 	// ... and force an immediate, full repaint of the framebuffer. The blank
 	// cleared the panel to black, so the whole UI must be redrawn; this is not
 	// gated on g_refr_timer, and lv_refr_now() draws even if the timer is paused.
@@ -1688,7 +1726,10 @@ static void power_timer_cb(lv_timer_t *timer) {
 	// comes in over A2DP, so neither of the first two answers says anything
 	// about it. Streaming rather than merely active, because the mode left on
 	// with the phone paused is exactly the idle state the timer exists for.
-	bool playing = (audio_get_status() == AUDIO_STATUS_PLAYING) || radio_is_playing() || btreceiver_is_streaming();
+	// The metronome counts as music: a player clicking in a pocket with the
+	// screen dark must not go to sleep under it.
+	bool playing = (audio_get_status() == AUDIO_STATUS_PLAYING) || radio_is_playing() || btreceiver_is_streaming() ||
+				   metronome_running();
 	if (playing) {
 		g_last_playing_ms = now;
 	}
@@ -1877,6 +1918,9 @@ void power_init(const power_config_t *cfg, lv_display_t *disp) {
 	g_disp = disp;
 	g_refr_timer = disp ? lv_display_get_refr_timer(disp) : NULL;
 	g_screen_on = true;
+	if (disp) {
+		lv_display_add_event_cb(disp, refr_request_cb, LV_EVENT_REFR_REQUEST, NULL);
+	}
 
 	// discover the panel's maximum backlight level
 	g_max_brightness = g_cfg.max_brightness_path ? read_long_from_file(g_cfg.max_brightness_path) : -1;

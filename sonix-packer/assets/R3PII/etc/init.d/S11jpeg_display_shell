@@ -1,0 +1,104 @@
+#!/bin/sh
+#
+# The boot logo.
+#
+# Which picture to show is read from raw NAND, 13 bytes at 0x20000 of
+# /dev/mtd5, written by the player (src/system/device/bootlogo.c):
+#
+#     theme:T,aA,cC
+#
+# T is 1 for the light theme and 2 for the dark one, A the accent colour (0-5,
+# in the order of ACCENT_COLORS in theme.c) and C is 1 when the user has chosen
+# a picture of their own. The first seven bytes are the stock marker. Anything
+# unreadable shows the dark theme with the blue accent.
+#
+# The user's own picture is on userdata, which S21mount_ubifs mounts after the
+# kernel modules. With C set, the mount starts here instead, in the background
+# while the modules load, and S21mount_ubifs waits for it to end: two
+# mount_ubifs.sh at once can erase the partition.
+
+MARKER_DEV=/dev/mtd5
+LOGO_DIR=/etc/boot-logo
+CUSTOM_LOGO=/usr/data/bootlogo.jpeg
+MOUNTING=/tmp/.userdata_mounting
+
+# Steps of 20 ms: how long the logo waits for an early mount still running when
+# the screen is ready, before showing the theme's logo instead.
+MOUNT_WAIT_STEPS=100
+
+theme=dark
+accent=blue
+custom=0
+
+read_marker()
+{
+	# mdev, started just before, may not have made the node yet
+	n=50
+	while [ ! -e $MARKER_DEV ] && [ $n -gt 0 ]; do
+		sleep 0.02
+		n=$((n - 1))
+	done
+
+	marker=$(nanddump -q -s 0x20000 -l 13 $MARKER_DEV -a 2>/dev/null)
+	case "$marker" in
+	theme:1*) theme=light ;;
+	esac
+	case "$marker" in
+	theme:[12],a[0-5],c[01])
+		case "${marker:9:1}" in
+		1) accent=orange ;;
+		2) accent=yellow ;;
+		3) accent=green ;;
+		4) accent=purple ;;
+		5) accent=pink ;;
+		esac
+		custom=${marker:12:1}
+		;;
+	esac
+}
+
+jpeg_display()
+{
+	echo "Starting display... "
+	while [ ! -e /dev/fb0 ]; do
+		sleep 0.02
+	done
+
+	echo "Wait display... "
+
+	logo=$LOGO_DIR/$theme-theme-$accent.jpeg
+	[ -f $logo ] || logo=/etc/logo.jpeg
+
+	shown=0
+	if [ "$custom" = 1 ]; then
+		n=$MOUNT_WAIT_STEPS
+		while [ -e $MOUNTING ] && [ $n -gt 0 ]; do
+			sleep 0.02
+			n=$((n - 1))
+		done
+		if [ -s $CUSTOM_LOGO ] && cmd_jpeg_display $CUSTOM_LOGO; then
+			shown=1
+		fi
+	fi
+	[ $shown = 1 ] || cmd_jpeg_display $logo
+
+	# the R1's LG 35583 panel needs 100 ms before the backlight
+	sleep 0.1
+	echo 60 > /sys/class/backlight/backlight_pwm0/brightness
+	echo "Finish display... "
+}
+
+case "$1" in
+	start)
+		read_marker
+		if [ "$custom" = 1 ]; then
+			touch $MOUNTING
+			( mount_ubifs.sh userdata /usr/data/; rm -f $MOUNTING ) &
+		fi
+		jpeg_display &
+	;;
+	*)
+		exit 1
+esac
+
+exit 0

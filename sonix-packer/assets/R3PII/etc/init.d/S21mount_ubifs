@@ -1,0 +1,25 @@
+#!/bin/sh
+#
+# userdata on /usr/data. S11jpeg_display_shell may have started this mount
+# early, for a boot logo of the user's own: that one is waited for, however
+# long it takes, because two mount_ubifs.sh at once can erase the partition.
+
+MOUNTING=/tmp/.userdata_mounting
+
+case "$1" in
+  start)
+	while [ -e $MOUNTING ]; do
+		sleep 0.05
+	done
+	grep -q " /usr/data ubifs " /proc/mounts || mount_ubifs.sh userdata /usr/data/
+	;;
+  stop)
+	;;
+  restart|reload)
+	;;
+  *)
+	echo "Usage: $0 {start|stop|restart}"
+	exit 1
+esac
+
+exit $?

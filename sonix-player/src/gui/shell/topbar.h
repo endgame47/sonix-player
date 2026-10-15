@@ -47,6 +47,12 @@ void topbar_tint_on_screen(lv_obj_t *screen, bool on, lv_color_t bg, lv_color_t 
 // is loaded.
 void topbar_page_shown(lv_obj_t *screen);
 
+// The control centre over the page: the bar is part of the sheet while it is
+// open, so it wears the theme's colours whatever the page under it is painted
+// in. Held from the moment the sheet starts coming down until it has gone, and
+// then the page's tint, if it has one, is back.
+void topbar_tint_hold(bool held);
+
 // Shows or hides the status bar. Pages that want the full screen height (the
 // player, with its artwork flush to the top) hide it on entry.
 void topbar_set_hidden(bool hidden);

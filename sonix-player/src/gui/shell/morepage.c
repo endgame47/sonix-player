@@ -3,6 +3,7 @@
 #include "lvgl/lvgl.h"
 
 #include "src/gui/audio/dacpage.h"
+#include "src/gui/audio/metronomepage.h"
 #include "src/gui/ebook/ebookpage.h"
 #include "src/gui/flappybird/flappybird.h"
 #include "src/gui/library/filespage.h"
@@ -31,6 +32,7 @@ void morepage_init(gui_config_t *cfg) {
 		{"file_explorer", &icon_menu_file_explorer, NULL, filespage_open},
 		// An action: the artwork is read from the resource tree on the way in.
 		{"flappy_bird", &icon_menu_flappy_bird, NULL, flappybird_open},
+		{"metronome", &icon_menu_metronome, &metronomepage_screen, NULL},
 	};
 
 	// Two columns by three rows, like the Music and Wireless pages, so a tile

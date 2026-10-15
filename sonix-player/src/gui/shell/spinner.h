@@ -11,7 +11,8 @@
 //
 // The animation dies with the object: LVGL cancels animations targeting an
 // object when it destroys it, so a spinner created inside a list that will be
-// cleared needs no bookkeeping.
+// cleared needs no bookkeeping. It also stands still while it cannot be seen
+// (animpark.h).
 //
 // `icon` is &icon_loader_small or &icon_loader_big.
 lv_obj_t *spinner_create(lv_obj_t *parent, const lv_image_dsc_t *icon);

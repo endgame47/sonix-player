@@ -17,6 +17,7 @@
 #include "src/gui/nowplaying/player.h"
 #include "src/gui/shell/confirm.h"
 #include "src/gui/shell/icons.h"
+#include "src/gui/shell/pagetimer.h"
 #include "src/gui/shell/popover.h"
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/spinner.h"
@@ -2322,7 +2323,7 @@ void podcastcard_init(gui_config_t *cfg) {
 	lv_obj_add_event_cb(podcastcard_feed_screen, feed_unloaded_cb, LV_EVENT_SCREEN_UNLOADED, NULL);
 
 	theme_register_refresh(repaint);
-	lv_timer_create(states_watch_cb, 1000, NULL);
+	pagetimer_bind(lv_timer_create(states_watch_cb, 1000, NULL), podcastcard_screen, podcastcard_feed_screen);
 	hero_timer = lv_timer_create(hero_poll_cb, 100, NULL);
 	lv_timer_pause(hero_timer);
 }

@@ -237,6 +237,9 @@ void theme_init(void) {
 
 	rebuild_active();
 	apply_palette();
+
+	// The marker on the flash may be missing or older than these settings.
+	bootlogo_follow(active->dark, accent_index);
 }
 
 void theme_apply_slider_knob(lv_obj_t *slider) {
@@ -379,11 +382,8 @@ void theme_toggle(void) {
 	config_set_bool("ui", "dark_theme", active->dark);
 	config_save();
 
-	// The picture shown while the player boots follows the theme too. It is
-	// written into raw flash rather than into the config, because the script
-	// that draws it runs long before any filesystem holding a config is
-	// mounted -- see bootlogo.h.
-	bootlogo_follow_theme(active->dark);
+	// The boot logo follows the theme and the accent; see bootlogo.h.
+	bootlogo_follow(active->dark, accent_index);
 
 	refresh_all();
 }
@@ -400,6 +400,8 @@ void theme_set_accent(int index) {
 
 	config_set_int("ui", "accent", index);
 	config_save();
+
+	bootlogo_follow(active->dark, accent_index);
 
 	refresh_all();
 }

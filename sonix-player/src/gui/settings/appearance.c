@@ -6,6 +6,7 @@
 
 #include "src/gui/fonts/fonts.h"
 #include "src/gui/nowplaying/player.h"
+#include "src/gui/settings/bootlogopage.h"
 #include "src/gui/shell/corners.h"
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/switcher.h"
@@ -311,6 +312,10 @@ void appearance_init(gui_config_t *cfg) {
 	lv_obj_add_style(tint_note, &theme_style_text_dim, 0);
 	lv_obj_set_style_text_font(tint_note, &font_ui_22, 0);
 	lv_label_set_text(tint_note, tr("appearance_dynamic_tint_note"));
+
+	// The picture shown while the player boots, which follows the theme and
+	// the accent unless one of the user's own is chosen.
+	settingsrow_add(container, "bootlogo", NULL, switch_screen_cb, bootlogopage_screen);
 
 	// How big the small text on every page is: the secondary lines, notes,
 	// clocks and counters. See fonts.c for which sizes grow and by how much.

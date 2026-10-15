@@ -236,6 +236,12 @@ bool audio_output_is_bluetooth(void);
 // emulator holds the output only while its own screen is up).
 void audio_set_external_release_cb(bool (*cb)(void));
 
+// The same request, for a source that polls rather than registers: true once
+// local playback, or another external source, has asked for the output since
+// this one began. The metronome checks it between writes and gives the output
+// back.
+bool audio_external_wanted(void);
+
 bool audio_external_begin(int sample_rate, int channels, int bits);
 
 // The same, but stating how deep the buffer must be. `buffer_ms` of 0 means the
@@ -246,6 +252,13 @@ bool audio_external_begin(int sample_rate, int channels, int bits);
 // as its metronome -- writing one frame's samples to a blocking PCM lets ALSA
 // keep the pace of 59.73 frames per second.
 bool audio_external_begin_latency(int sample_rate, int channels, int bits, int buffer_ms);
+
+// begin_latency() for a source that gives the output up to anyone: the
+// metronome. It does not share a PCM another source holds (that one is asked
+// back first, and false comes back if it is not), and a later begin() from any
+// other source sets audio_external_wanted() and waits for it to end before
+// opening its own.
+bool audio_external_begin_yielding(int sample_rate, int channels, int bits, int buffer_ms);
 int audio_external_write(const void *frames, int count);
 void audio_external_end(void);
 

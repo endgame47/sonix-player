@@ -268,6 +268,46 @@ static void scan_cb(lv_event_t *e) {
 	libraryscan_choose_folders();
 }
 
+// "More below": a chevron that drops off the bottom edge as the page opens
+// with tiles under the fold. One short animation of a small picture, moved and
+// faded together, and hidden again once it is over.
+#define MORE_HINT_TRAVEL 40	   // from just above the edge to past it
+#define MORE_HINT_DELAY_MS 150 // long enough for the page to be seen first
+#define MORE_HINT_MS 450
+
+static lv_obj_t *more_hint;
+
+static void more_hint_exec(void *obj, int32_t y) {
+	lv_obj_set_style_translate_y(obj, y, 0);
+	lv_obj_set_style_image_opa(obj, (lv_opa_t)(LV_OPA_COVER - y * LV_OPA_COVER / MORE_HINT_TRAVEL), 0);
+}
+
+static void more_hint_done(lv_anim_t *a) {
+	(void)a;
+	lv_obj_set_hidden(more_hint, true);
+}
+
+static void more_hint_play(void) {
+	if (!more_hint) {
+		return;
+	}
+	lv_anim_delete(more_hint, more_hint_exec);
+	more_hint_exec(more_hint, 0);
+	lv_obj_set_hidden(more_hint, false);
+	lv_obj_move_foreground(more_hint);
+
+	lv_anim_t a;
+	lv_anim_init(&a);
+	lv_anim_set_var(&a, more_hint);
+	lv_anim_set_exec_cb(&a, more_hint_exec);
+	lv_anim_set_values(&a, 0, MORE_HINT_TRAVEL);
+	lv_anim_set_delay(&a, MORE_HINT_DELAY_MS);
+	lv_anim_set_duration(&a, MORE_HINT_MS);
+	lv_anim_set_path_cb(&a, lv_anim_path_ease_in);
+	lv_anim_set_completed_cb(&a, more_hint_done);
+	lv_anim_start(&a);
+}
+
 // The tiles, or what stands in for them: a note that the card is missing --
 // the index lives on it -- or the scan panel while nothing is indexed.
 static void show_tiles_or_panel(void) {
@@ -277,9 +317,14 @@ static void show_tiles_or_panel(void) {
 	}
 	bool empty = !library_scan_running() && library_track_count() == 0;
 	gridpage_show_empty(tile_grid, empty_panel, empty);
-	// More tiles than the screen holds: the scrollbar shows for a moment.
+	// More tiles than the screen holds: the scrollbar shows for a moment, and
+	// the chevron, while there is more below where the page stands.
 	if (!empty) {
 		gridpage_hint_scroll(tile_grid);
+		lv_obj_update_layout(tile_grid);
+		if (lv_obj_get_scroll_bottom(tile_grid) > 0) {
+			more_hint_play();
+		}
 	}
 }
 
@@ -329,5 +374,18 @@ void music_init(gui_config_t *cfg) {
 	lv_obj_add_event_cb(search_btn, search_cb, LV_EVENT_CLICKED, NULL);
 
 	empty_panel = gridpage_empty_panel(music_screen, cfg, &icon_music_note, "music_no_database", scan_cb);
+
+	// Over the tiles but never in the way: a press goes through it to the tile,
+	// or to the pull from the bottom edge. Floating, because on its way down it
+	// leaves the screen, and a child past the edge makes the screen itself
+	// scrollable -- its scrollbar came up over the page's for the length of the
+	// animation.
+	more_hint = lv_image_create(music_screen);
+	lv_image_set_src(more_hint, &icon_chevron_down);
+	lv_obj_add_style(more_hint, &theme_style_icon, 0);
+	lv_obj_align(more_hint, LV_ALIGN_BOTTOM_MID, 0, -MORE_HINT_TRAVEL / 2);
+	lv_obj_set_clickable(more_hint, false);
+	lv_obj_set_floating(more_hint, true);
+	lv_obj_set_hidden(more_hint, true);
 	lv_obj_add_event_cb(music_screen, screen_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
 }

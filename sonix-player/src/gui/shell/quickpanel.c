@@ -479,6 +479,9 @@ static void restore_topbar(void) {
 			topbar_set_hidden(true);
 		}
 	}
+	// And the colours of a page painted in its own (an album's page), which the
+	// bar gave up while the sheet was over it.
+	topbar_tint_hold(false);
 }
 
 static void hide_when_parked_cb(lv_anim_t *a) {
@@ -630,6 +633,8 @@ static void panel_prepare(void) {
 		raised_topbar = true;
 		topbar_set_hidden(false);
 	}
+	// In the theme's colours, like the sheet it now belongs to.
+	topbar_tint_hold(true);
 
 	// The bar is also restacked above the sheet, so clock, battery and volume
 	// stay readable with the control centre open.

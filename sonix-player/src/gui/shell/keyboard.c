@@ -8,6 +8,7 @@
 #include <stdlib.h>
 
 #include "src/gui/fonts/fonts.h"
+#include "src/gui/shell/animpark.h"
 #include "src/gui/shell/icons.h"
 #include "src/gui/shell/theme.h"
 #include "src/system/core/config.h"
@@ -1203,6 +1204,27 @@ void keyboard_set_field(keyboard_t *kb, lv_obj_t *field) {
 // The caret is the left border of the CURSOR part, not a block: three pixels
 // of accent, like a system text field's cursor.
 #define KB_CARET_WIDTH 3
+#define KB_CARET_BLINK_MS 900 // a calm blink
+
+static void caret_set_blink(lv_obj_t *field, uint32_t ms) {
+	const lv_style_selector_t parts[] = {LV_PART_CURSOR, LV_PART_CURSOR | LV_STATE_FOCUSED};
+	for (unsigned i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
+		lv_obj_set_style_anim_duration(field, ms, parts[i]);
+	}
+	// The textarea reads the blink time only when it starts the blink, which it
+	// does when its label's style changes; telling the label so is what makes
+	// the new time count now. A time of 0 is a steady caret with no animation.
+	lv_obj_t *label = lv_obj_check_type(field, &lv_textarea_class) ? lv_textarea_get_label(field) : NULL;
+	if (label) {
+		lv_obj_send_event(label, LV_EVENT_STYLE_CHANGED, NULL);
+	}
+}
+
+// Every textarea blinks from the moment it exists, on whatever page it is, so
+// a caret out of sight stops blinking until it is back (animpark.h).
+static void caret_park(lv_obj_t *field) { caret_set_blink(field, 0); }
+
+static void caret_unpark(lv_obj_t *field) { caret_set_blink(field, KB_CARET_BLINK_MS); }
 
 void keyboard_style_caret(lv_obj_t *field) {
 	if (!field) {
@@ -1232,8 +1254,10 @@ void keyboard_style_caret(lv_obj_t *field) {
 		lv_obj_set_style_border_color(field, theme()->accent, parts[i]);
 		lv_obj_set_style_border_opa(field, LV_OPA_COVER, parts[i]);
 		lv_obj_set_style_border_width(field, KB_CARET_WIDTH, parts[i]);
-		lv_obj_set_style_anim_duration(field, 900, parts[i]); // a calm blink
+		// Styled again at every theme change: a parked caret stays parked.
+		lv_obj_set_style_anim_duration(field, animpark_is_parked(field) ? 0 : KB_CARET_BLINK_MS, parts[i]);
 	}
+	animpark_watch(field, caret_park, caret_unpark);
 }
 
 // ---------------------------------------------------------------------------

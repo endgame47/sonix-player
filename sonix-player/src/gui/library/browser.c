@@ -780,7 +780,7 @@ static void gather_done_cb(void *arg) {
 	case SEND_QUEUE: {
 		int queued = 0;
 		for (int i = 0; i < g->count; i++) {
-			queued += playlist_insert_next(g->paths[i]) ? 1 : 0;
+			queued += playlist_enqueue(g->paths[i]) ? 1 : 0;
 		}
 		if (queued > 0) {
 			// Written down now: the mirror on disk is otherwise refreshed only

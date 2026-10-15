@@ -113,6 +113,21 @@ static double progress_anchor_secs;
 static uint32_t progress_anchor_tick;
 static bool progress_running;
 
+// The smoothing runs only while there is a bar moving on a sheet that can be
+// seen: sixteen wake-ups a second for a panel that is closed or dark are pure
+// drain. Asked again by every poll, which is how it comes back after a wake,
+// and at every opening and closing of the sheet.
+static void smooth_timer_sync(void) {
+	if (!smooth_timer) {
+		return;
+	}
+	if (progress_running && sheet_open && power_screen_is_on()) {
+		lv_timer_resume(smooth_timer);
+	} else {
+		lv_timer_pause(smooth_timer);
+	}
+}
+
 // How often the UI reconciles itself against the playback thread. It polls
 // slowly rather than not at all while stopped: the audio thread can report
 // STOPPED for a moment in the middle of a track change, and a UI that stopped
@@ -4093,13 +4108,7 @@ static void update_progress(void) {
 	progress_anchor_secs = state.progress_current_secs;
 	progress_anchor_tick = lv_tick_get();
 	progress_running = state.status == AUDIO_STATUS_PLAYING && state.progress_total_secs > 0;
-	if (smooth_timer) {
-		if (progress_running) {
-			lv_timer_resume(smooth_timer);
-		} else {
-			lv_timer_pause(smooth_timer);
-		}
-	}
+	smooth_timer_sync();
 
 	set_progress_label(state.progress_current_secs, current_total_length);
 	wave_refresh(cover_shown_path, state.progress_current_secs);
@@ -4755,6 +4764,7 @@ void player_sheet_open(bool animate) {
 		sheet_under = lv_screen_active();
 	}
 	sheet_open = true;
+	smooth_timer_sync();
 	back_btn_player_mode(true);
 	lyrics_screen_hold_update();
 
@@ -4791,6 +4801,7 @@ static void sheet_hidden_anim_ready_cb(lv_anim_t *a) {
 void player_sheet_close(bool animate) {
 	bool was_open = sheet_open;
 	sheet_open = false;
+	smooth_timer_sync();
 	back_btn_player_mode(false);
 	lyrics_screen_hold_update();
 	topbar_set_over_artwork(false, false);

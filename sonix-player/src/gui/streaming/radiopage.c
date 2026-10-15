@@ -13,6 +13,7 @@
 #include "src/gui/shell/icons.h"
 #include "src/gui/nowplaying/player.h"
 #include "src/gui/shell/confirm.h"
+#include "src/gui/shell/pagetimer.h"
 #include "src/gui/shell/popover.h"
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/switcher.h"
@@ -1107,6 +1108,7 @@ static void build_list_page(gui_config_t *cfg) {
 	lv_obj_add_event_cb(radiolist_screen, list_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
 
 	list_timer = lv_timer_create(list_poll_cb, POLL_MS, NULL);
+	pagetimer_bind(list_timer, radiolist_screen, NULL);
 	theme_register_refresh(list_theme_refresh);
 }
 
@@ -1423,5 +1425,5 @@ void radiopage_init(gui_config_t *cfg) {
 
 	// The Wi-Fi can come and go while the page is open; the rows follow it.
 	hub_timer = lv_timer_create(hub_poll_cb, 1000, NULL);
-	(void)hub_timer;
+	pagetimer_bind(hub_timer, radiopage_screen, NULL);
 }

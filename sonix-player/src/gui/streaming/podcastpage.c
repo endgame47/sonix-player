@@ -13,6 +13,7 @@
 #include "src/gui/shell/icons.h"
 #include "src/gui/shell/keyboard.h"
 #include "src/gui/nowplaying/player.h"
+#include "src/gui/shell/pagetimer.h"
 #include "src/gui/shell/popover.h"
 #include "src/gui/shell/toast.h"
 #include "src/gui/nowplaying/cover.h"
@@ -4012,7 +4013,7 @@ void podcastpage_init(gui_config_t *cfg) {
 	fetch_start_thread();
 
 	lv_timer_create(queue_watch_cb, 1000, NULL);
-	lv_timer_create(wifi_watch_cb, 1000, NULL);
+	pagetimer_bind(lv_timer_create(wifi_watch_cb, 1000, NULL), podcast_screen, NULL);
 	art_drop_timer = lv_timer_create(art_drop_cb, ART_DROP_DELAY_MS, NULL);
 	lv_timer_pause(art_drop_timer);
 	art_timer = lv_timer_create(art_poll_cb, 120, NULL);

@@ -99,6 +99,14 @@ void power_screen_off(void);
 void power_toggle_screen(void);
 bool power_screen_is_on(void);
 
+// For the main loop, after every pass of lv_timer_handler(). LVGL starts its
+// animation timer again whenever an animation is created or ends, so the pause
+// put on it at the blank lasts only until the first animation started in the
+// dark -- a title that starts scrolling at a track change -- and from there it
+// runs every 16 ms until the screen comes back. With the panel off this puts it
+// back to sleep; power_screen_on() catches every animation up on the way back.
+void power_keep_animations_paused(void);
+
 // --- Activity notifications (thread-safe; call from any thread) ---
 // Reset the idle timers because the user did something (e.g. a physical
 // button press). Touch input is already accounted for automatically.

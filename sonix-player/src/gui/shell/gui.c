@@ -19,6 +19,7 @@
 #include "src/gui/bluetooth/btsettings.h"
 #include "src/gui/shell/confirm.h"
 #include "src/gui/shell/corners.h"
+#include "src/gui/settings/bootlogopage.h"
 #include "src/gui/settings/kblayoutpage.h"
 #include "src/gui/settings/screensaver.h"
 #include "src/gui/library/audiobookextras.h"
@@ -59,6 +60,7 @@
 #include "src/gui/shell/quickpanel.h"
 #include "src/gui/bluetooth/btreceiverpage.h"
 #include "src/gui/audio/dacpage.h"
+#include "src/gui/audio/metronomepage.h"
 #include "src/system/bluetooth/btreceiver.h"
 #include "src/system/audio/usbdac.h"
 #include "src/system/net/wifitransfer.h"
@@ -506,6 +508,10 @@ static void key_async_cb(void *user_data) {
 	if (usbdac_is_active() || wifitransfer_running()) {
 		return;
 	}
+	// The same while the metronome holds the output.
+	if (metronomepage_key(key)) {
+		return;
+	}
 
 	// Receiver mode is the exception, and the only one: the press still means
 	// what it says, it just has somewhere else to go. The music is on the phone
@@ -624,6 +630,7 @@ void gui_init(gui_config_t *cfg) {
 	gearboypage_screen = lv_obj_create(NULL);
 	gearboyplay_screen = lv_obj_create(NULL);
 	flappybird_screen = lv_obj_create(NULL);
+	metronomepage_screen = lv_obj_create(NULL);
 
 	// Persistent topbar that stays above every screen.
 	topbar_init(cfg);
@@ -670,6 +677,7 @@ void gui_init(gui_config_t *cfg) {
 	gearboysettings_init(cfg); // before the page: its gear opens this
 	gearboypage_init(cfg);
 	flappybird_init(cfg);
+	metronomepage_init(cfg);
 	// before morepage: the books tile opens the shelf, and the shelf opens the
 	// reader.
 	ebookreader_init(cfg);
@@ -697,6 +705,7 @@ void gui_init(gui_config_t *cfg) {
 	processespage_init(cfg); // the processes page the devoptions entry opens
 	// after devoptions: the system entry opens the page that can unlock it
 	systempage_init(cfg);
+	bootlogopage_init(cfg); // before appearance: its row carries the screen
 	appearance_init(cfg);
 	language_init(cfg);
 	libraryscan_init(cfg);
@@ -745,7 +754,7 @@ void gui_init(gui_config_t *cfg) {
 		wifisettings_screen,
 		btsettings_screen, btaudio_screen,	 airpodspage_screen, airplay_screen,   streaming_screen,
 		radiopage_screen,  radiolist_screen, radiosearch_screen,
-		dlna_screen,	   sonixlink_screen,	 morepage_screen,	  gearboypage_screen,
+		dlna_screen,	   sonixlink_screen,	 morepage_screen,	  gearboypage_screen, metronomepage_screen,
 	};
 	for (size_t i = 0; i < sizeof(back_swipe_screens) / sizeof(back_swipe_screens[0]); i++) {
 		switcher_attach_back_gesture(back_swipe_screens[i]);

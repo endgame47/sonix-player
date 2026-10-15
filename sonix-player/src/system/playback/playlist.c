@@ -10,6 +10,7 @@
 #include <dirent.h>
 #include <stdint.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -736,6 +737,23 @@ bool playlist_insert_at(const char *path, int slot) {
 	return true;
 }
 
+bool playlist_enqueue_at_end(void) { return config_get_int("player", "queue_add_end", 0) != 0; }
+
+void playlist_set_enqueue_at_end(bool at_end) {
+	config_set_int("player", "queue_add_end", at_end ? 1 : 0);
+	config_save();
+}
+
+bool playlist_enqueue(const char *path) {
+	if (!playlist_enqueue_at_end()) {
+		return playlist_insert_next(path);
+	}
+	// A slot past the last appends: the end of the queue in playing order,
+	// which with shuffle on is the end of the order dealt. Ahead of playback
+	// unless the queue is empty, when the track simply becomes the queue.
+	return playlist_insert_at(path, INT_MAX);
+}
+
 static void refresh_stale_source(void);
 
 typedef struct {
@@ -759,31 +777,10 @@ static bool collect_cb(const char *name, const char *path, const char *artist, v
 	return true;
 }
 
-bool playlist_remove(const int *indices, int count) {
-	if (!indices || count <= 0 || !order || entry_count == 0) {
-		return false;
-	}
-	refresh_stale_source();
-
-	// Which entries go, by where they are stored. The one playing stays.
-	uint8_t *gone = calloc(entry_count, 1);
-	if (!gone) {
-		return false;
-	}
-	size_t removed = 0;
-	for (int i = 0; i < count; i++) {
-		int at = indices[i];
-		if (at < 0 || (size_t)at >= entry_count || (size_t)at == pos || gone[order[at]]) {
-			continue;
-		}
-		gone[order[at]] = 1;
-		removed++;
-	}
-	if (removed == 0) {
-		free(gone);
-		return false;
-	}
-
+// Rebuilds the queue as a list of paths in the order it is played, without the
+// entries `gone` marks (by where they are stored), and with playback on the
+// track it was on. Takes `gone`, and frees it whatever happens.
+static bool rebuild_as_paths(uint8_t *gone) {
 	// Every entry becomes a path: the rows of a library list are read in one
 	// pass rather than one lookup each. What is left of the queue is no longer
 	// that list, so it is not held as one either.
@@ -867,6 +864,85 @@ bool playlist_remove(const int *indices, int count) {
 	free(old_order);
 	free(kept_at);
 	free(gone);
+	return true;
+}
+
+bool playlist_remove(const int *indices, int count) {
+	if (!indices || count <= 0 || !order || entry_count == 0) {
+		return false;
+	}
+	refresh_stale_source();
+
+	// Which entries go, by where they are stored. The one playing stays.
+	uint8_t *gone = calloc(entry_count, 1);
+	if (!gone) {
+		return false;
+	}
+	size_t removed = 0;
+	for (int i = 0; i < count; i++) {
+		int at = indices[i];
+		if (at < 0 || (size_t)at >= entry_count || (size_t)at == pos || gone[order[at]]) {
+			continue;
+		}
+		gone[order[at]] = 1;
+		removed++;
+	}
+	if (removed == 0) {
+		free(gone);
+		return false;
+	}
+
+	return rebuild_as_paths(gone);
+}
+
+bool playlist_move(int from, int to) {
+	if (!order || from < 0 || to < 0 || (size_t)from >= entry_count || (size_t)to >= entry_count || from == to) {
+		return false;
+	}
+	// The library list under the queue read again: the positions the caller
+	// counted may stand for other tracks now.
+	unsigned seen = revision;
+	refresh_stale_source();
+	if (revision != seen) {
+		return false;
+	}
+
+	// An order of its own is something the query a library list is kept as
+	// cannot say: the queue becomes the paths, as a removal makes it.
+	if (ix_count > 0) {
+		size_t before = entry_count;
+		uint8_t *none = calloc(entry_count, 1);
+		if (!none || !rebuild_as_paths(none)) {
+			return false;
+		}
+		// A row of the library that has gone meanwhile was dropped, and the
+		// positions the caller counted are off by it.
+		if (entry_count != before) {
+			return false;
+		}
+	}
+
+	size_t entry = order[from];
+	if (from < to) {
+		memmove(&order[from], &order[from + 1], (size_t)(to - from) * sizeof(*order));
+	} else {
+		memmove(&order[to + 1], &order[to], (size_t)(from - to) * sizeof(*order));
+	}
+	order[to] = entry;
+
+	// Playback stays on its track, wherever that has gone.
+	size_t f = (size_t)from, t = (size_t)to;
+	if (pos == f) {
+		pos = t;
+	} else if (f < pos && t >= pos) {
+		pos--;
+	} else if (f > pos && t <= pos) {
+		pos++;
+	}
+
+	chain_valid = false;
+	custom_queue = true;
+	revision++;
 	return true;
 }
 

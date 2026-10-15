@@ -54,6 +54,19 @@ void playlist_load_paths_ordered(const char *const *list, int count, int start_i
 // Returns false only when the track could not be stored (out of memory).
 bool playlist_insert_next(const char *path);
 
+// "Add to queue" from the library, the search and the browser, where the
+// user's setting puts it (Music settings > Playback options, [player]
+// queue_add_end): right after the track playing, as playlist_insert_next(), or
+// at the end of the queue, after everything already in it. Several added one
+// after another keep the order they were added in either way. Returns false
+// only when the track could not be stored (out of memory).
+bool playlist_enqueue(const char *path);
+
+// Whether playlist_enqueue() adds at the end. Read and written through the
+// configuration, so the setting page and the queue agree without a cache.
+bool playlist_enqueue_at_end(void);
+void playlist_set_enqueue_at_end(bool at_end);
+
 // The same, but at a slot chosen by the caller rather than after the current
 // track. For putting a saved queue back exactly as it was left.
 //
@@ -71,6 +84,13 @@ bool playlist_insert_at(const char *path, int slot);
 // queue. The one playing is never taken out, and the others keep their order.
 // The queue becomes a custom list of paths. False when nothing was taken out.
 bool playlist_remove(const int *indices, int count);
+
+// Moves the entry at `from` to `to` (positions in playback order; `to` is
+// where it ends up). Playback stays on the track it is on, and the queue
+// becomes a custom list of paths, as with a removal. False when either
+// position is out of range, they are the same, or the library list under the
+// queue changed meanwhile and the positions no longer stand for the same tracks.
+bool playlist_move(int from, int to);
 
 // True while the queue is a custom list rather than a folder.
 bool playlist_is_custom(void);

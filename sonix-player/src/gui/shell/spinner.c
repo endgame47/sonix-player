@@ -1,5 +1,6 @@
 #include "spinner.h"
 
+#include "src/gui/shell/animpark.h"
 #include "src/gui/shell/theme.h"
 
 // One full turn. A second and a half: faster looks frantic, slower looks stalled.
@@ -9,6 +10,24 @@
 #define SPIN_FULL_TURN 3600
 
 static void spin_cb(void *obj, int32_t angle) { lv_image_set_rotation((lv_obj_t *)obj, angle); }
+
+// One endless turn from wherever the icon stands, so a spinner given back by
+// animpark carries on from where it stopped.
+static void spin_start(lv_obj_t *img) {
+	int32_t from = lv_image_get_rotation(img);
+	lv_anim_t a;
+	lv_anim_init(&a);
+	lv_anim_set_var(&a, img);
+	lv_anim_set_exec_cb(&a, spin_cb);
+	lv_anim_set_values(&a, from, from + SPIN_FULL_TURN);
+	lv_anim_set_duration(&a, SPIN_PERIOD_MS);
+	lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+	// Linear: a spinner that speeds up and slows down each turn looks broken.
+	lv_anim_set_path_cb(&a, lv_anim_path_linear);
+	lv_anim_start(&a);
+}
+
+static void spin_stop(lv_obj_t *img) { lv_anim_delete(img, spin_cb); }
 
 lv_obj_t *spinner_create(lv_obj_t *parent, const lv_image_dsc_t *icon) {
 	lv_obj_t *img = lv_image_create(parent);
@@ -25,16 +44,10 @@ lv_obj_t *spinner_create(lv_obj_t *parent, const lv_image_dsc_t *icon) {
 	// quarter turn.
 	lv_obj_set_overflow_visible(img, true);
 
-	lv_anim_t a;
-	lv_anim_init(&a);
-	lv_anim_set_var(&a, img);
-	lv_anim_set_exec_cb(&a, spin_cb);
-	lv_anim_set_values(&a, 0, SPIN_FULL_TURN);
-	lv_anim_set_duration(&a, SPIN_PERIOD_MS);
-	lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
-	// Linear: a spinner that speeds up and slows down each turn looks broken.
-	lv_anim_set_path_cb(&a, lv_anim_path_linear);
-	lv_anim_start(&a);
+	spin_start(img);
+	// Spinners wait on hidden layers and on pages left behind; turning there
+	// would keep LVGL's animation timer awake for nothing.
+	animpark_watch(img, spin_stop, spin_start);
 
 	return img;
 }

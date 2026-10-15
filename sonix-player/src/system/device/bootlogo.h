@@ -3,41 +3,47 @@
 
 #include <stdbool.h>
 
-// The picture shown while the player boots, and how it follows the theme.
+// The picture shown while the player boots: which one, and the user's own.
 //
-// It is not the player that draws it: by the time the player is running the
-// logo has long gone. It is `/etc/init.d/S11jpeg_display_shell`, which runs
-// before anything else and picks one of three files:
+// It is drawn by `/etc/init.d/S11jpeg_display_shell`, long before the player
+// runs and before any filesystem holding a configuration is mounted. The
+// choice therefore lives in raw NAND, in a block of /dev/mtd5 that holds
+// nothing else, as 13 bytes at 0x20000:
 //
-//     theme=$(nanddump -q -s 0x20000 -l 7 /dev/mtd5 -a)
-//     if   [ "$theme" == "theme:1" ]; then cmd_jpeg_display /etc/logo1.jpeg
-//     elif [ "$theme" == "theme:2" ]; then cmd_jpeg_display /etc/logo2.jpeg
-//     else                                 cmd_jpeg_display /etc/logo.jpeg
+//     theme:T,aA,cC
 //
-// So the setting does not live in a file at all -- a rootfs mounted read-only
-// could not hold it, and /usr/data is not mounted yet when the script runs. It
-// lives in seven bytes of raw NAND, in a block of /dev/mtd5 that belongs to
-// nothing else, and the stock player writes it with the two commands its own
-// binary carries as strings:
+//   T  1 light, 2 dark
+//   A  the accent, 0-5, the index into theme.c's ACCENT_COLORS
+//   C  1 when BOOTLOGO_CUSTOM_FILE is the logo to show
 //
-//     flash_erase -q /dev/mtd5 0x20000 1
-//     printf %-256s | nandwrite -q -s 0x20000 -p /dev/mtd5 -
+// The first seven bytes are the stock firmware's own marker, which its script
+// reads as "theme:1" or "theme:2". The script shows
+// /etc/boot-logo/<light|dark>-theme-<colour>.jpeg, or the custom file when C
+// is 1; with C at 1 it also mounts userdata early so the file is there in time.
 //
-// logo1 is the pale one and logo2 the dark one, which is why light theme
-// writes 1 and dark writes 2.
-//
-// Two things this module is careful about, because raw flash is not a file:
-// it reads the marker first and does nothing when it already agrees (NAND has
-// a finite number of erase cycles and a theme switch is one tap), and it does
-// the writing on a thread of its own (flash_erase takes long enough to be seen
-// as a freeze).
+// The marker is written with the stock tools, `flash_erase` on the block and
+// `nandwrite` of one page, on a thread of its own, and only when it differs
+// from what is on the flash: NAND has a finite number of erase cycles.
 
-// Which marker is on the flash now: 1, 2, or 0 for none/unreadable.
-int bootlogo_current(void);
+// The user's own logo, on the userdata partition.
+#define BOOTLOGO_CUSTOM_FILE "/usr/data/bootlogo.jpeg"
 
-// Points the boot logo at the theme. Returns immediately; the flash work
-// happens on a worker. A no-op when the marker already matches, when the
-// device has no /dev/mtd5, or on the host build.
-void bootlogo_follow_theme(bool dark);
+// Brings the marker in line with the theme, the accent and whether a custom
+// logo exists. Returns at once; the flash work happens on a worker. A no-op on
+// a device without /dev/mtd5 and on the host build.
+void bootlogo_follow(bool dark, int accent);
+
+// Whether a custom logo is set.
+bool bootlogo_has_custom(void);
+
+// Makes `image_path` (a JPEG or a PNG) the boot logo: scaled to cover
+// `width` x `height`, cropped to it around the centre, and saved as a baseline
+// JPEG at BOOTLOGO_CUSTOM_FILE. Blocks for the decode and the encode, so it is
+// called off the UI thread. False when the picture cannot be read or the file
+// cannot be written; the previous logo is then left as it was.
+bool bootlogo_make_custom(const char *image_path, int width, int height);
+
+// Back to the theme's logo: deletes the custom file.
+void bootlogo_clear_custom(void);
 
 #endif /* BOOTLOGO_H */

@@ -5,6 +5,7 @@
 #include "src/gui/shell/confirm.h"
 #include "src/gui/fonts/fonts.h"
 #include "src/gui/shell/icons.h"
+#include "src/gui/shell/pagetimer.h"
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/switcher.h"
 #include "src/gui/shell/theme.h"
@@ -279,5 +280,5 @@ void dacpage_init(gui_config_t *cfg) {
 	switcher_set_back_guard(dacpage_screen, back_guard);
 
 	poll_timer = lv_timer_create(poll_cb, 500, NULL);
-	(void)poll_timer;
+	pagetimer_bind(poll_timer, dacpage_screen, NULL);
 }
