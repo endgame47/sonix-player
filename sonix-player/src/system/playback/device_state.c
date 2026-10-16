@@ -3,21 +3,23 @@
 #include "src/system/audio/alsa-controls.h"
 #include "src/system/audio/audio.h"
 #include "src/system/audio/readahead.h"
-#include "src/system/playback/audiobook.h"
+#include "src/system/audio/replaygain.h"
 #include "src/system/core/config.h"
 #include "src/system/core/lang.h"
+#include "src/system/decode/growfile.h"
+#include "src/system/device/system.h"
 #include "src/system/library/library.h"
 #include "src/system/library/metadata.h"
+#include "src/system/playback/audiobook.h"
+#include "src/system/playback/playhistory.h"
 #include "src/system/playback/playlist.h"
+#include "src/system/remote/dlna.h"
 #include "src/system/streaming/podcast.h"
 #include "src/system/streaming/podcastcache.h"
 #include "src/system/streaming/podcaststate.h"
-#include "src/system/decode/growfile.h"
 #include "src/system/streaming/qobuzcache.h"
-#include "src/system/streaming/tidalcache.h"
 #include "src/system/streaming/radio.h"
-#include "src/system/audio/replaygain.h"
-#include "src/system/device/system.h"
+#include "src/system/streaming/tidalcache.h"
 
 #include <pthread.h>
 #include <stdio.h>
@@ -490,6 +492,28 @@ static void apply_track_speed(void) {
 // beginning. A tap in a list clears this first.
 static char started_file[512];
 
+// The history (playhistory.h) is told about every track that starts, and about
+// the one it replaces. A track started again where it already is -- the same
+// file picked up at a position, as a book or an interrupted track is, or
+// restarted to be sought in -- has not been left.
+static bool history_same_listen;
+
+static void history_leave_for(const char *next, double position) {
+	bool same = next && strcmp(next, current_metadata_file) == 0 && (position > 0 || history_same_listen);
+	history_same_listen = false;
+	if (!same) {
+		playhistory_left();
+	}
+}
+
+// `restored`: put back by a reboot, paused, and not played again until play is
+// pressed.
+static void note_started(bool restored) {
+	snprintf(started_file, sizeof(started_file), "%s", current_metadata_file);
+	bool kept_out = audiobook_is_playing() || podcastcache_is_episode(current_metadata_file) || dlna_owns_path(current_metadata_file);
+	playhistory_started(current_metadata_file, current_metadata.title, metadata_shown_artist(&current_metadata), kept_out, restored);
+}
+
 // Where a podcast episode should start when nobody said: where it was left.
 // Not on a file still coming down -- the point may not have arrived, and a seek
 // past what has arrived is refused rather than waited for; the podcast page
@@ -516,6 +540,7 @@ static void load_and_play_at(const char *filepath, double position) {
 	// the track can change under a held button -- the queue advances on its
 	// own when the outgoing one ends.
 	scrub_cancel();
+	history_leave_for(filepath, position);
 
 	// A file and a stream cannot both have the output. Starting a track ends
 	// the radio outright -- not merely stops it -- because from here on the
@@ -558,7 +583,7 @@ static void load_and_play_at(const char *filepath, double position) {
 	} else {
 		audio_play(current_metadata_file);
 	}
-	snprintf(started_file, sizeof(started_file), "%s", current_metadata_file);
+	note_started(false);
 
 	// Any track load supersedes the note: it belongs to the one press that
 	// follows the storage coming back.
@@ -574,6 +599,7 @@ static void load_and_play(const char *filepath) { load_and_play_at(filepath, -1.
 // play starts it. The queue is left as it is.
 static void load_paused(const char *filepath) {
 	scrub_cancel();
+	history_leave_for(filepath, -1.0);
 	radio_clear();
 
 	if (filepath != current_metadata_file) {
@@ -585,7 +611,7 @@ static void load_paused(const char *filepath) {
 	apply_track_speed();
 
 	audio_play_paused(current_metadata_file, 0);
-	snprintf(started_file, sizeof(started_file), "%s", current_metadata_file);
+	note_started(false);
 	audiobook_suppress_rewind_once();
 
 	interrupted_file[0] = '\0';
@@ -627,7 +653,7 @@ void device_state_restore_file(const char *filepath, double position) {
 	apply_track_speed();
 
 	audio_play_paused(current_metadata_file, position);
-	snprintf(started_file, sizeof(started_file), "%s", current_metadata_file);
+	note_started(true);
 	device_state_remember_restored(current_metadata_file, position);
 
 	queue_persist();
@@ -710,7 +736,7 @@ void device_state_restore_index(library_index_t *ix, int start_index, const char
 	restore_queue_album();
 
 	audio_play_paused(current_metadata_file, position);
-	snprintf(started_file, sizeof(started_file), "%s", current_metadata_file);
+	note_started(true);
 	device_state_remember_restored(current_metadata_file, position);
 }
 
@@ -761,7 +787,7 @@ void device_state_restore_list(const char *const *list, int count, int start_ind
 	restore_queue_album();
 
 	audio_play_paused(current_metadata_file, position);
-	snprintf(started_file, sizeof(started_file), "%s", current_metadata_file);
+	note_started(true);
 	device_state_remember_restored(current_metadata_file, position);
 }
 
@@ -786,6 +812,7 @@ void device_state_play_file_at(const char *filepath, double position) {
 
 	playlist_load_folder(folder, filename);
 
+	history_leave_for(filepath, position);
 	radio_clear();
 	if (filepath != current_metadata_file) {
 		strncpy(current_metadata_file, filepath, sizeof(current_metadata_file) - 1);
@@ -798,7 +825,7 @@ void device_state_play_file_at(const char *filepath, double position) {
 	apply_track_speed();
 
 	audio_play_at(current_metadata_file, position);
-	snprintf(started_file, sizeof(started_file), "%s", current_metadata_file);
+	note_started(false);
 
 	queue_persist();
 }
@@ -1303,7 +1330,10 @@ bool device_state_advance_auto(char *out_path, size_t out_size) {
 	}
 
 	if (!playlist_advance_auto(path, sizeof(path))) {
-		return false; // the queue is spent, and there was no record to follow
+		// The queue is spent, and there was no record to follow: the last
+		// track has been heard to its end.
+		playhistory_left();
+		return false;
 	}
 
 	load_and_play(path);
@@ -1482,6 +1512,7 @@ audio_status_t device_state_toggle_play_pause(void) {
 			double back = current - (double)audiobook_rewind_seconds();
 			audio_seek(back > 0 ? back : 0);
 		}
+		playhistory_resumed();
 		audio_resume();
 		return AUDIO_STATUS_PLAYING;
 	case AUDIO_STATUS_STOPPED:
@@ -1604,6 +1635,7 @@ void device_state_seek(double seconds) {
 	// (e.g. dragging the slider or hitting prev) resumes playback intuitively
 	// instead of silently doing nothing.
 	if (audio_get_status() == AUDIO_STATUS_STOPPED && current_metadata_file[0]) {
+		history_same_listen = true;
 		load_and_play(current_metadata_file);
 	}
 	audio_seek(seconds);

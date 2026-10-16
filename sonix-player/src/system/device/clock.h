@@ -36,9 +36,13 @@ void clock_remember(void);
 // ---------------------------------------------------------------------------
 // The time zone
 //
-// Chosen by the user, in Settings > Date and time > Time zone. Fixed offsets,
-// with no daylight saving: switching zone moves the offset by an hour, exactly
-// as the original firmware treats it.
+// By hand: chosen by the user, in Settings > Date and time > Time zone. Fixed
+// offsets, with no daylight saving: switching zone moves the offset by an hour,
+// exactly as the original firmware treats it.
+//
+// Automatic: located by the network along with the time, as an IANA zone whose
+// rule moves between standard time and daylight saving on its own (see
+// clock_zone_automatic()).
 //
 // Until one is chosen the player behaves as it always did -- the system clock
 // holds local time and the C library shifts nothing -- so not knowing the zone
@@ -47,6 +51,7 @@ void clock_remember(void);
 // ---------------------------------------------------------------------------
 
 bool clock_utc_offset_known(void);
+// The standard time of the zone in use, daylight saving left out.
 int clock_utc_offset_minutes(void);
 
 // Daylight saving time, kept as its own thing.
@@ -58,6 +63,10 @@ int clock_utc_offset_minutes(void);
 //
 // So the two are kept apart: the list says where, this switch says when. What
 // reaches the system is their sum.
+//
+// With the zone located by the network, clock_dst_enabled() says whether its
+// rule has daylight saving on right now, and clock_set_dst() only changes the
+// hand-set value, used again once the clock is manual.
 bool clock_dst_enabled(void);
 void clock_set_dst(bool on);
 
@@ -75,7 +84,36 @@ void clock_set_utc_offset_minutes(int minutes);
 // Returns immediately; the work happens on a detached thread, and a successful
 // answer is written straight through to the RTC. Called on every Wi-Fi
 // association, and rate-limited internally to one attempt per half hour.
+// The same attempt asks where the device is, for the time zone. Nothing happens
+// with the clock set to manual.
 void clock_network_sync(void);
+
+// Date and time set automatically (the network, above) or by hand: the choice
+// on the Date and time page, kept as [clock] automatic. On by default.
+bool clock_auto_enabled(void);
+void clock_set_auto(bool on);
+
+// An attempt now, half hour or not: the page asks when it is switched to
+// automatic. False when none could start (no ntpdate on this firmware).
+bool clock_network_sync_now(void);
+
+// How many attempts have ended so far, and whether one is running and how the
+// last one went: the page watches the count to know when to say something.
+unsigned clock_network_sync_result(bool *running, bool *ok);
+
+// True while the zone comes from the network: the clock is automatic and an
+// attempt has located the device at least once. The zone list and the daylight
+// saving switch are then the network's, not the user's.
+bool clock_zone_automatic(void);
+
+// The located zone's IANA name ("Europe/Rome"), or "" while
+// clock_zone_automatic() is false.
+const char *clock_zone_name(void);
+
+// Installs a zone an attempt has just located. The attempt runs on a thread of
+// its own and the zone is put in place here, on the interface thread; call it
+// on a timer. True when the local time may have moved.
+bool clock_poll(void);
 
 // Puts the system clock back where it belongs; returns true if it had to move
 // it.

@@ -1,18 +1,22 @@
 #include "timeset.h"
 
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 
 #include "lvgl/lvgl.h"
 
 #include "src/gui/fonts/fonts.h"
+#include "src/gui/shell/confirm.h"
 #include "src/gui/shell/icons.h"
 #include "src/gui/shell/settingsrow.h"
+#include "src/gui/shell/tabbar.h"
 #include "src/gui/shell/theme.h"
 #include "src/gui/shell/topbar.h"
 #include "src/system/device/clock.h"
 #include "src/system/core/lang.h"
 #include "src/system/device/power.h"
+#include "src/system/net/wifi.h"
 
 #define TIMESET_YEAR_FIRST 2025
 #define TIMESET_YEAR_LAST 2044
@@ -37,6 +41,27 @@ static lv_obj_t *confirm_btn;
 static lv_obj_t *h24_switch;
 static lv_obj_t *tz_value;	// the label at the right of the "Time zone" row
 static lv_obj_t *dst_pills[2]; // 0 = standard time, 1 = daylight saving
+
+// Manual or automatic, the tabs at the top. Automatic leaves the date, the
+// time, the zone and daylight saving to the network (clock_network_sync()):
+// their cards stay on the page, switched off and following the clock, with a
+// line saying how the network is doing. The 24-hour clock is still the user's.
+#define MODE_MANUAL 0
+#define MODE_AUTOMATIC 1
+static tabbar_t mode_tabs;
+static lv_obj_t *date_card;
+static lv_obj_t *time_card;
+static lv_obj_t *tz_card;
+static lv_obj_t *dst_card;
+static lv_obj_t *auto_status;
+static lv_timer_t *auto_timer;
+static unsigned auto_seen_syncs; // clock_network_sync_result() when last looked at
+static bool auto_waiting_wifi;	 // Wi-Fi switched on from here: ask the network once it connects
+
+// Shown as the first-boot page: no way back, no status bar. Decided when the
+// page opens rather than read from the clock each time, because on the first
+// boot the network may set the clock while the page is up.
+static bool first_boot;
 
 // The right one lit, the other not: same shape as the quality and theme pills,
 // so it reads as a choice between two things rather than switching one on.
@@ -211,10 +236,11 @@ static void h24_toggle_cb(lv_event_t *e) {
 // ---------------------------------------------------------------------------
 // The time zone
 //
-// Stated by the user rather than inferred: the RTC keeps UTC, and nothing on
-// the device can work out the offset to apply to it without being told. The
-// entries are fixed offsets, as the original firmware treats them; daylight
-// saving is a separate choice below the list.
+// By hand, stated by the user rather than inferred: the RTC keeps UTC, and
+// nothing on the device can work out the offset to apply to it without being
+// told. The entries are fixed offsets, as the original firmware treats them;
+// daylight saving is a separate choice below the list. In automatic the network
+// locates the zone instead (clock_zone_automatic()), and the row shows where.
 
 // `places` is the tag of the cities beside the offset, not the cities
 // themselves: a zone list that says "Londra, Lisbona" to somebody reading the
@@ -321,14 +347,30 @@ static void tz_paint(void) {
 		}
 	}
 
-	if (tz_value) {
-		if (selected < 0) {
-			lv_label_set_text(tz_value, tr("timeset_not_set"));
-		} else {
-			char text[16];
-			tz_format_offset(TIMEZONES[selected].minutes, text, sizeof(text));
-			lv_label_set_text(tz_value, text);
+	if (!tz_value) {
+		return;
+	}
+	char offset[16];
+	tz_format_offset(clock_utc_offset_minutes(), offset, sizeof(offset));
+	if (clock_zone_automatic()) {
+		// The place the network found, by the last part of its name:
+		// "America/Argentina/Buenos_Aires" is "Buenos Aires".
+		const char *zone = clock_zone_name();
+		const char *slash = strrchr(zone, '/');
+		char city[64];
+		snprintf(city, sizeof(city), "%s", slash ? slash + 1 : zone);
+		for (char *c = city; *c; c++) {
+			if (*c == '_') {
+				*c = ' ';
+			}
 		}
+		char text[96];
+		snprintf(text, sizeof(text), "%s (%s)", city, offset);
+		lv_label_set_text(tz_value, text);
+	} else if (selected < 0) {
+		lv_label_set_text(tz_value, tr("timeset_not_set"));
+	} else {
+		lv_label_set_text(tz_value, offset);
 	}
 }
 
@@ -343,7 +385,7 @@ static void tz_close(void) {
 	// boot the bar is not hidden, only covered by the panels built after it, so
 	// an unguarded call to bring it forward puts it back on top for good.
 	// Choosing a zone goes through here, since tz_pick_cb closes the list.
-	if (!timeset_needed()) {
+	if (!first_boot) {
 		topbar_bring_to_front();
 	}
 }
@@ -391,7 +433,7 @@ static void tz_open_cb(lv_event_t *e) {
 	// behind, for the same reason it does on Date and time: there is no clock to
 	// show yet, and that is exactly what is being asked for (see
 	// timeset_show()).
-	if (!timeset_needed()) {
+	if (!first_boot) {
 		topbar_bring_to_front();
 	}
 
@@ -426,8 +468,187 @@ static lv_obj_t *make_card(lv_obj_t *parent) {
 	return card;
 }
 
+// ---------------------------------------------------------------------------
+// Manual or automatic
+// ---------------------------------------------------------------------------
+
+// Switched off, the cards stay where they are, dimmed and deaf to the finger.
+static void cards_enable(bool on) {
+	if (tz_card) {
+		lv_obj_set_style_opa(tz_card, on ? LV_OPA_COVER : LV_OPA_40, 0);
+		lv_obj_set_clickable(tz_card, on);
+	}
+	lv_obj_t *const cards[] = {date_card, time_card, dst_card};
+	for (size_t c = 0; c < sizeof(cards) / sizeof(cards[0]); c++) {
+		if (!cards[c]) {
+			continue;
+		}
+		lv_obj_set_style_opa(cards[c], on ? LV_OPA_COVER : LV_OPA_40, 0);
+		uint32_t count = lv_obj_get_child_count(cards[c]);
+		for (uint32_t i = 0; i < count; i++) {
+			lv_obj_t *child = lv_obj_get_child(cards[c], (int32_t)i);
+			if (lv_obj_check_type(child, &lv_button_class)) {
+				// The daylight saving pills keep their colours, dimmed with the
+				// card, so the one in force can still be read.
+				lv_obj_set_clickable(child, on);
+				continue;
+			}
+			if (!lv_obj_check_type(child, &lv_roller_class)) {
+				continue;
+			}
+			if (on) {
+				lv_obj_remove_state(child, LV_STATE_DISABLED);
+			} else {
+				lv_obj_add_state(child, LV_STATE_DISABLED);
+			}
+			lv_obj_set_clickable(child, on);
+		}
+	}
+}
+
+// The line under the tabs: what the network has done, or why it cannot.
+static void auto_status_paint(void) {
+	if (!auto_status) {
+		return;
+	}
+	const char *tag;
+	bool running = false, ok = false;
+	unsigned syncs = clock_network_sync_result(&running, &ok);
+	wifi_status_t wifi;
+	wifi_get_status(&wifi);
+
+	if (running) {
+		tag = "timeset_auto_syncing";
+	} else if (syncs != auto_seen_syncs && !ok) {
+		tag = "timeset_auto_failed";
+	} else if (syncs != auto_seen_syncs && !clock_zone_automatic()) {
+		tag = "timeset_auto_no_zone";
+	} else if (syncs != auto_seen_syncs) {
+		tag = "timeset_auto_synced";
+	} else if (!wifi_get_enabled() || wifi.state == WIFI_STATE_OFF) {
+		tag = "timeset_auto_wifi_off";
+	} else if (wifi.state != WIFI_STATE_CONNECTED) {
+		tag = "timeset_auto_no_network";
+	} else if (clock_is_set()) {
+		tag = "timeset_auto_synced";
+	} else {
+		tag = "timeset_auto_syncing";
+	}
+	lv_label_set_text(auto_status, tr(tag));
+}
+
+// Once a second while the page is up in automatic: the rollers follow the
+// clock the network keeps, and Wi-Fi switched on from here is used as soon as
+// it has a network.
+static void auto_tick_cb(lv_timer_t *t) {
+	(void)t;
+	if (!panel || lv_obj_is_hidden(panel) || !clock_auto_enabled()) {
+		return;
+	}
+	if (auto_waiting_wifi) {
+		wifi_status_t wifi;
+		wifi_get_status(&wifi);
+		if (wifi.state == WIFI_STATE_CONNECTED) {
+			auto_waiting_wifi = false;
+			clock_network_sync_now();
+		}
+	}
+	// The zone may have come in with the time, and daylight saving may have
+	// started or ended since the last tick.
+	if (clock_poll()) {
+		topbar_refresh_clock();
+	}
+	seed_rollers_from_clock();
+	tz_paint();
+	dst_paint();
+	auto_status_paint();
+}
+
+static void auto_timer_run(bool on) {
+	if (on && !auto_timer) {
+		auto_timer = lv_timer_create(auto_tick_cb, 1000, NULL);
+	} else if (!on && auto_timer) {
+		lv_timer_delete(auto_timer);
+		auto_timer = NULL;
+	}
+}
+
+// The page as the mode says: tabs, cards, the status line and its timer.
+static void mode_paint(void) {
+	bool automatic = clock_auto_enabled();
+	tabbar_set_active(&mode_tabs, automatic ? MODE_AUTOMATIC : MODE_MANUAL);
+	cards_enable(!automatic);
+	if (auto_status) {
+		lv_obj_set_hidden(auto_status, !automatic);
+	}
+	if (automatic) {
+		seed_rollers_from_clock();
+		auto_status_paint();
+	}
+	tz_paint();
+	dst_paint();
+	auto_timer_run(automatic && panel && !lv_obj_is_hidden(panel));
+}
+
+static void enable_wifi_cb(void *user) {
+	(void)user;
+	wifi_set_enabled(true);
+	auto_waiting_wifi = true;
+	auto_status_paint();
+}
+
+// Asks the network now, or, with Wi-Fi off, whether to switch it on for that.
+static void auto_start(void) {
+	wifi_status_t wifi;
+	wifi_get_status(&wifi);
+	if (wifi.state == WIFI_STATE_CONNECTED) {
+		clock_network_sync_now();
+	} else if (!wifi_get_enabled() && wifi_available()) {
+		confirm_show("timeset_enable_wifi", "timeset_enable_wifi_note", "timeset_enable_wifi_button", enable_wifi_cb, NULL);
+	}
+	auto_status_paint();
+}
+
+static void mode_pick_cb(lv_event_t *e) {
+	bool automatic = (int)(intptr_t)lv_event_get_user_data(e) == MODE_AUTOMATIC;
+	if (automatic == clock_auto_enabled()) {
+		return;
+	}
+	clock_set_auto(automatic);
+	topbar_refresh_clock(); // the zone in use may have changed with the mode
+	if (!automatic) {
+		auto_waiting_wifi = false;
+	}
+	// The count as it is now: a result from before the switch is not news.
+	auto_seen_syncs = clock_network_sync_result(NULL, NULL);
+	mode_paint();
+	if (automatic) {
+		auto_start();
+	}
+}
+
+// Leaving the page, whichever way.
+static void panel_close(void) {
+	auto_timer_run(false);
+	auto_waiting_wifi = false;
+	first_boot = false;
+	lv_obj_set_hidden(panel, true);
+	if (tz_panel) {
+		lv_obj_set_hidden(tz_panel, true);
+	}
+}
+
 static void confirm_cb(lv_event_t *e) {
 	(void)e;
+
+	// In automatic the rollers only showed what the network said: there is
+	// nothing of the user's to write.
+	if (clock_auto_enabled()) {
+		power_hold_screen_on(false);
+		power_notify_activity();
+		panel_close();
+		return;
+	}
 
 	int day = (int)lv_roller_get_selected(roller_day) + 1;
 	int month = (int)lv_roller_get_selected(roller_month) + 1;
@@ -440,11 +661,7 @@ static void confirm_cb(lv_event_t *e) {
 
 	power_hold_screen_on(false);
 	power_notify_activity();
-
-	lv_obj_set_hidden(panel, true);
-	if (tz_panel) {
-		lv_obj_set_hidden(tz_panel, true);
-	}
+	panel_close();
 }
 
 // The back chevron only exists when the page was opened from the settings:
@@ -459,10 +676,7 @@ static void cancel_cb(lv_event_t *e) {
 	// not become the device's new time.
 	power_hold_screen_on(false);
 	power_notify_activity();
-	lv_obj_set_hidden(panel, true);
-	if (tz_panel) {
-		lv_obj_set_hidden(tz_panel, true);
-	}
+	panel_close();
 }
 
 bool timeset_needed(void) { return !clock_is_set(); }
@@ -497,10 +711,11 @@ static void seed_rollers_from_clock(void) {
 	apply_time_format(local.tm_hour);
 }
 
-void timeset_show(void) {
+static void show(bool setup) {
 	if (!panel) {
 		return;
 	}
+	first_boot = setup;
 
 	seed_rollers_from_clock();
 	tz_paint();
@@ -521,7 +736,7 @@ void timeset_show(void) {
 	// Set from the settings: offer the way out. On the first-boot showing the
 	// clock is not set yet and there is no way back.
 	if (cancel_btn) {
-		if (timeset_needed()) {
+		if (first_boot) {
 			lv_obj_set_hidden(cancel_btn, true);
 		} else {
 			lv_obj_set_hidden(cancel_btn, false);
@@ -537,8 +752,7 @@ void timeset_show(void) {
 	// moved by hand, the row is told how to lay out what it has left. With the
 	// chevron hidden LVGL skips it, and centring the row centres the title.
 	if (header_row) {
-		lv_obj_set_flex_align(header_row, timeset_needed() ? LV_FLEX_ALIGN_CENTER : LV_FLEX_ALIGN_START,
-							  LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+		lv_obj_set_flex_align(header_row, first_boot ? LV_FLEX_ALIGN_CENTER : LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 	}
 
 	lv_obj_set_hidden(panel, false);
@@ -549,14 +763,34 @@ void timeset_show(void) {
 	// it forward had put it over the bar. On the first-boot showing the bar
 	// stays away: there is no clock to show yet, which is the whole reason the
 	// panel is up, and a bar reading "--:--" over it would be a poor welcome.
-	if (!timeset_needed()) {
+	if (!first_boot) {
 		topbar_set_hidden(false);
 		topbar_bring_to_front();
 	}
 
+	mode_paint();
+
 	// Setting a date takes as long as it takes; the screen must not blank
 	// halfway through, because blanking this panel also kills the touchscreen.
 	power_hold_screen_on(true);
+}
+
+void timeset_show(void) { show(timeset_needed()); }
+
+void timeset_show_first_boot(void) {
+	// Automatic when the Wi-Fi page before this one has connected, and the
+	// network may already have answered; manual otherwise. Either can be
+	// changed on the page.
+	wifi_status_t wifi;
+	wifi_get_status(&wifi);
+	bool automatic = wifi.state == WIFI_STATE_CONNECTED;
+	if (automatic != clock_auto_enabled()) {
+		clock_set_auto(automatic);
+	}
+	show(true);
+	if (automatic) {
+		auto_start();
+	}
 }
 
 // Re-paints the rollers' hand-set colours after a theme or accent switch.
@@ -576,6 +810,8 @@ static void timeset_refresh_theme(void) {
 	if (confirm_btn) {
 		lv_obj_set_style_bg_color(confirm_btn, theme()->accent, 0);
 	}
+
+	tabbar_set_active(&mode_tabs, clock_auto_enabled() ? MODE_AUTOMATIC : MODE_MANUAL);
 
 	// Standard time and daylight saving, for the same reason. Those two carry
 	// no shared style at all -- both the fill and the ink are decided in
@@ -801,15 +1037,30 @@ void timeset_init(gui_config_t *cfg) {
 	lv_obj_set_style_pad_bottom(content, 12, 0);
 	lv_obj_set_flex_align(content, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
+	// Manual or automatic, first: it decides whether the cards below are the
+	// user's at all.
+	tabbar_create(&mode_tabs, content);
+	tabbar_add(&mode_tabs, "timeset_manual", mode_pick_cb, (void *)(intptr_t)MODE_MANUAL);
+	tabbar_add(&mode_tabs, "timeset_automatic", mode_pick_cb, (void *)(intptr_t)MODE_AUTOMATIC);
+
+	auto_status = lv_label_create(content);
+	lv_label_set_long_mode(auto_status, LV_LABEL_LONG_WRAP);
+	lv_obj_set_width(auto_status, lv_pct(100));
+	lv_obj_set_style_text_align(auto_status, LV_TEXT_ALIGN_CENTER, 0);
+	lv_obj_add_style(auto_status, &theme_style_text_dim, 0);
+	lv_obj_set_style_text_font(auto_status, &font_ui_20, 0);
+	lv_label_set_text(auto_status, "");
+	lv_obj_set_hidden(auto_status, true);
+
 	// Date in one card, time in the next: five rollers side by side would be
 	// too narrow to hit on a 480 px panel, and the two boxed groups read as
 	// "the date" and "the time" at a glance.
-	lv_obj_t *date_card = make_card(content);
+	date_card = make_card(content);
 	roller_day = make_roller(date_card, days_options, 86);
 	roller_month = make_roller(date_card, MONTHS, 184);
 	roller_year = make_roller(date_card, years_options, 110);
 
-	lv_obj_t *time_card = make_card(content);
+	time_card = make_card(content);
 	roller_hour = make_roller(time_card, hours_options, 118);
 
 	// The colon between the two, like every clock dialog.
@@ -829,7 +1080,7 @@ void timeset_init(gui_config_t *cfg) {
 	// Time zone, above "24 hour", because it decides what time the rollers above
 	// it say. A single row with the value on the right, like any settings row;
 	// tapping it opens the list.
-	lv_obj_t *tz_card = lv_obj_create(content);
+	tz_card = lv_obj_create(content);
 	lv_obj_set_size(tz_card, lv_pct(100), LV_SIZE_CONTENT);
 	lv_obj_add_style(tz_card, &theme_style_card, 0);
 	lv_obj_add_style(tz_card, &theme_style_card_pressed, LV_STATE_PRESSED);
@@ -860,7 +1111,7 @@ void timeset_init(gui_config_t *cfg) {
 	// March and October a pill is tapped instead of hunting for one's own city
 	// on a different row, and that the list stays one list instead of two nearly
 	// identical ones.
-	lv_obj_t *dst_card = lv_obj_create(content);
+	dst_card = lv_obj_create(content);
 	lv_obj_set_size(dst_card, lv_pct(100), LV_SIZE_CONTENT);
 	lv_obj_add_style(dst_card, &theme_style_card, 0);
 	lv_obj_set_style_radius(dst_card, 12, 0);

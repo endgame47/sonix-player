@@ -12,6 +12,7 @@
 #include "src/gui/nowplaying/coverflow.h"
 #include "src/gui/settings/ccsettings.h"
 #include "src/gui/nowplaying/chapters.h"
+#include "src/gui/nowplaying/lyricsearch.h"
 #include "src/gui/wireless/airplay.h"
 #include "src/gui/bluetooth/airpodspage.h"
 #include "src/gui/settings/appearance.h"
@@ -42,6 +43,7 @@
 #include "src/gui/shell/main_menu.h"
 #include "src/gui/library/medialist.h"
 #include "src/gui/library/filespage.h"
+#include "src/gui/library/imageview.h"
 #include "src/gui/library/textview.h"
 #include "src/gui/shell/morepage.h"
 #include "src/gui/shell/popover.h"
@@ -69,6 +71,7 @@
 #include "src/gui/library/search.h"
 #include "src/gui/settings/settings.h"
 #include "src/gui/settings/systempage.h"
+#include "src/gui/shell/setupwifi.h"
 #include "src/gui/shell/welcome.h"
 #include "src/gui/streaming/streaming.h"
 #include "src/gui/shell/switcher.h"
@@ -607,6 +610,7 @@ void gui_init(gui_config_t *cfg) {
 	audiobookcontrols_screen = lv_obj_create(NULL);
 	audiobookscan_screen = lv_obj_create(NULL);
 	chapters_screen = lv_obj_create(NULL);
+	lyricsearch_screen = lv_obj_create(NULL);
 	queue_screen = lv_obj_create(NULL);
 	details_screen = lv_obj_create(NULL);
 	wireless_screen = lv_obj_create(NULL);
@@ -627,6 +631,7 @@ void gui_init(gui_config_t *cfg) {
 	morepage_screen = lv_obj_create(NULL);
 	filespage_screen = lv_obj_create(NULL);
 	textview_screen = lv_obj_create(NULL);
+	imageview_screen = lv_obj_create(NULL);
 	gearboypage_screen = lv_obj_create(NULL);
 	gearboyplay_screen = lv_obj_create(NULL);
 	flappybird_screen = lv_obj_create(NULL);
@@ -686,7 +691,8 @@ void gui_init(gui_config_t *cfg) {
 	ebooksettings_init(cfg); // likewise: the other corner button opens this
 	ebookpage_init(cfg);
 	morepage_init(cfg);
-	textview_init(cfg); // before filespage: a text file tapped there opens here
+	textview_init(cfg);	 // before filespage: a text file tapped there opens here
+	imageview_init(cfg); // likewise, for a picture
 	filespage_init(cfg);
 	streaming_init(cfg);
 
@@ -720,6 +726,7 @@ void gui_init(gui_config_t *cfg) {
 	audiobookextras_init(cfg); // the bookmarks and summary pages
 	audiobooks_init(cfg);
 	chapters_init(cfg);
+	lyricsearch_init(cfg);
 	trackmenu_init(cfg);
 
 	// The leftward swipe that pulls the player in works on the browsing pages
@@ -750,6 +757,7 @@ void gui_init(gui_config_t *cfg) {
 		language_screen,
 		medialist_screen,  medialist_tracks_screen, medialist_albums_screen, audiobooks_screen, audiobooksettings_screen,
 		queue_screen,	  chapters_screen,		 details_screen,   audiobookcontrols_screen,
+		lyricsearch_screen,
 		wireless_screen,
 		wifisettings_screen,
 		btsettings_screen, btaudio_screen,	 airpodspage_screen, airplay_screen,   streaming_screen,
@@ -849,6 +857,7 @@ void gui_init(gui_config_t *cfg) {
 	// language brings the clock up itself, so the two only chain here on the
 	// path where the language has already been answered before.
 	welcome_init(cfg);
+	setupwifi_init(cfg); // the step between the language and the clock
 
 	// Ahead of everything else, and only on a device that has never been booted:
 	// the greeting. Its button opens the language picker itself, which in turn

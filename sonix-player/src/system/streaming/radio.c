@@ -21,6 +21,7 @@
 #include "src/system/core/lang.h"
 #include "src/system/net/tls.h"
 #include "src/system/streaming/onair.h"
+#include "src/system/playback/playhistory.h"
 #include "src/system/core/utils.h"
 
 // The MP3 frame decoder on its own -- no file, no seeking, no length. This is
@@ -2893,6 +2894,8 @@ bool radio_play(const radio_station_t *station) {
 	transport_stop();
 
 	// One PCM takes one writer: whatever was playing locally has to go first.
+	// A track it stops has been left.
+	playhistory_left();
 	audio_stop();
 
 	pthread_mutex_lock(&now_lock);

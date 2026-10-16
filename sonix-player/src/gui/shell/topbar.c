@@ -233,6 +233,9 @@ void topbar_refresh_clock(void) {
 
 static void clock_timer_cb(lv_timer_t *timer) {
 	(void)timer;
+	// A time zone the network has just located goes in place first, so the
+	// bar shows the time in it.
+	clock_poll();
 	topbar_refresh_clock();
 }
 

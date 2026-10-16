@@ -15,6 +15,10 @@ void timeset_init(gui_config_t *cfg);
 // Brings the panel up, pre-filled with the current time.
 void timeset_show(void);
 
+// The same as the step of the first-boot setup that follows the Wi-Fi page:
+// no way back, no status bar, and automatic chosen when that page connected.
+void timeset_show_first_boot(void);
+
 // True when the clock has never been set, i.e. the panel should come up on its
 // own at startup.
 bool timeset_needed(void);

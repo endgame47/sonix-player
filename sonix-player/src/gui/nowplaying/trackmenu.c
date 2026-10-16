@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #include "src/gui/fonts/fonts.h"
 #include "src/gui/shell/icons.h"
@@ -34,6 +35,7 @@
 #include "src/system/library/library.h"
 #include "src/system/playback/playlist.h"
 #include "src/system/core/utils.h"
+#include "src/system/device/system.h"
 #include "lvgl/src/core/lv_obj_scroll_private.h"
 
 lv_obj_t *queue_screen;
@@ -53,6 +55,12 @@ lv_obj_t *details_screen;
 // The room a heading takes above its rows: History over the tracks already
 // played, Now playing over the track playing and the ones after it.
 #define QUEUE_HEADER_H 48
+
+// The history is split by day, under a smaller heading of its own: Today,
+// Yesterday or the date. Only the ones near the top of the page are drawn, from
+// a pool of labels, as the rows are.
+#define QUEUE_SEP_H 40
+#define QUEUE_SEP_POOL 8
 
 // The page rests with Now playing at the top, and the history sits above it.
 // Pulling down into the history meets resistance: the list moves
@@ -75,7 +83,9 @@ typedef struct {
 	lv_obj_t *label;
 	lv_obj_t *check; // the tick on a chosen row while choosing
 	lv_obj_t *grip;	 // the handle on a row that can be moved, while reordering
-	int index;		 // position in the queue, or -1
+	int vindex;		 // the row of the page it shows (see queue_vrow_y), or -1
+	int index;		 // its position in the queue, or -1 on a row of the history
+	int hist;		 // its entry of queue_hist, or -1 on a row of the queue
 	bool has_thumb;
 	cover_image_t thumb;
 } queue_row_t;
@@ -90,6 +100,23 @@ static int queue_total;	  // how many tracks the queue holds, from its first
 static int queue_current; // the track playing, as the rows were laid out for it
 static int queue_view_h;  // the height of the viewport
 static lv_obj_t *queue_title;
+
+// The history (playhistory.h) as the page was laid out for it, oldest first,
+// with where each of its rows sits, and the day headings between them.
+static library_history_item_t *queue_hist;
+static int queue_hist_count;
+static int *queue_hist_y;
+static int queue_hist_end; // where the history ends and Now playing begins
+// The history is off the page while choosing or reordering: neither acts on
+// it, and the page is not to be scrolled up into it meanwhile.
+static bool queue_hist_hidden;
+static struct {
+	int y;
+	long long when; // the time of the first entry under it
+} *queue_seps;
+static int queue_sep_count;
+static lv_obj_t *queue_sep_labels[QUEUE_SEP_POOL];
+static int queue_sep_bound[QUEUE_SEP_POOL]; // which heading each label shows, or -1
 
 // The two buttons always in the corner put the page into choosing rows to take
 // out (SELECT) or moving them by hand (REORDER). A long press on a row of the
@@ -116,9 +143,10 @@ static lv_obj_t *queue_close_btn;
 static struct {
 	bool active;
 	bool moved;
-	bool by_row; // held by the row: its scroll chain is off until the drop
-	int from;	 // its position in the queue
-	int target;	 // the position it would be put in front of, or -1
+	bool by_row;	   // held by the row: its scroll chain is off until the drop
+	int from;		   // its position in the queue, or -1 for an entry of the history
+	long long hist_id; // the entry of the history it is, or -1
+	int target;		   // the position it would be put in front of, or -1
 	lv_obj_t *held;
 	lv_point_t start;
 	int32_t grab_dx;
@@ -145,34 +173,60 @@ static lv_obj_t *details_scroll;
 static gui_config_t *g_cfg;
 
 // ---------------------------------------------------------------------------
-// Queue: the tracks already played, the one playing and the ones after it,
-// tappable to jump.
+// Queue: the history of what was played, the track playing and the ones after
+// it, tappable to play.
+//
+// The rows of the page are counted as one run: first the entries of the
+// history, then the queue from the track playing on. What came before the track
+// playing in the queue is not shown: in order it is what was skipped over, and
+// what was played of it is in the history; a shuffle deals the track playing
+// first, so there everything is still to come.
 // ---------------------------------------------------------------------------
 
 // Where Now playing begins on the canvas: under the history, when there is one.
-static int queue_now_top(void) { return queue_current > 0 ? QUEUE_HEADER_H + queue_current * QUEUE_ROW_PITCH : 0; }
+static int queue_now_top(void) { return queue_hist_end; }
 
-// Where queued track `index` sits on the canvas. `queue_total` gives the end of
-// the last row.
-static int queue_row_y(int index) {
-	if (index < queue_current) {
-		return QUEUE_HEADER_H + index * QUEUE_ROW_PITCH;
+// How many rows of the queue the page shows: the track playing and those after.
+static int queue_shown(void) { return queue_total > 0 ? queue_total - queue_current : 0; }
+
+// Where queued track `index` (the track playing or one after it) sits on the
+// canvas. `queue_total` gives the end of the last row.
+static int queue_row_y(int index) { return queue_now_top() + QUEUE_HEADER_H + (index - queue_current) * QUEUE_ROW_PITCH; }
+
+// Where row `vindex` of the page sits on the canvas.
+static int queue_vrow_y(int vindex) {
+	if (vindex < queue_hist_count) {
+		return queue_hist_y[vindex];
 	}
-	return queue_now_top() + QUEUE_HEADER_H + (index - queue_current) * QUEUE_ROW_PITCH;
+	return queue_row_y(queue_current + vindex - queue_hist_count);
 }
 
-// The row at height `y` on the canvas, or the nearest one.
-static int queue_index_at(int y) {
-	int index;
-	if (y < queue_now_top()) {
-		index = (y - QUEUE_HEADER_H) / QUEUE_ROW_PITCH;
+// The row of the page at height `y` on the canvas, or the nearest one.
+static int queue_vindex_at(int y) {
+	int count = queue_hist_count + queue_shown();
+	int vindex;
+	if (queue_hist_count > 0 && y < queue_now_top()) {
+		// The last row of the history that starts above `y`.
+		int lo = 0, hi = queue_hist_count - 1;
+		while (lo < hi) {
+			int mid = (lo + hi + 1) / 2;
+			if (queue_hist_y[mid] <= y) {
+				lo = mid;
+			} else {
+				hi = mid - 1;
+			}
+		}
+		vindex = lo;
 	} else {
-		index = queue_current + (y - queue_now_top() - QUEUE_HEADER_H) / QUEUE_ROW_PITCH;
+		vindex = queue_hist_count + (y - queue_now_top() - QUEUE_HEADER_H) / QUEUE_ROW_PITCH;
+		if (vindex < queue_hist_count) {
+			vindex = queue_hist_count;
+		}
 	}
-	if (index >= queue_total) {
-		index = queue_total - 1;
+	if (vindex >= count) {
+		vindex = count - 1;
 	}
-	return index < 0 ? 0 : index;
+	return vindex < 0 ? 0 : vindex;
 }
 
 // The scroll position furthest down the list can go.
@@ -195,7 +249,7 @@ static void queue_row_paint_tools(queue_row_t *row) {
 	queue_row_paint_check(row);
 	bool grip = queue_mode == QUEUE_REORDER && row->index > queue_current && row->index < queue_total;
 	lv_obj_set_hidden(row->grip, !grip);
-	bool carried = queue_drag.active && row->index >= 0 && row->index == queue_drag.from;
+	bool carried = queue_drag.active && ((row->index >= 0 && row->index == queue_drag.from) || (row->hist >= 0 && queue_hist[row->hist].id == queue_drag.hist_id));
 	lv_opa_t opa = carried ? LV_OPA_40 : LV_OPA_COVER;
 	if (lv_obj_get_style_opa(row->button, 0) != opa) {
 		lv_obj_set_style_opa(row->button, opa, 0);
@@ -235,6 +289,25 @@ static void queue_mode_show(void) {
 	queue_paint_rows();
 }
 
+static void queue_layout(void);
+static void queue_scroll_to(int scroll, lv_anim_enable_t anim);
+static void queue_window_update(void);
+
+// Takes the history off the page, or puts it back, with the page staying on
+// what it shows: what is below Now playing moves by as much as the history
+// above it grew or shrank.
+static void queue_history_hide(bool hidden) {
+	if (hidden == queue_hist_hidden) {
+		return;
+	}
+	int scroll = lv_obj_get_scroll_y(queue_list);
+	int top = queue_now_top();
+	queue_hist_hidden = hidden;
+	queue_layout();
+	queue_scroll_to(scroll + queue_now_top() - top, LV_ANIM_OFF);
+	queue_window_update();
+}
+
 static void queue_mode_set(queue_mode_t mode) {
 	if (mode != QUEUE_SELECT) {
 		free(queue_chosen);
@@ -242,6 +315,7 @@ static void queue_mode_set(queue_mode_t mode) {
 		queue_chosen_count = 0;
 	}
 	queue_mode = mode;
+	queue_history_hide(mode != QUEUE_IDLE);
 	queue_mode_show();
 }
 
@@ -258,6 +332,7 @@ static bool queue_selection_start(void) {
 	}
 	queue_chosen_count = 0;
 	queue_mode = QUEUE_SELECT;
+	queue_history_hide(true);
 	queue_mode_show();
 	return true;
 }
@@ -275,7 +350,7 @@ static void queue_selection_toggle(queue_row_t *row) {
 
 static queue_row_t *queue_row_of(lv_obj_t *button) {
 	for (int i = 0; i < QUEUE_ROW_POOL; i++) {
-		if (queue_rows[i].button == button && queue_rows[i].index >= 0) {
+		if (queue_rows[i].button == button && queue_rows[i].vindex >= 0) {
 			return &queue_rows[i];
 		}
 	}
@@ -302,10 +377,10 @@ static void queue_row_drop_thumb(queue_row_t *row) {
 // it only where a row is bound would leave the mark on a finished track until
 // the list scrolled far enough to rebind that row.
 static void queue_row_paint_mark(queue_row_t *row) {
-	if (!row->icon || row->index < 0) {
+	if (!row->icon || row->vindex < 0) {
 		return;
 	}
-	bool is_playing_row = row->index == playlist_current_index();
+	bool is_playing_row = row->index >= 0 && row->index == playlist_current_index();
 	lv_image_set_src(row->icon, is_playing_row ? &icon_now_playing : &icon_music2);
 	lv_obj_add_style(row->icon, &theme_style_icon, 0);
 	if (is_playing_row) {
@@ -316,28 +391,64 @@ static void queue_row_paint_mark(queue_row_t *row) {
 	lv_obj_set_style_image_recolor_opa(row->icon, LV_OPA_COVER, 0);
 }
 
-// Points a pool row at queued track `index` and resolves its title on the spot;
-// an indexed lookup is cheap enough to do during a scroll.
-static void queue_row_bind(queue_row_t *row, int index) {
-	if (row->index == index) {
+// A title for a file with none: its name, without the extension.
+static void queue_file_title(const char *path, char *title, size_t size) {
+	const char *slash = strrchr(path, '/');
+	snprintf(title, size, "%.250s", slash ? slash + 1 : path);
+	char *dot = strrchr(title, '.');
+	if (dot) {
+		*dot = '\0';
+	}
+}
+
+// Points a pool row at row `vindex` of the page and resolves its title on the
+// spot; an indexed lookup is cheap enough to do during a scroll.
+static void queue_row_bind(queue_row_t *row, int vindex) {
+	if (row->vindex == vindex) {
 		return;
 	}
 
 	queue_row_drop_thumb(row);
-	row->index = index;
+	row->vindex = vindex;
+	row->index = -1;
+	row->hist = -1;
 
-	if (index < 0 || index >= queue_total) {
+	if (vindex < 0 || vindex >= queue_hist_count + queue_shown()) {
+		row->vindex = -1;
 		lv_obj_set_hidden(row->button, true);
 		return;
 	}
 
 	char path[512];
+	char title[256];
+	if (vindex < queue_hist_count) {
+		// The title was written down with the entry.
+		row->hist = vindex;
+		if (!library_history_entry(queue_hist[vindex].id, path, sizeof(path), title, sizeof(title))) {
+			row->vindex = -1;
+			lv_obj_set_hidden(row->button, true);
+			return;
+		}
+		if (!title[0]) {
+			queue_file_title(path, title, sizeof(title));
+		}
+		lv_obj_set_hidden(row->button, false);
+		lv_obj_set_y(row->button, queue_vrow_y(vindex));
+		lv_label_set_text(row->label, title);
+		queue_row_paint_mark(row);
+		queue_row_paint_tools(row);
+		return;
+	}
+
+	int index = queue_current + vindex - queue_hist_count;
+	row->index = index;
 	if (!playlist_path_at(index, path, sizeof(path))) {
+		row->vindex = -1;
+		row->index = -1;
 		lv_obj_set_hidden(row->button, true);
 		return;
 	}
 
-	char title[256];
 	if (!library_track_title(path, title, sizeof(title))) {
 		// Not in the library: it may be a Qobuz track, which is kept out of the
 		// library on purpose. The title is still there, in the sidecar file next
@@ -348,12 +459,7 @@ static void queue_row_bind(queue_row_t *row, int index) {
 		if (meta.title[0]) {
 			snprintf(title, sizeof(title), "%.250s", meta.title);
 		} else {
-			const char *slash = strrchr(path, '/');
-			snprintf(title, sizeof(title), "%.250s", slash ? slash + 1 : path);
-			char *dot = strrchr(title, '.');
-			if (dot) {
-				*dot = '\0';
-			}
+			queue_file_title(path, title, sizeof(title));
 		}
 	}
 
@@ -365,38 +471,141 @@ static void queue_row_bind(queue_row_t *row, int index) {
 	queue_row_paint_tools(row);
 }
 
+// Today, Yesterday, or the day of the month and the month, with the year when
+// it is not this one.
+static void queue_day_text(long long when, char *out, size_t size) {
+	static const char *const MONTHS[12] = {"podcast_january", "podcast_february", "podcast_march", "podcast_april", "podcast_may", "podcast_june", "podcast_july", "podcast_august", "podcast_september", "podcast_october", "podcast_november", "podcast_december"};
+	time_t then = (time_t)when;
+	time_t now = time(NULL);
+	time_t day_before = now - 24 * 60 * 60;
+	struct tm t_then, t_now, t_before;
+	if (!localtime_r(&then, &t_then) || !localtime_r(&now, &t_now) || !localtime_r(&day_before, &t_before)) {
+		out[0] = '\0';
+		return;
+	}
+	if (t_then.tm_year == t_now.tm_year && t_then.tm_yday == t_now.tm_yday) {
+		snprintf(out, size, "%s", tr("history_today"));
+	} else if (t_then.tm_year == t_before.tm_year && t_then.tm_yday == t_before.tm_yday) {
+		snprintf(out, size, "%s", tr("history_yesterday"));
+	} else if (t_then.tm_year == t_now.tm_year) {
+		snprintf(out, size, "%d %s", t_then.tm_mday, tr(MONTHS[t_then.tm_mon % 12]));
+	} else {
+		snprintf(out, size, "%d %s %d", t_then.tm_mday, tr(MONTHS[t_then.tm_mon % 12]), t_then.tm_year + 1900);
+	}
+}
+
+// The day headings near the top of the page, from the pool. The text is worked
+// out as a label is bound, so Today becomes Yesterday at midnight.
+static void queue_seps_update(int scroll) {
+	// The first heading that can still be seen.
+	int lo = 0, hi = queue_sep_count;
+	while (lo < hi) {
+		int mid = (lo + hi) / 2;
+		if (queue_seps[mid].y + QUEUE_SEP_H <= scroll) {
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+	for (int i = 0; i < QUEUE_SEP_POOL; i++) {
+		int sep = lo + i;
+		if (sep >= queue_sep_count || queue_seps[sep].y >= scroll + queue_view_h) {
+			queue_sep_bound[i] = -1;
+			lv_obj_set_hidden(queue_sep_labels[i], true);
+			continue;
+		}
+		if (queue_sep_bound[i] != sep) {
+			char text[64];
+			queue_day_text(queue_seps[sep].when, text, sizeof(text));
+			lv_label_set_text(queue_sep_labels[i], text);
+			lv_obj_set_y(queue_sep_labels[i], queue_seps[sep].y + 8);
+			queue_sep_bound[i] = sep;
+		}
+		lv_obj_set_hidden(queue_sep_labels[i], false);
+	}
+}
+
 static void queue_window_update(void) {
-	if (queue_total <= 0) {
+	int count = queue_hist_count + queue_shown();
+	int scroll = lv_obj_get_scroll_y(queue_list);
+	if (scroll < 0) {
+		scroll = 0;
+	}
+	queue_seps_update(scroll);
+	if (count <= 0) {
 		for (int i = 0; i < QUEUE_ROW_POOL; i++) {
 			queue_row_bind(&queue_rows[i], -1);
 		}
 		return;
 	}
 
-	int scroll = lv_obj_get_scroll_y(queue_list);
-	if (scroll < 0) {
-		scroll = 0;
-	}
-
-	int first = queue_index_at(scroll) - 1;
-	if (first + QUEUE_ROW_POOL > queue_total) {
-		first = queue_total - QUEUE_ROW_POOL;
+	int first = queue_vindex_at(scroll) - 1;
+	if (first + QUEUE_ROW_POOL > count) {
+		first = count - QUEUE_ROW_POOL;
 	}
 	if (first < 0) {
 		first = 0;
 	}
 
 	for (int i = 0; i < QUEUE_ROW_POOL; i++) {
-		int index = first + i;
-		queue_row_bind(&queue_rows[index % QUEUE_ROW_POOL], index < queue_total ? index : -1);
+		int vindex = first + i;
+		queue_row_bind(&queue_rows[vindex % QUEUE_ROW_POOL], vindex < count ? vindex : -1);
+	}
+}
+
+// Reads the history again and works out where its rows and headings go.
+static void queue_history_layout(void) {
+	free(queue_hist);
+	free(queue_hist_y);
+	free(queue_seps);
+	queue_hist = NULL;
+	queue_hist_y = NULL;
+	queue_seps = NULL;
+	queue_sep_count = 0;
+	queue_hist_count = queue_hist_hidden ? 0 : library_history_items(&queue_hist);
+	if (queue_hist_count > 0) {
+		queue_hist_y = malloc((size_t)queue_hist_count * sizeof(*queue_hist_y));
+		queue_seps = malloc((size_t)queue_hist_count * sizeof(*queue_seps));
+	}
+	if (!queue_hist_y || !queue_seps) {
+		free(queue_hist);
+		free(queue_hist_y);
+		free(queue_seps);
+		queue_hist = NULL;
+		queue_hist_y = NULL;
+		queue_seps = NULL;
+		queue_hist_count = 0;
+	}
+
+	int y = QUEUE_HEADER_H;
+	long long day = -1;
+	for (int i = 0; i < queue_hist_count; i++) {
+		// A new heading where the day changes. An entry from before the clock
+		// was set has no day, and goes under whatever heading is above it.
+		time_t when = (time_t)queue_hist[i].played_at;
+		struct tm t;
+		if (when > 0 && localtime_r(&when, &t)) {
+			long long key = (long long)t.tm_year * 1000 + t.tm_yday;
+			if (key != day) {
+				day = key;
+				queue_seps[queue_sep_count].y = y;
+				queue_seps[queue_sep_count].when = queue_hist[i].played_at;
+				queue_sep_count++;
+				y += QUEUE_SEP_H;
+			}
+		}
+		queue_hist_y[i] = y;
+		y += QUEUE_ROW_PITCH;
+	}
+	queue_hist_end = queue_hist_count > 0 ? y : 0;
+	for (int i = 0; i < QUEUE_SEP_POOL; i++) {
+		queue_sep_bound[i] = -1;
 	}
 }
 
 // Lays the page out for the queue as it is now: the headings, the canvas and,
 // at the next window update, every row.
 static void queue_layout(void) {
-	// The whole queue, from its first track: the ones already played are part
-	// of it and are how the album being listened to can be seen at all.
 	queue_total = playlist_count();
 	if (queue_total < 0) {
 		queue_total = 0;
@@ -406,15 +615,17 @@ static void queue_layout(void) {
 		current = queue_total - 1;
 	}
 	queue_current = current < 0 ? 0 : current;
+	queue_history_layout();
 
-	lv_obj_set_hidden(queue_history_header, queue_total == 0 || queue_current == 0);
+	lv_obj_set_hidden(queue_history_header, queue_hist_count == 0);
 	lv_obj_set_hidden(queue_now_header, queue_total == 0);
 	lv_obj_set_y(queue_now_header, queue_now_top() + 10);
+	lv_obj_align(queue_empty, LV_ALIGN_TOP_MID, 0, queue_now_top() + 72);
 
 	// Tall enough for Now playing to reach the top of the page however little
 	// comes after it.
-	int height = queue_total ? queue_row_y(queue_total) : QUEUE_ROW_PITCH;
-	if (queue_total && height < queue_now_top() + queue_view_h) {
+	int height = queue_total ? queue_row_y(queue_total) : 0;
+	if (height < queue_now_top() + queue_view_h) {
 		height = queue_now_top() + queue_view_h;
 	}
 	lv_obj_set_height(queue_body, height);
@@ -423,8 +634,12 @@ static void queue_layout(void) {
 	// first the clamp uses the old height.
 	lv_obj_update_layout(queue_list);
 
+	// Every row binds again, and until it does it points at nothing: the
+	// entries it pointed at may not be there any more.
 	for (int i = 0; i < QUEUE_ROW_POOL; i++) {
-		queue_rows[i].index = -2; // force every row to rebind
+		queue_rows[i].vindex = -2;
+		queue_rows[i].index = -1;
+		queue_rows[i].hist = -1;
 	}
 	lv_obj_set_hidden(queue_empty, queue_total != 0);
 	queue_pull.on = false;
@@ -439,8 +654,8 @@ static void queue_scroll_to(int scroll, lv_anim_enable_t anim) {
 
 static void queue_rebuild(void) {
 	queue_layout();
-	// Opened on Now playing rather than at the top: with the whole queue
-	// listed, the top is wherever the queue began, which may be an hour ago.
+	// Opened on Now playing rather than at the top: the top is wherever the
+	// history begins, which may be days ago.
 	queue_scroll_to(queue_now_top(), LV_ANIM_OFF);
 	queue_window_update();
 	queue_mode_show();
@@ -527,7 +742,7 @@ static void queue_scroll_cb(lv_event_t *e) {
 			queue_pull.adjusting = false;
 		}
 		int32_t scroll = lv_obj_get_scroll_y(queue_list);
-		queue_pull.on = indev && queue_current > 0 && scroll >= queue_now_top();
+		queue_pull.on = indev && queue_hist_count > 0 && scroll >= queue_now_top();
 		queue_pull.natural = scroll;
 		queue_pull.last = scroll;
 		return;
@@ -545,9 +760,10 @@ static void queue_scroll_cb(lv_event_t *e) {
 	queue_window_update();
 }
 
-// The track changed under the page. With the page showing, the headings move
-// round the new track, and a list resting on Now playing follows it there;
-// otherwise only the marks are repainted, and opening the page lays it out.
+// The track changed under the page. With the page showing, the one left joins
+// the history, the headings move round the new track, and a list resting on Now
+// playing follows it there; otherwise only the marks are repainted, and opening
+// the page lays it out.
 // Called from the one place in the player that sees every change of track, the
 // same way the browser and the library lists are told.
 static void queue_drag_end(bool drop);
@@ -626,6 +842,7 @@ static void queue_drag_start(queue_row_t *row, lv_obj_t *held, lv_point_t point)
 	queue_drag.moved = false;
 	queue_drag.by_row = held == row->button;
 	queue_drag.from = row->index;
+	queue_drag.hist_id = row->hist >= 0 ? queue_hist[row->hist].id : -1;
 	queue_drag.target = -1;
 	queue_drag.held = held;
 	queue_drag.start = point;
@@ -683,8 +900,12 @@ static void queue_drag_start(queue_row_t *row, lv_obj_t *held, lv_point_t point)
 	queue_paint_rows();
 }
 
+static bool queue_history_path(long long id, char *path, size_t size);
+
 // Lets go of the row. With `drop`, it is put where the rule was, if the finger
-// went anywhere and the queue is still the one the drag began on.
+// went anywhere and the queue is still the one the drag began on: a row of the
+// queue is moved there, an entry of the history is added there and stays in
+// the history.
 static void queue_drag_end(bool drop) {
 	if (!queue_drag.active) {
 		return;
@@ -716,29 +937,31 @@ static void queue_drag_end(bool drop) {
 	if (!drop || !queue_drag.moved || target < 0 || playlist_count() != queue_total || playlist_current_index() != queue_current) {
 		return;
 	}
-	int to = target > from ? target - 1 : target;
-	if (to == from) {
-		return;
-	}
 
-	// A row taken out of the history above the top of the page takes its
-	// height with it, and the heading too when it was the last one: the page
-	// moves up by as much, and stays on what it shows.
 	int scroll = lv_obj_get_scroll_y(queue_list);
-	bool above = from < queue_current && queue_row_y(from) < scroll;
-	int now_top = queue_now_top();
 	unsigned revision = playlist_revision();
-	playlist_move(from, to);
+	if (from >= 0) {
+		int to = target > from ? target - 1 : target;
+		if (to == from) {
+			return;
+		}
+		playlist_move(from, to);
+	} else {
+		char path[512];
+		if (!queue_history_path(queue_drag.hist_id, path, sizeof(path))) {
+			return;
+		}
+		playlist_insert_at(path, target);
+	}
 	if (playlist_revision() != revision) {
 		// Written down now, as a removal is: the mirror on disk is otherwise
 		// refreshed only when a track is loaded. A move turned down after the
 		// queue became a list of paths has changed it too.
 		device_state_queue_changed();
 	}
+	// Only what is to play changed, below Now playing: the page stays where
+	// it is.
 	queue_layout();
-	if (above) {
-		scroll -= now_top - queue_now_top();
-	}
 	queue_scroll_to(scroll, LV_ANIM_OFF);
 	queue_window_update();
 	queue_mode_show();
@@ -787,7 +1010,7 @@ static void queue_drag_follow(lv_point_t point) {
 		}
 	}
 	// Where the row already is is not a move.
-	if (target == queue_drag.from || target == queue_drag.from + 1) {
+	if (queue_drag.from >= 0 && (target == queue_drag.from || target == queue_drag.from + 1)) {
 		target = -1;
 	}
 	queue_drag.target = target;
@@ -842,6 +1065,17 @@ static void queue_drag_cb(lv_event_t *e) {
 	}
 }
 
+// The file of an entry of the history, if it is still there. Says so when it
+// is not: a file deleted since, or a stream's copy cleared out.
+static bool queue_history_path(long long id, char *path, size_t size) {
+	struct stat st;
+	if (!library_history_entry(id, path, size, NULL, 0) || stat(path, &st) != 0) {
+		toast_error("history_track_gone");
+		return false;
+	}
+	return true;
+}
+
 static void queue_row_pressed_cb(lv_event_t *e) {
 	(void)e;
 	queue_drop_guard = false;
@@ -860,7 +1094,7 @@ static void queue_row_long_cb(lv_event_t *e) {
 
 	// Only a row of the history: picked up, to be put down in what is to play.
 	// On any other row a long press is a slow tap.
-	if (row->index >= queue_current || queue_mode == QUEUE_SELECT || !indev) {
+	if (row->hist < 0 || queue_total <= 0 || queue_mode == QUEUE_SELECT || !indev) {
 		return;
 	}
 	lv_point_t point;
@@ -940,7 +1174,20 @@ static void queue_row_clicked_cb(lv_event_t *e) {
 	case QUEUE_IDLE:
 		break;
 	}
-	if (device_state_play_queue_index(row->index)) {
+	int index = row->index;
+	if (row->hist >= 0) {
+		// An entry of the history plays from the queue: put in right after the
+		// track playing, so what was coming still comes after it.
+		char path[512];
+		if (!queue_history_path(queue_hist[row->hist].id, path, sizeof(path))) {
+			return;
+		}
+		index = queue_total > 0 ? queue_current + 1 : 0;
+		if (!playlist_insert_at(path, index)) {
+			return;
+		}
+	}
+	if (device_state_play_queue_index(index)) {
 		player_refresh_now_playing();
 		switch_screen(player_screen);
 	}
@@ -1025,13 +1272,21 @@ static void build_queue_page(gui_config_t *cfg) {
 
 	queue_history_header = queue_header("queue_history", 0);
 	queue_now_header = queue_header("queue_now_playing", 0);
+	for (int i = 0; i < QUEUE_SEP_POOL; i++) {
+		queue_sep_labels[i] = lv_label_create(queue_body);
+		lv_obj_add_style(queue_sep_labels[i], &theme_style_text_dim, 0);
+		lv_obj_set_style_text_font(queue_sep_labels[i], &font_ui_18, 0);
+		lv_obj_set_x(queue_sep_labels[i], 4);
+		lv_obj_set_hidden(queue_sep_labels[i], true);
+		queue_sep_bound[i] = -1;
+	}
 
 	queue_empty = lv_label_create(queue_list);
 	lv_label_set_text(queue_empty, tr("trackmenu_queue_empty"));
 	lv_obj_set_style_text_align(queue_empty, LV_TEXT_ALIGN_CENTER, 0);
 	lv_obj_add_style(queue_empty, &theme_style_text_dim, 0);
 	lv_obj_set_style_text_font(queue_empty, &font_ui_24, 0);
-	lv_obj_align(queue_empty, LV_ALIGN_TOP_MID, 0, 120);
+	lv_obj_align(queue_empty, LV_ALIGN_TOP_MID, 0, 72);
 	lv_obj_set_hidden(queue_empty, true);
 
 	for (int i = 0; i < QUEUE_ROW_POOL; i++) {
@@ -1099,7 +1354,9 @@ static void build_queue_page(gui_config_t *cfg) {
 		lv_obj_add_event_cb(row->grip, queue_drag_cb, LV_EVENT_PRESS_LOST, NULL);
 		lv_obj_set_hidden(row->grip, true);
 
+		row->vindex = -1;
 		row->index = -1;
+		row->hist = -1;
 		row->has_thumb = false;
 	}
 
@@ -1160,6 +1417,21 @@ static void details_add_row(const char *name, const char *value) {
 // list's popover) or, when empty, whatever is playing right now (opened from
 // the player's own menu).
 static char details_path[512];
+
+// The path as it is on the card: the mount point in front of it is the same
+// on every track and says nothing. A file anywhere else keeps its whole path.
+static const char *details_card_path(const char *file) {
+	static const char *const ROOTS[] = {"/mnt/sd_0", "/data/mnt/sd_0", "/usr/data/mnt/sd_0"};
+	const char *mounted = storage_sd_root();
+	for (int i = -1; i < (int)(sizeof(ROOTS) / sizeof(ROOTS[0])); i++) {
+		const char *root = i < 0 ? mounted : ROOTS[i];
+		size_t length = root ? strlen(root) : 0;
+		if (length > 0 && strncmp(file, root, length) == 0 && file[length] == '/') {
+			return file + length + 1;
+		}
+	}
+	return file;
+}
 
 // The common tail of both variants: tags, format, size, path.
 // `codec` is the name the decoder reports ("MP3", "AAC", "ALAC"...), empty when
@@ -1273,7 +1545,7 @@ static void details_fill(const char *file, const song_metadata_t *tags, int bits
 	} else if (tidalcache_owns(file)) {
 		details_add_row("trackmenu_source", "tidal");
 	} else {
-		details_add_row("trackmenu_file", file);
+		details_add_row("trackmenu_file", details_card_path(file));
 	}
 }
 

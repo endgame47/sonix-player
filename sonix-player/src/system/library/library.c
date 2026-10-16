@@ -93,6 +93,13 @@ static const char *const SCHEMA[] = {
 	// from MEDIA_TABLE like the favourites, so a rescan does not forget it.
 	"CREATE TABLE IF NOT EXISTS PLAY_COUNTS(path TEXT PRIMARY KEY, plays INT NOT NULL, last_played INT)",
 
+	// Also local: every track the queue has played, one row each time, in the
+	// order it happened (the queue page's History). The title and artist are
+	// written down with the row, so a rescan, or the file going, does not take
+	// the entry with it. `played_at` is 0 when the clock was not set.
+	"CREATE TABLE IF NOT EXISTS PLAY_HISTORY(id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL, name TEXT,"
+	" artist TEXT, played_at INT)",
+
 	// Also local: where playback was left (the "Ricorda traccia" option). One
 	// row only; id is always 0.
 	"CREATE TABLE IF NOT EXISTS PLAYBACK_STATE(id INT PRIMARY KEY, path TEXT, position REAL, updated_at INT)",
@@ -1452,6 +1459,7 @@ static bool playlist_table(const char *name, char *out, size_t out_size);
 static const char *const KEPT_TABLES[] = {
 	"FAVOURITES",			"PLAYBACK_STATE",		"PLAYBACK_QUEUE", "PLAYBACK_QUEUE_STATE",
 	"PLAYBACK_QUEUE_QUERY", "PLAYBACK_QUEUE_ALBUM", "PLAYLIST_MIGRATION",   "PLAY_COUNTS",
+	"PLAY_HISTORY",
 };
 
 // Copies one table from the attached damaged file. A table the damage reaches
@@ -2196,6 +2204,85 @@ void library_note_play(const char *path) {
 		sqlite3_finalize(stmt);
 	}
 	pthread_mutex_unlock(&db_lock);
+}
+
+void library_history_add(const char *path, const char *name, const char *artist, long long played_at) {
+	if (!path || !path[0]) {
+		return;
+	}
+	pthread_mutex_lock(&db_lock);
+	sqlite3_stmt *stmt = NULL;
+	if (db && sqlite3_prepare_v2(db, "INSERT INTO PLAY_HISTORY(path, name, artist, played_at) VALUES(?1, ?2, ?3, ?4)", -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_text(stmt, 1, path, -1, SQLITE_TRANSIENT);
+		sqlite3_bind_text(stmt, 2, name ? name : "", -1, SQLITE_TRANSIENT);
+		sqlite3_bind_text(stmt, 3, artist ? artist : "", -1, SQLITE_TRANSIENT);
+		sqlite3_bind_int64(stmt, 4, played_at);
+		if (sqlite3_step(stmt) != SQLITE_DONE) {
+			fprintf(stderr, "library: '%s' not added to the history: %s\n", path, sqlite3_errmsg(db));
+		}
+		sqlite3_finalize(stmt);
+		// Only the latest are kept: the ids only grow, so everything this far
+		// below the newest is older than what is kept.
+		char sql[128];
+		snprintf(sql, sizeof(sql), "DELETE FROM PLAY_HISTORY WHERE id <= (SELECT MAX(id) FROM PLAY_HISTORY) - %d", LIBRARY_HISTORY_MAX);
+		exec(sql);
+	}
+	pthread_mutex_unlock(&db_lock);
+}
+
+int library_history_items(library_history_item_t **out) {
+	if (!out) {
+		return 0;
+	}
+	*out = NULL;
+	pthread_mutex_lock(&db_lock);
+	int count = 0;
+	sqlite3_stmt *stmt = NULL;
+	if (db && sqlite3_prepare_v2(db, "SELECT id, played_at FROM PLAY_HISTORY ORDER BY id", -1, &stmt, NULL) == SQLITE_OK) {
+		int room = 0;
+		library_history_item_t *items = NULL;
+		while (sqlite3_step(stmt) == SQLITE_ROW) {
+			if (count == room) {
+				int grown_room = room ? room * 2 : 64;
+				library_history_item_t *grown = realloc(items, (size_t)grown_room * sizeof(*grown));
+				if (!grown) {
+					break;
+				}
+				items = grown;
+				room = grown_room;
+			}
+			items[count].id = sqlite3_column_int64(stmt, 0);
+			items[count].played_at = sqlite3_column_int64(stmt, 1);
+			count++;
+		}
+		sqlite3_finalize(stmt);
+		*out = items;
+	}
+	pthread_mutex_unlock(&db_lock);
+	return count;
+}
+
+bool library_history_entry(long long id, char *path, size_t path_size, char *name, size_t name_size) {
+	pthread_mutex_lock(&db_lock);
+	bool found = false;
+	sqlite3_stmt *stmt = NULL;
+	if (db && sqlite3_prepare_v2(db, "SELECT path, name FROM PLAY_HISTORY WHERE id = ?1", -1, &stmt, NULL) == SQLITE_OK) {
+		sqlite3_bind_int64(stmt, 1, id);
+		if (sqlite3_step(stmt) == SQLITE_ROW) {
+			const unsigned char *p = sqlite3_column_text(stmt, 0);
+			const unsigned char *n = sqlite3_column_text(stmt, 1);
+			if (path && path_size > 0) {
+				snprintf(path, path_size, "%s", p ? (const char *)p : "");
+			}
+			if (name && name_size > 0) {
+				snprintf(name, name_size, "%s", n ? (const char *)n : "");
+			}
+			found = p && p[0];
+		}
+		sqlite3_finalize(stmt);
+	}
+	pthread_mutex_unlock(&db_lock);
+	return found;
 }
 
 int library_fav_add_many(const library_fav_row_t *rows, int count) {

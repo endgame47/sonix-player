@@ -412,6 +412,25 @@ bool library_fav_toggle(const char *path, const char *name, const char *artist);
 // play has gone on long enough to count (playcount.h).
 void library_note_play(const char *path);
 
+// The history of what the queue has played: one entry each time a track was
+// left, finished or skipped (playhistory.h), oldest first. Only the latest
+// LIBRARY_HISTORY_MAX are kept.
+#define LIBRARY_HISTORY_MAX 1000
+
+typedef struct {
+	long long id;
+	long long played_at; // seconds since the epoch, 0 when the clock was not set
+} library_history_item_t;
+
+// Adds an entry at the end, with the title and artist it is to be shown by.
+void library_history_add(const char *path, const char *name, const char *artist, long long played_at);
+
+// Every entry, oldest first, in an array the caller frees. Returns how many.
+int library_history_items(library_history_item_t **out);
+
+// One entry's file and title. False when it is not there.
+bool library_history_entry(long long id, char *path, size_t path_size, char *name, size_t name_size);
+
 bool library_fav_contains(const char *path);
 
 // Stars every track in `rows` that is not starred yet, in one transaction and

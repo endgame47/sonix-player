@@ -24,6 +24,10 @@ void player_refresh_now_playing(void);
 // Redraws only the artist line, after "Use track artist" has been switched.
 void player_refresh_artist(void);
 
+// Reads the lyrics of `path` again, once an .lrc has been saved beside it, and
+// brings their page in when it is the file playing.
+void player_lyrics_reload(const char *path);
+
 // The "4/12" under the progress bar: the place in the queue as the screen shows
 // it (the deal's order under shuffle) and the length. False, with both zero,
 // where the screen shows nothing -- one track, a book, DLNA, a stream.

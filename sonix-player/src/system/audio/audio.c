@@ -26,6 +26,7 @@
 
 #include <sched.h>
 #include <poll.h>
+#include <sys/eventfd.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <dirent.h>
@@ -2278,6 +2279,56 @@ static void playback_wrote(snd_pcm_t *pcm, snd_pcm_uframes_t frames) {
 	playback_follow(pcm);
 }
 
+// Wakes the playback thread out of its wait for room in the card's buffer,
+// so that a pause, a seek or a stop is acted on at once. Without it the wait
+// ends only when a period frees, up to a period of music after the tap (some
+// 90 ms at 44.1 kHz), and the codec's fade-out comes that much late.
+static int playback_wake_fd = -1;
+
+static void playback_wake(void) {
+	uint64_t one = 1;
+	if (playback_wake_fd >= 0 && write(playback_wake_fd, &one, sizeof(one)) < 0) {
+		// Full counter: a wake-up is already pending, which is all this asks.
+	}
+}
+
+// snd_pcm_wait() that also returns, with 0, on playback_wake(). 1: room,
+// 0: timeout or wake-up, < 0: an error, for the writei to report.
+static int pcm_wait_or_wake(snd_pcm_t *pcm, int timeout_ms) {
+	struct pollfd fds[9];
+	int n = snd_pcm_poll_descriptors_count(pcm);
+
+	if (playback_wake_fd < 0 || n <= 0 || n >= (int)(sizeof(fds) / sizeof(fds[0]))) {
+		return snd_pcm_wait(pcm, timeout_ms);
+	}
+	n = snd_pcm_poll_descriptors(pcm, fds, (unsigned int)n);
+	if (n <= 0) {
+		return snd_pcm_wait(pcm, timeout_ms);
+	}
+	fds[n].fd = playback_wake_fd;
+	fds[n].events = POLLIN;
+	fds[n].revents = 0;
+
+	int r = poll(fds, (nfds_t)n + 1, timeout_ms);
+	if (r < 0) {
+		return errno == EINTR ? 0 : -errno;
+	}
+	if (fds[n].revents & POLLIN) {
+		uint64_t count;
+		if (read(playback_wake_fd, &count, sizeof(count)) < 0) {
+			// Already drained: nothing was pending.
+		}
+	}
+	unsigned short revents = 0;
+	if (snd_pcm_poll_descriptors_revents(pcm, fds, (unsigned int)n, &revents) < 0) {
+		return -EIO;
+	}
+	if (revents & (POLLERR | POLLNVAL)) {
+		return -EIO;
+	}
+	return (revents & POLLOUT) ? 1 : 0;
+}
+
 static snd_pcm_sframes_t pcm_write_recover(snd_pcm_t **pcm, const void *buf, snd_pcm_uframes_t frames, int channels,
 										   int rate, int bits, snd_pcm_uframes_t *period) {
 	for (int attempt = 0; attempt < 8; attempt++) {
@@ -2309,7 +2360,7 @@ static snd_pcm_sframes_t pcm_write_recover(snd_pcm_t **pcm, const void *buf, snd
 				if (playback_reader_should_abort()) {
 					return -EINTR; // a command is pending: the main loop handles it
 				}
-				int r = bluetooth ? pcm_wait_bluetooth(*pcm, 100) : snd_pcm_wait(*pcm, 100);
+				int r = bluetooth ? pcm_wait_bluetooth(*pcm, 100) : pcm_wait_or_wake(*pcm, 100);
 				if (r != 0) {
 					room = true; // ready (1) or error (<0): the writei will say which
 				}
@@ -4028,6 +4079,7 @@ int audio_init(void) {
 		return 0;
 
 	growfile_set_reader_abort_cb(playback_reader_should_abort);
+	playback_wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
 
 	set_volume_percent(40); // a sane, audible default on the new dB taper
 	auto_set_output();
@@ -4284,6 +4336,7 @@ void audio_pause(void) {
 	// resume, leaving the button stuck on the play glyph.
 	playback_status = AUDIO_STATUS_PAUSED;
 	pthread_mutex_unlock(&audio_mutex);
+	playback_wake();
 }
 
 void audio_resume(void) {
@@ -4326,6 +4379,7 @@ void audio_stop(void) {
 	seek_target_secs = -1.0;
 	track_completed = false; // deliberate stop is not a natural completion
 	pthread_mutex_unlock(&audio_mutex);
+	playback_wake();
 }
 
 audio_status_t audio_get_status(void) {
@@ -4436,9 +4490,18 @@ void audio_seek(double seconds) {
 	pthread_mutex_lock(&audio_mutex);
 	progress_current_secs = seconds; // the bar follows the finger, not the decoder
 	progress_floor_secs = -1.0;		// and a deliberate jump outranks the pause floor
-	seek_target_secs = seconds;
-	seek_request = true;
+	if (restart_fresh_pending) {
+		// Paused through a suspend: there is no track context to take the
+		// seek, and the play that follows rebuilds one at the saved point.
+		// The point is moved instead, or that play would carry on from where
+		// the pause was and not from where the bar was put.
+		restart_fresh_pos = seconds;
+	} else {
+		seek_target_secs = seconds;
+		seek_request = true;
+	}
 	pthread_mutex_unlock(&audio_mutex);
+	playback_wake();
 }
 
 // ---------------------------------------------------------------------------

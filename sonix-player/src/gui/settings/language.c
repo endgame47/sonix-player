@@ -3,6 +3,7 @@
 #include "src/gui/fonts/fonts.h"
 #include "src/gui/shell/icons.h"
 #include "src/gui/shell/keyboard.h"
+#include "src/gui/shell/setupwifi.h"
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/switcher.h"
 #include "src/gui/shell/theme.h"
@@ -160,9 +161,10 @@ static void confirm_cb(lv_event_t *e) {
 	power_notify_activity();
 
 	// And on to the clock, which is the other thing a player that has never
-	// run cannot work out for itself.
+	// run cannot work out for itself: by way of the Wi-Fi, so that the
+	// network can tell it.
 	if (timeset_needed()) {
-		timeset_show();
+		setupwifi_show();
 	}
 }
 

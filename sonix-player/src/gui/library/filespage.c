@@ -16,6 +16,7 @@
 #include "src/gui/shell/gui.h"
 #include "src/gui/shell/icons.h"
 #include "src/gui/shell/keyboard.h"
+#include "src/gui/library/imageview.h"
 #include "src/gui/library/textview.h"
 #include "src/gui/nowplaying/coverflow.h"
 #include "src/gui/nowplaying/player.h"
@@ -965,15 +966,17 @@ static void row_clicked_cb(lv_event_t *e) {
 		return;
 	}
 
-	// A text file opens to be read. Any other file has nothing to open into,
-	// and the tap does nothing: the menu is what the three dots are for, and a
-	// row that opens a menu when pressed anywhere is a row that opens one every
-	// time a scroll ends on it.
+	// A text file opens to be read and a picture to be looked at. Any other
+	// file has nothing to open into, and the tap does nothing: the menu is what
+	// the three dots are for, and a row that opens a menu when pressed anywhere
+	// is a row that opens one every time a scroll ends on it.
 	if (!entries[index].dir) {
 		char file[PATH_MAX_LEN];
-		if (ext_in(ext_of(entries[index].name), EXT_TEXT) && child_path(entries[index].name, file, sizeof(file)) &&
-			!textview_open(file)) {
+		const char *ext = ext_of(entries[index].name);
+		if (ext_in(ext, EXT_TEXT) && child_path(entries[index].name, file, sizeof(file)) && !textview_open(file)) {
 			gui_notify_popup("files_text_unreadable");
+		} else if (ext_in(ext, EXT_IMAGE) && child_path(entries[index].name, file, sizeof(file))) {
+			imageview_open(file);
 		}
 		return;
 	}
