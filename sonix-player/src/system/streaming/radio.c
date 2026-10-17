@@ -21,6 +21,7 @@
 #include "src/system/core/lang.h"
 #include "src/system/net/tls.h"
 #include "src/system/streaming/onair.h"
+#include "src/system/streaming/radioflac.h"
 #include "src/system/playback/playhistory.h"
 #include "src/system/core/utils.h"
 
@@ -1674,6 +1675,10 @@ static bool still_mine(unsigned mine) { return play_generation == mine; }
 // Six seconds at 320 kbps, sixteen at the 128 kbps most stations send.
 #define RADIO_BUFFER_BYTES (256 * 1024)
 
+// The same for a station that may be FLAC, allocated while it plays: some
+// fifteen seconds of a 16/44.1 station, five of a 24/96 one.
+#define RADIO_FLAC_BUFFER_BYTES (2 * 1024 * 1024)
+
 // What is gathered before the first frame is decoded, and how long the filling
 // thread is given to gather it. Six seconds of a 128 kbps station, three of a
 // 256 kbps one.
@@ -1687,6 +1692,11 @@ static bool still_mine(unsigned mine) { return play_generation == mine; }
 #define RADIO_PREFILL_BYTES (96 * 1024)
 #define RADIO_PREFILL_MS 3000
 
+// A FLAC station spends RADIO_PREFILL_BYTES in well under a second, so once
+// the stream is known to be FLAC it is given this much longer to fill three
+// quarters of its buffer.
+#define RADIO_FLAC_PREFILL_MS 2000
+
 // A station announces a song ahead of the audio it belongs to, by however much
 // of the stream is being held here. Each announcement is kept with the position
 // it arrived at and goes on screen when the decoder reaches it.
@@ -1698,7 +1708,9 @@ typedef struct {
 } radio_title_mark_t;
 
 typedef struct {
-	unsigned char data[RADIO_BUFFER_BYTES];
+	// radio_buffer_storage, or for a FLAC station a larger block of its own.
+	unsigned char *data;
+	int capacity;
 	int head;  // where the decoder reads
 	int level; // bytes held
 
@@ -1728,7 +1740,11 @@ typedef struct {
 // One station plays at a time and both transports run on the same thread, so
 // one of these does for both. Static for the same reason as the decoder's
 // buffers below: a quarter of a megabyte does not go on a stack.
+static unsigned char radio_buffer_storage[RADIO_BUFFER_BYTES];
+
 static radio_buffer_t radio_buffer = {
+	.data = radio_buffer_storage,
+	.capacity = RADIO_BUFFER_BYTES,
 	.lock = PTHREAD_MUTEX_INITIALIZER,
 	.filled = PTHREAD_COND_INITIALIZER,
 	.drained = PTHREAD_COND_INITIALIZER,
@@ -1754,12 +1770,12 @@ static void *radio_buffer_main(void *arg) {
 
 	for (;;) {
 		pthread_mutex_lock(&b->lock);
-		while (!b->stop && b->level >= RADIO_BUFFER_BYTES) {
+		while (!b->stop && b->level >= b->capacity) {
 			pthread_cond_wait(&b->drained, &b->lock);
 		}
 		bool stop = b->stop;
-		int tail = (b->head + b->level) % RADIO_BUFFER_BYTES;
-		int room = RADIO_BUFFER_BYTES - b->level;
+		int tail = (b->head + b->level) % b->capacity;
+		int room = b->capacity - b->level;
 		pthread_mutex_unlock(&b->lock);
 
 		if (stop) {
@@ -1770,7 +1786,7 @@ static void *radio_buffer_main(void *arg) {
 		// next turn's business. The read is outside the lock, and can be: this
 		// is the only thread that writes, and it writes into space the decoder
 		// has already passed.
-		int to_end = RADIO_BUFFER_BYTES - tail;
+		int to_end = b->capacity - tail;
 		int want = room < to_end ? room : to_end;
 		int got = b->stream ? http_stream_read(b->stream, b->data + tail, want)
 							: hls_read(b->hls, b->data + tail, want);
@@ -1792,10 +1808,32 @@ static void *radio_buffer_main(void *arg) {
 	return NULL;
 }
 
-// Starts filling from a source that is already open. False when the thread
-// cannot be created, which leaves the caller with nothing to read from.
-static bool radio_buffer_start(radio_buffer_t *b, http_stream_t *stream, hls_t *hls) {
+// Gives back a block radio_buffer_start() allocated. The filling thread must be
+// gone.
+static void radio_buffer_release(radio_buffer_t *b) {
+	if (b->data != radio_buffer_storage) {
+		free(b->data);
+	}
+	b->data = radio_buffer_storage;
+	b->capacity = RADIO_BUFFER_BYTES;
+}
+
+// Starts filling from a source that is already open, into `capacity` bytes:
+// RADIO_BUFFER_BYTES, or more when there is the memory for it. False when the
+// thread cannot be created, which leaves the caller with nothing to read from.
+static bool radio_buffer_start(radio_buffer_t *b, http_stream_t *stream, hls_t *hls, int capacity) {
+	unsigned char *data = capacity > RADIO_BUFFER_BYTES ? malloc((size_t)capacity) : NULL;
+	if (!data) {
+		if (capacity > RADIO_BUFFER_BYTES) {
+			fprintf(stderr, "radio: no memory for a %d KB buffer\n", capacity / 1024);
+		}
+		data = radio_buffer_storage;
+		capacity = RADIO_BUFFER_BYTES;
+	}
+
 	pthread_mutex_lock(&b->lock);
+	b->data = data;
+	b->capacity = capacity;
 	b->head = 0;
 	b->level = 0;
 	b->written = 0;
@@ -1811,6 +1849,7 @@ static bool radio_buffer_start(radio_buffer_t *b, http_stream_t *stream, hls_t *
 		fprintf(stderr, "radio: no thread for the buffer\n");
 		b->stream = NULL;
 		b->hls = NULL;
+		radio_buffer_release(b);
 		return false;
 	}
 	b->thread_valid = true;
@@ -1842,6 +1881,7 @@ static void radio_buffer_stop(radio_buffer_t *b) {
 	b->thread_valid = false;
 	b->stream = NULL;
 	b->hls = NULL;
+	radio_buffer_release(b);
 }
 
 // Hands the decoder what has been gathered, and takes the place of reading the
@@ -1856,13 +1896,13 @@ static int radio_buffer_read(radio_buffer_t *b, unsigned char *dst, int max) {
 
 	int n = b->level < max ? b->level : max;
 	if (n > 0) {
-		int to_end = RADIO_BUFFER_BYTES - b->head;
+		int to_end = b->capacity - b->head;
 		int first = n < to_end ? n : to_end;
 		memcpy(dst, b->data + b->head, (size_t)first);
 		if (n > first) {
 			memcpy(dst + first, b->data, (size_t)(n - first));
 		}
-		b->head = (b->head + n) % RADIO_BUFFER_BYTES;
+		b->head = (b->head + n) % b->capacity;
 		b->level -= n;
 		b->taken += n;
 		pthread_cond_signal(&b->drained);
@@ -1886,9 +1926,9 @@ static bool radio_buffer_take_title(radio_buffer_t *b, char *out, size_t size) {
 	return got;
 }
 
-// Waits for the buffer to fill before the first frame is decoded: this is the
-// reserve the station plays from for as long as it is on.
-static void radio_buffer_prefill(radio_buffer_t *b, unsigned mine) {
+// Waits for `bytes` to be held, `ms` at most, before the first frame is
+// decoded: this is the reserve the station plays from for as long as it is on.
+static void radio_buffer_prefill(radio_buffer_t *b, unsigned mine, int bytes, int ms) {
 	int waited = 0;
 	int level = 0;
 
@@ -1898,7 +1938,7 @@ static void radio_buffer_prefill(radio_buffer_t *b, unsigned mine) {
 		bool ended = b->ended;
 		pthread_mutex_unlock(&b->lock);
 
-		if (ended || level >= RADIO_PREFILL_BYTES || waited >= RADIO_PREFILL_MS || !still_mine(mine)) {
+		if (ended || level >= bytes || waited >= ms || !still_mine(mine)) {
 			break;
 		}
 		usleep(50 * 1000);
@@ -2031,6 +2071,7 @@ typedef struct {
 	bool open;
 	int rate;
 	int channels; // what the STREAM is, not what the card was opened as
+	int bits;	  // what the card was opened with: 16, or 32 for a deep FLAC
 } radio_out_t;
 
 // Opens or reopens the card when the stream changes under it, widens mono, and
@@ -2053,12 +2094,13 @@ static bool radio_push_pcm(radio_out_t *out, short *pcm, short *stereo, int fram
 	// because a DAC that will not take a one-channel stream does not refuse it:
 	// the frames are read as half-pairs and play at double speed with the
 	// channels crossed.
-	if (!out->open || rate != out->rate || channels != out->channels) {
+	if (!out->open || rate != out->rate || channels != out->channels || out->bits != 16) {
 		if (out->open) {
 			audio_external_end();
 		}
 		out->rate = rate;
 		out->channels = channels;
+		out->bits = 16;
 		out->open = audio_external_begin(out->rate, 2, 16);
 		if (!out->open) {
 			fprintf(stderr, "radio: cannot open the output at %d Hz\n", out->rate);
@@ -2114,6 +2156,63 @@ static bool radio_push_pcm(radio_out_t *out, short *pcm, short *stereo, int fram
 	return true;
 }
 
+// radio_push_pcm() for samples deeper than 16 bits, left-justified in 32, which
+// go to the card as they are: the card is opened for 32-bit frames. False when
+// it refuses them.
+static bool radio_push_pcm32(radio_out_t *out, int32_t *pcm, int32_t *stereo, int frames, int rate, int channels, const char *codec_name) {
+	if (frames <= 0 || rate <= 0 || channels <= 0) {
+		return true;
+	}
+
+	if (!out->open || rate != out->rate || channels != out->channels || out->bits != 32) {
+		if (out->open) {
+			audio_external_end();
+		}
+		out->rate = rate;
+		out->channels = channels;
+		out->bits = 32;
+		out->open = audio_external_begin(out->rate, 2, 32);
+		if (!out->open) {
+			fprintf(stderr, "radio: cannot open the output at %d Hz, 32 bit\n", out->rate);
+			return false;
+		}
+
+		pthread_mutex_lock(&now_lock);
+		now_state.sample_rate = out->rate;
+		now_state.channels = out->channels;
+		snprintf(now_state.codec, sizeof(now_state.codec), "%s", codec_name ? codec_name : "");
+		now_state.connecting = false;
+		now_state.playing = true;
+		now_touch();
+		pthread_mutex_unlock(&now_lock);
+	}
+
+	// Mono widened, and more than two channels folded into two, as above.
+	int32_t *frames_out = pcm;
+	if (channels == 1) {
+		for (int i = frames - 1; i >= 0; i--) {
+			stereo[2 * i] = pcm[i];
+			stereo[2 * i + 1] = pcm[i];
+		}
+		frames_out = stereo;
+	} else if (channels > 2) {
+		int pairs = channels / 2;
+		for (int i = 0; i < frames; i++) {
+			int64_t left = 0, right = 0;
+			for (int c = 0; c < pairs; c++) {
+				left += pcm[i * channels + 2 * c];
+				right += pcm[i * channels + 2 * c + 1];
+			}
+			stereo[2 * i] = (int32_t)(left / pairs);
+			stereo[2 * i + 1] = (int32_t)(right / pairs);
+		}
+		frames_out = stereo;
+	}
+	eq_process_s32(frames_out, frames, 2, rate);
+	audio_external_write(frames_out, frames);
+	return true;
+}
+
 // ---------------------------------------------------------------------------
 // Which decoder a plain stream needs
 //
@@ -2125,17 +2224,44 @@ static bool radio_push_pcm(radio_out_t *out, short *pcm, short *stereo, int fram
 // is enough. Plenty of AAC stations are served as audio/mpeg by a misconfigured
 // Icecast, and plenty send no Content-Type at all; on the other side, the first
 // bytes of a stream can land mid-frame, where a sniff finds nothing.
+//
+// FLAC comes native or in Ogg, with its header at the start of the connection
+// either way; radioflac.c decodes both.
 // ---------------------------------------------------------------------------
 
 typedef enum {
 	RADIO_CODEC_UNKNOWN = 0,
 	RADIO_CODEC_MP3,
 	RADIO_CODEC_AAC,
+	RADIO_CODEC_FLAC,
+	RADIO_CODEC_OGG_FLAC,
 } radio_codec_t;
+
+static const char *codec_label(radio_codec_t codec) {
+	switch (codec) {
+	case RADIO_CODEC_MP3:
+		return "MP3";
+	case RADIO_CODEC_AAC:
+		return "AAC";
+	case RADIO_CODEC_FLAC:
+		return "FLAC";
+	case RADIO_CODEC_OGG_FLAC:
+		return "Ogg FLAC";
+	default:
+		return "nothing";
+	}
+}
+
+static bool codec_is_flac(radio_codec_t codec) { return codec == RADIO_CODEC_FLAC || codec == RADIO_CODEC_OGG_FLAC; }
 
 static radio_codec_t codec_from_content_type(const char *ct) {
 	if (!ct || !ct[0]) {
 		return RADIO_CODEC_UNKNOWN;
+	}
+	// audio/flac, audio/x-flac, and "audio/ogg; codecs=flac": which of the two
+	// containers it is, the bytes say.
+	if (strcasestr(ct, "flac")) {
+		return RADIO_CODEC_FLAC;
 	}
 	// audio/aac, audio/aacp, audio/x-aac, application/aacp -- and "mp4a" for
 	// the servers that answer with the codec string instead of a media type.
@@ -2227,6 +2353,35 @@ static bool bytes_look_like_adts(const drmp3_uint8 *data, int len) {
 	return false;
 }
 
+// A FLAC header at the very front: "fLaC", behind an ID3 tag if there is one,
+// or an Ogg page whose first packet is FLAC's (0x7F "FLAC"). UNKNOWN otherwise.
+static radio_codec_t bytes_look_like_flac(const drmp3_uint8 *data, int len) {
+	int off = radio_skip_id3(data, len);
+	if (off + 4 <= len && memcmp(data + off, "fLaC", 4) == 0) {
+		return RADIO_CODEC_FLAC;
+	}
+	if (len >= 27 && memcmp(data, "OggS", 4) == 0) {
+		int packet = 27 + data[26];
+		if (packet + 5 <= len && data[packet] == 0x7F && memcmp(data + packet + 1, "FLAC", 4) == 0) {
+			return RADIO_CODEC_OGG_FLAC;
+		}
+	}
+	return RADIO_CODEC_UNKNOWN;
+}
+
+// Whether a connection could turn out to be FLAC, before a byte has been read:
+// the Content-Type says FLAC or Ogg, the address says FLAC, or the directory
+// lists the station as FLAC. It decides only how large a buffer it gets.
+static bool stream_may_be_flac(const char *url, const char *content_type) {
+	if (strcasestr(url, "flac") || strcasestr(content_type, "flac") || strcasestr(content_type, "ogg")) {
+		return true;
+	}
+	pthread_mutex_lock(&now_lock);
+	bool listed = strcasestr(now_station.codec, "flac") != NULL;
+	pthread_mutex_unlock(&now_lock);
+	return listed;
+}
+
 // ---------------------------------------------------------------------------
 // HLS
 //
@@ -2300,10 +2455,10 @@ static bool play_hls(const char *url, unsigned mine) {
 		}
 	}
 
-	if (!radio_buffer_start(&radio_buffer, NULL, h)) {
+	if (!radio_buffer_start(&radio_buffer, NULL, h, RADIO_BUFFER_BYTES)) {
 		goto done_hls;
 	}
-	radio_buffer_prefill(&radio_buffer, mine);
+	radio_buffer_prefill(&radio_buffer, mine, RADIO_PREFILL_BYTES, RADIO_PREFILL_MS);
 
 	while (still_mine(mine)) {
 		if (have < RADIO_IN_BUFFER) {
@@ -2401,7 +2556,122 @@ done_hls:
 	}
 	return true;
 }
+// ---------------------------------------------------------------------------
+// FLAC
+//
+// The decoder pulls its bytes rather than being handed them (see radioflac.h):
+// first the ones already read for the sniff, then the network buffer's.
+// ---------------------------------------------------------------------------
 
+// Sample frames per read: what radio_pcm holds at eight channels, once
+// narrowed to 16 bits.
+#define RADIO_FLAC_CHUNK (RADIO_PCM_CAPACITY / 8)
+
+typedef struct {
+	const drmp3_uint8 *prefix;
+	int prefix_len;
+	int prefix_at;
+	unsigned mine;
+} radio_flac_source_t;
+
+static int radio_flac_source_read(void *user, unsigned char *dst, int max) {
+	radio_flac_source_t *src = user;
+	if (!still_mine(src->mine)) {
+		return 0;
+	}
+	if (src->prefix_at < src->prefix_len) {
+		int n = src->prefix_len - src->prefix_at;
+		if (n > max) {
+			n = max;
+		}
+		memcpy(dst, src->prefix + src->prefix_at, (size_t)n);
+		src->prefix_at += n;
+		return n;
+	}
+	return radio_buffer_read(&radio_buffer, dst, max);
+}
+
+// Plays a FLAC station until it ends or is stopped. `prefix` is what was read
+// for the sniff. *give_up is set when the stream holds no FLAC at all, which
+// another connection would only repeat.
+static void play_flac(bool ogg, const drmp3_uint8 *prefix, int prefix_len, unsigned mine, radio_out_t *out, bool *ever_decoded, bool *clean, bool *give_up) {
+	radio_flac_source_t src = {prefix, prefix_len, 0, mine};
+	radioflac_t *f = radioflac_open(ogg, radio_flac_source_read, &src);
+	int32_t *pcm = malloc(sizeof(int32_t) * RADIO_FLAC_CHUNK * 8);
+	int32_t *stereo = malloc(sizeof(int32_t) * RADIO_FLAC_CHUNK * 2);
+	if (!f || !pcm || !stereo) {
+		fprintf(stderr, "radio: no memory for the FLAC decoder\n");
+		*clean = true;
+		*give_up = true;
+		goto done_flac;
+	}
+
+	radio_buffer_prefill(&radio_buffer, mine, radio_buffer.capacity / 4 * 3, RADIO_FLAC_PREFILL_MS);
+
+	bool narrow = false; // the card would not take 32-bit frames
+	int shown_bits = -1;
+	while (still_mine(mine)) {
+		int frames = radioflac_read(f, pcm, RADIO_FLAC_CHUNK);
+		if (frames < 0) {
+			fprintf(stderr, "radio: no FLAC frame in the stream\n");
+			pthread_mutex_lock(&now_lock);
+			snprintf(now_state.error, sizeof(now_state.error), "%s", tr("radio_unreadable"));
+			now_state.playing = false;
+			now_state.connecting = false;
+			now_touch();
+			pthread_mutex_unlock(&now_lock);
+			*clean = true;
+			*give_up = true;
+			break;
+		}
+		if (frames == 0 || !still_mine(mine)) {
+			break; // the station closed, went quiet past the timeout, or was stopped
+		}
+
+		// What the station announces over ICY, and what the stream's own
+		// comments name at each new song of an Ogg chain.
+		char announced[256];
+		while (radio_buffer_take_title(&radio_buffer, announced, sizeof(announced)) || radioflac_take_title(f, announced, sizeof(announced))) {
+			onair_clean(announced, sizeof(announced));
+			pthread_mutex_lock(&now_lock);
+			snprintf(now_state.title, sizeof(now_state.title), "%s", announced);
+			now_touch();
+			pthread_mutex_unlock(&now_lock);
+		}
+
+		int rate, channels, bits;
+		radioflac_format(f, &rate, &channels, &bits);
+		if (bits != shown_bits) {
+			shown_bits = bits;
+			pthread_mutex_lock(&now_lock);
+			now_state.bits = bits;
+			now_touch();
+			pthread_mutex_unlock(&now_lock);
+		}
+		*ever_decoded = true;
+
+		if (bits > 16 && !narrow) {
+			if (radio_push_pcm32(out, pcm, stereo, frames, rate, channels, "FLAC")) {
+				continue;
+			}
+			fprintf(stderr, "radio: playing the %d-bit station at 16 bit\n", bits);
+			narrow = true;
+		}
+		short *pcm16 = radio_pcm;
+		for (int i = 0; i < frames * channels; i++) {
+			pcm16[i] = (short)(pcm[i] >> 16);
+		}
+		if (!radio_push_pcm(out, pcm16, radio_stereo, frames, rate, channels, 0, "FLAC")) {
+			*clean = true; // no point reconnecting: the DAC said no
+			break;
+		}
+	}
+
+done_flac:
+	radioflac_close(f);
+	free(pcm);
+	free(stereo);
+}
 
 // Decodes one connection's worth of stream. Returns true if it ended cleanly
 // or was stopped, false if it broke and is worth reconnecting.
@@ -2505,6 +2775,7 @@ static bool play_one_connection(const char *url, unsigned mine, char *redirect, 
 	bool clean = false;
 	bool ended = false;
 	bool ever_decoded = false;
+	bool give_up = false; // the stream is not what it claimed, and will not be on the next try
 	time_t opened_at = time(NULL);
 
 	// What the header claims. The bytes get the last word, once there are some:
@@ -2513,10 +2784,11 @@ static bool play_one_connection(const char *url, unsigned mine, char *redirect, 
 	bool codec_settled = false;
 	aacdec_t *aac = NULL;
 
-	if (!radio_buffer_start(&radio_buffer, &stream, NULL)) {
+	int capacity = stream_may_be_flac(url, stream.content_type) ? RADIO_FLAC_BUFFER_BYTES : RADIO_BUFFER_BYTES;
+	if (!radio_buffer_start(&radio_buffer, &stream, NULL, capacity)) {
 		goto done;
 	}
-	radio_buffer_prefill(&radio_buffer, mine);
+	radio_buffer_prefill(&radio_buffer, mine, RADIO_PREFILL_BYTES, RADIO_PREFILL_MS);
 
 	while (still_mine(mine)) {
 		// Connected, receiving, and nothing has come out of the decoder for
@@ -2568,17 +2840,25 @@ static bool play_one_connection(const char *url, unsigned mine, char *redirect, 
 		// that is the same threshold, so the answer is always in before the
 		// first frame. A second look later would swap the decoder out from
 		// under a stream that is already playing.
+		//
+		// A FLAC header is looked for first. Without one, a Content-Type that
+		// says FLAC is still taken at its word unless the bytes are AAC: a
+		// native stream joined midway is opened from its first whole frame.
 		if (!codec_settled && have >= RADIO_DECODE_SLACK) {
-			radio_codec_t sniffed = bytes_look_like_adts(input, have) ? RADIO_CODEC_AAC : RADIO_CODEC_MP3;
+			radio_codec_t sniffed = bytes_look_like_flac(input, have);
+			if (sniffed == RADIO_CODEC_UNKNOWN) {
+				sniffed = bytes_look_like_adts(input, have) ? RADIO_CODEC_AAC : codec == RADIO_CODEC_FLAC ? RADIO_CODEC_FLAC : RADIO_CODEC_MP3;
+			}
 			if (sniffed != codec) {
-				fprintf(stderr, "radio: header said %s, the stream is %s\n",
-						codec == RADIO_CODEC_AAC	 ? "AAC"
-						: codec == RADIO_CODEC_MP3 ? "MP3"
-												   : "nothing",
-						sniffed == RADIO_CODEC_AAC ? "AAC" : "MP3");
+				fprintf(stderr, "radio: header said %s, the stream is %s\n", codec_label(codec), codec_label(sniffed));
 			}
 			codec = sniffed;
 			codec_settled = true;
+		}
+
+		if (codec_settled && codec_is_flac(codec)) {
+			play_flac(codec == RADIO_CODEC_OGG_FLAC, input, have, mine, &out, &ever_decoded, &clean, &give_up);
+			goto done;
 		}
 
 		if (codec == RADIO_CODEC_AAC && !aac) {
@@ -2668,7 +2948,7 @@ static bool play_one_connection(const char *url, unsigned mine, char *redirect, 
 			// the two formats this can read. Say so where the user is looking
 			// instead of leaving a station that is silent for no visible
 			// reason.
-			fprintf(stderr, "radio: this stream is neither MP3 nor AAC\n");
+			fprintf(stderr, "radio: this stream is neither MP3, AAC nor FLAC\n");
 			pthread_mutex_lock(&now_lock);
 			snprintf(now_state.error, sizeof(now_state.error), "%s",
 					 tr("radio_format_unsupported_generic"));
@@ -2702,7 +2982,7 @@ done:
 
 	// A connection that produced no audio at all is not worth retrying the
 	// same way -- but one that played for a while and dropped is.
-	if (!ever_decoded && still_mine(mine)) {
+	if (!ever_decoded && still_mine(mine) && !give_up) {
 		return false;
 	}
 	return clean;

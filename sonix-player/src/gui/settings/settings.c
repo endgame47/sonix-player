@@ -181,11 +181,8 @@ static void screen_off_changed_cb(lv_event_t *e) {
 	lv_label_set_text(screen_off_value, tr(SCREEN_OFF[index].label));
 }
 
-// 0..100 scale -- anything under that is indistinguishable from off.
-static long brightness_floor(long max) {
-	long floor = max / 20;
-	return floor > 0 ? floor : 1;
-}
+// The dimmest backlight level on the slider: 0 would put the backlight out.
+#define BRIGHTNESS_FLOOR 1
 
 static void brightness_show_value(long value, long max) {
 	lv_label_set_text_fmt(brightness_value, "%d%%", (int)((value * 100 + max / 2) / max));
@@ -215,10 +212,10 @@ static void screensettings_loaded_cb(lv_event_t *e) {
 	if (max <= 0) {
 		max = 100;
 	}
-	lv_slider_set_range(brightness_slider, (int32_t)brightness_floor(max), (int32_t)max);
+	lv_slider_set_range(brightness_slider, BRIGHTNESS_FLOOR, (int32_t)max);
 
 	long value = power_get_brightness();
-	if (value < brightness_floor(max)) {
+	if (value < BRIGHTNESS_FLOOR) {
 		value = max;
 	}
 	lv_slider_set_value(brightness_slider, (int32_t)value, LV_ANIM_OFF);
@@ -268,7 +265,7 @@ static void build_screen_page(gui_config_t *cfg) {
 	lv_obj_set_width(brightness_slider, lv_pct(100));
 	lv_obj_set_height(brightness_slider, 10);
 	lv_obj_align(brightness_slider, LV_ALIGN_BOTTOM_MID, 0, -14);
-	lv_slider_set_range(brightness_slider, 5, 100);
+	lv_slider_set_range(brightness_slider, BRIGHTNESS_FLOOR, 100);
 
 	lv_obj_set_style_radius(brightness_slider, LV_RADIUS_CIRCLE, LV_PART_MAIN);
 	lv_obj_set_style_bg_color(brightness_slider, theme()->text_secondary, LV_PART_MAIN);

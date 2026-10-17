@@ -28,6 +28,16 @@ void axpcharge_set(bool limit_voltage, bool limit_current) {
 }
 void axpcharge_tick(void) {}
 bool axpcharge_holding(void) { return false; }
+bool axpcharge_reg_read(uint8_t reg, uint8_t *value) {
+	(void)reg;
+	(void)value;
+	return false;
+}
+bool axpcharge_reg_write(uint8_t reg, uint8_t value) {
+	(void)reg;
+	(void)value;
+	return false;
+}
 
 #else
 
@@ -219,5 +229,8 @@ void axpcharge_tick(void) {
 }
 
 bool axpcharge_holding(void) { return holding; }
+
+bool axpcharge_reg_read(uint8_t reg, uint8_t *value) { return axp_read(reg, value); }
+bool axpcharge_reg_write(uint8_t reg, uint8_t value) { return axp_write(reg, value); }
 
 #endif /* HOST_BUILD */

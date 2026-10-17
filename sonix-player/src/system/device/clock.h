@@ -115,6 +115,12 @@ const char *clock_zone_name(void);
 // on a timer. True when the local time may have moved.
 bool clock_poll(void);
 
+// Called from the thread of an attempt each time it learns something -- the
+// time, the zone, the end of the attempt -- so the interface can bring
+// clock_poll() and the status bar forward instead of waiting for its timers.
+// The hook runs on that thread, not the interface's.
+void clock_set_change_hook(void (*hook)(void));
+
 // Puts the system clock back where it belongs; returns true if it had to move
 // it.
 //
@@ -153,5 +159,9 @@ void clock_set_use_24h(bool on); // stored in the configuration
 // "14:05" or "2:05 PM", per the setting. `hour` is always the real hour, 0 to
 // 23; the conversion happens here.
 void clock_format_hm(char *out, size_t out_size, int hour, int minute);
+
+// The same in two parts, for a clock that draws AM and PM apart from the
+// figures: "2:05" and "PM", or "14:05" and "".
+void clock_format_hm_parts(char *time_out, size_t time_size, char *suffix_out, size_t suffix_size, int hour, int minute);
 
 #endif /* CLOCK_H */

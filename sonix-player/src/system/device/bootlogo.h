@@ -46,4 +46,10 @@ bool bootlogo_make_custom(const char *image_path, int width, int height);
 // Back to the theme's logo: deletes the custom file.
 void bootlogo_clear_custom(void);
 
+// Draws the boot logo now, the one S11jpeg_display_shell would pick for this
+// theme and accent: the custom file when there is one, otherwise the theme's
+// own, otherwise /etc/logo.jpeg. Blocks while cmd_jpeg_display runs. False
+// when nothing could be shown.
+bool bootlogo_show_now(bool dark, int accent);
+
 #endif /* BOOTLOGO_H */

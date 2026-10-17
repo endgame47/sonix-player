@@ -10,6 +10,7 @@
 #include "lvgl/lvgl.h"
 
 #include "src/gui/fonts/fonts.h"
+#include "src/gui/shell/clocklabel.h"
 #include "src/gui/shell/icons.h"
 #include "src/gui/nowplaying/player.h"
 #include "src/gui/shell/quickpanel.h"
@@ -212,24 +213,7 @@ static void update_battery_indicator(int percent, bool charging) {
 
 // Redraws the clock. Before the time has been set there is nothing truthful to
 // show, so it reads as blank rather than as 1970.
-void topbar_refresh_clock(void) {
-	if (!clock_label) {
-		return;
-	}
-
-	if (!clock_is_set()) {
-		lv_label_set_text(clock_label, "--:--");
-		return;
-	}
-
-	time_t now = time(NULL);
-	struct tm local;
-	localtime_r(&now, &local);
-
-	char text[16];
-	clock_format_hm(text, sizeof(text), local.tm_hour, local.tm_min);
-	lv_label_set_text(clock_label, text);
-}
+void topbar_refresh_clock(void) { clocklabel_refresh(clock_label); }
 
 static void clock_timer_cb(lv_timer_t *timer) {
 	(void)timer;
@@ -238,6 +222,15 @@ static void clock_timer_cb(lv_timer_t *timer) {
 	clock_poll();
 	topbar_refresh_clock();
 }
+
+static void clock_changed_cb(void *unused) {
+	(void)unused;
+	clock_poll();
+	topbar_refresh_clock();
+}
+
+// From the network attempt's thread: onto this one.
+static void clock_changed(void) { gui_post(clock_changed_cb, NULL); }
 
 static void remember_timer_cb(lv_timer_t *timer) {
 	(void)timer;
@@ -1015,9 +1008,8 @@ void topbar_init(gui_config_t *cfg) {
 	lv_obj_set_hidden(bat_bolt, true);
 
 	// Clock, centred on the bar and independent of everything around it.
-	clock_label = lv_label_create(top_bar);
+	clock_label = clocklabel_create(top_bar, &font_ui_24, 24, &font_ui_14, 14);
 	lv_obj_add_style(clock_label, &theme_style_text, 0);
-	lv_obj_set_style_text_font(clock_label, &font_ui_24, 0);
 	lv_obj_align(clock_label, LV_ALIGN_CENTER, 0, 0);
 	topbar_refresh_clock();
 	topbar_set_clock_position((int)config_get_int("screen", "clock_pos", TOPBAR_CLOCK_CENTER));
@@ -1037,6 +1029,7 @@ void topbar_init(gui_config_t *cfg) {
 
 	// Ten seconds keeps the minute from ever looking stale and costs nothing.
 	clock_timer = lv_timer_create(clock_timer_cb, 10000, NULL);
+	clock_set_change_hook(clock_changed);
 	power_pause_in_standby(clock_timer); // a clock nobody can see is pure drain
 
 	// The current time is written to the config, and checked against the RTC, so

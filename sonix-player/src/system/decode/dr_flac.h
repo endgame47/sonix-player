@@ -5309,8 +5309,8 @@ static drflac_bool32 drflac__read_next_flac_frame_header(drflac_bs* bs, drflac_u
             header->bitsPerSample = streaminfoBitsPerSample;
         }
 
-        if (header->bitsPerSample != streaminfoBitsPerSample) {
-            /* A different bitsPerSample than STREAMINFO: a sync code inside the audio data, not a frame header. Keep looking, as above. */
+        if (streaminfoBitsPerSample != 0 && header->bitsPerSample != streaminfoBitsPerSample) {
+            /* A different bitsPerSample than STREAMINFO: a sync code inside the audio data, not a frame header. Keep looking, as above. Relaxed mode has no STREAMINFO and passes 0. */
             continue;
         }
 

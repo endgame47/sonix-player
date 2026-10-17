@@ -1,0 +1,67 @@
+name: Bug report log check
+
+# A bug report must carry the log as an attached file. Without one the issue
+# gets the "needs log" label and a comment that explains how to attach it;
+# once the log is added by editing the report, the label goes away. The issue
+# itself stays open either way.
+
+on:
+  issues:
+    types: [opened, edited]
+
+permissions:
+  issues: write
+
+jobs:
+  check:
+    if: contains(github.event.issue.labels.*.name, 'bug')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const body = issue.body || '';
+            const label = 'needs log';
+
+            // Reports made with the form only, and not the maintainer's own.
+            if (issue.user.login === context.repo.owner) return;
+            const start = body.indexOf('### Log (required)');
+            if (start < 0) return;
+
+            // Only the "Log (required)" section of the form counts.
+            let section = body.slice(start);
+            const next = section.indexOf('\n### ', 5);
+            if (next > 0) section = section.slice(0, next);
+
+            // A file dragged into the box becomes a link to an uploaded file.
+            const hasFile = /https:\/\/github\.com\/(user-attachments\/files|[^\/\s]+\/[^\/\s]+\/files)\/\d+\/[^\s)]+/i.test(section);
+            const labels = issue.labels.map(l => l.name);
+            const params = { owner: context.repo.owner, repo: context.repo.repo, issue_number: issue.number };
+
+            if (hasFile) {
+              if (labels.includes(label)) {
+                await github.rest.issues.removeLabel({ ...params, name: label }).catch(() => {});
+                await github.rest.issues.createComment({ ...params, body: 'Thanks, the log is there now.' });
+              }
+              return;
+            }
+
+            // Asked once: an edit that still has no log does not ask again.
+            if (labels.includes(label)) return;
+
+            await github.rest.issues.addLabels({ ...params, labels: [label] });
+            await github.rest.issues.createComment({ ...params, body: [
+              'This bug report has no log file attached, and without it the problem cannot be looked into.',
+              '',
+              'Please **edit this report** and drag the `sonix_player.log` file into the **Log** box.',
+              '',
+              'How to get the log:',
+              '',
+              '1. Go to Settings > System > About and tap "Build number" five times, until a pop-up says that developer options are turned on.',
+              '2. Go to Settings > Developer options and turn on "Log to microSD".',
+              '3. Make the problem happen again.',
+              '4. The file is `.local/sonix_player.log` in the root of the microSD card. `.local` is a hidden folder: on a Mac press Cmd+Shift+. in Finder to see it, on Windows turn on "Hidden items" in the View menu of File Explorer.',
+              '',
+              'Please attach the file itself. A log pasted as text is not enough.',
+            ].join('\n') });

@@ -230,10 +230,12 @@ typedef struct {
 	int sample_rate;
 	int channels;
 	// What is actually coming down the wire, filled in when the decoder is
-	// chosen: "MP3" or "AAC". The directory's own codec field is a claim and is
-	// often wrong -- an AAC station listed as MP3 is the common case -- so the
-	// player shows this one and not that.
+	// chosen: "MP3", "AAC" or "FLAC". The directory's own codec field is a
+	// claim and is often wrong -- an AAC station listed as MP3 is the common
+	// case -- so the player shows this one and not that.
 	char codec[8];
+	// The bit depth of a lossless station, 0 for a lossy one.
+	int bits;
 } radio_now_t;
 
 // Starts a station. Stops local playback first: one PCM takes one writer.

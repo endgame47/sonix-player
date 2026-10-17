@@ -58,6 +58,23 @@ static lv_timer_t *auto_timer;
 static unsigned auto_seen_syncs; // clock_network_sync_result() when last looked at
 static bool auto_waiting_wifi;	 // Wi-Fi switched on from here: ask the network once it connects
 
+// A link that has only just come up can fail the first request (no route or
+// no DNS yet): the attempts made for Wi-Fi switched on from here are tried
+// again, this many times this far apart, before a failure is shown.
+#define AUTO_FRESH_RETRIES 2
+#define AUTO_FRESH_RETRY_MS 3000
+static int auto_retries_left;
+static bool auto_retry_pending;
+static uint32_t auto_retry_since; // lv_tick of the failure the retry follows
+
+// Associated and with an address: what a request needs. The state says
+// connected as soon as the association completes, before the lease.
+static bool auto_wifi_online(void) {
+	wifi_status_t wifi;
+	wifi_get_status(&wifi);
+	return wifi.state == WIFI_STATE_CONNECTED && wifi.ip[0] != '\0';
+}
+
 // Shown as the first-boot page: no way back, no status bar. Decided when the
 // page opens rather than read from the clock each time, because on the first
 // boot the network may set the clock while the page is up.
@@ -517,7 +534,8 @@ static void auto_status_paint(void) {
 	wifi_status_t wifi;
 	wifi_get_status(&wifi);
 
-	if (running) {
+	bool joining = auto_waiting_wifi && (wifi.state == WIFI_STATE_CONNECTING || wifi.state == WIFI_STATE_CONNECTED);
+	if (running || auto_retry_pending || joining) {
 		tag = "timeset_auto_syncing";
 	} else if (syncs != auto_seen_syncs && !ok) {
 		tag = "timeset_auto_failed";
@@ -545,12 +563,28 @@ static void auto_tick_cb(lv_timer_t *t) {
 	if (!panel || lv_obj_is_hidden(panel) || !clock_auto_enabled()) {
 		return;
 	}
-	if (auto_waiting_wifi) {
-		wifi_status_t wifi;
-		wifi_get_status(&wifi);
-		if (wifi.state == WIFI_STATE_CONNECTED) {
-			auto_waiting_wifi = false;
-			clock_network_sync_now();
+	if (auto_waiting_wifi && auto_wifi_online()) {
+		auto_waiting_wifi = false;
+		clock_network_sync_now();
+	}
+	if (auto_retries_left > 0) {
+		bool running = false, ok = false;
+		unsigned syncs = clock_network_sync_result(&running, &ok);
+		if (auto_retry_pending) {
+			if (lv_tick_elaps(auto_retry_since) >= AUTO_FRESH_RETRY_MS) {
+				auto_retry_pending = false;
+				auto_retries_left--;
+				clock_network_sync_now();
+			}
+		} else if (!running && syncs != auto_seen_syncs) {
+			if (ok) {
+				auto_retries_left = 0;
+			} else {
+				// Not shown: another attempt follows.
+				auto_seen_syncs = syncs;
+				auto_retry_pending = true;
+				auto_retry_since = lv_tick_get();
+			}
 		}
 	}
 	// The zone may have come in with the time, and daylight saving may have
@@ -594,16 +628,18 @@ static void enable_wifi_cb(void *user) {
 	(void)user;
 	wifi_set_enabled(true);
 	auto_waiting_wifi = true;
+	auto_retries_left = AUTO_FRESH_RETRIES;
+	auto_retry_pending = false;
 	auto_status_paint();
 }
 
 // Asks the network now, or, with Wi-Fi off, whether to switch it on for that.
 static void auto_start(void) {
-	wifi_status_t wifi;
-	wifi_get_status(&wifi);
-	if (wifi.state == WIFI_STATE_CONNECTED) {
+	if (auto_wifi_online()) {
 		clock_network_sync_now();
-	} else if (!wifi_get_enabled() && wifi_available()) {
+	} else if (wifi_get_enabled()) {
+		auto_waiting_wifi = true; // asked once the link has an address
+	} else if (wifi_available()) {
 		confirm_show("timeset_enable_wifi", "timeset_enable_wifi_note", "timeset_enable_wifi_button", enable_wifi_cb, NULL);
 	}
 	auto_status_paint();
@@ -618,6 +654,8 @@ static void mode_pick_cb(lv_event_t *e) {
 	topbar_refresh_clock(); // the zone in use may have changed with the mode
 	if (!automatic) {
 		auto_waiting_wifi = false;
+		auto_retries_left = 0;
+		auto_retry_pending = false;
 	}
 	// The count as it is now: a result from before the switch is not news.
 	auto_seen_syncs = clock_network_sync_result(NULL, NULL);
@@ -631,6 +669,8 @@ static void mode_pick_cb(lv_event_t *e) {
 static void panel_close(void) {
 	auto_timer_run(false);
 	auto_waiting_wifi = false;
+	auto_retries_left = 0;
+	auto_retry_pending = false;
 	first_boot = false;
 	lv_obj_set_hidden(panel, true);
 	if (tz_panel) {

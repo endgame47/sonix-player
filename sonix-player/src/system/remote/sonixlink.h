@@ -18,6 +18,8 @@
 //     GET  /api/covers             the player's own thumbnail cache, as a file
 //     GET  /api/state              what is playing, volume, mode, battery
 //     GET  /api/queue              the playback queue around the current track
+//     GET  /api/history?limit=N    the latest N entries of what the queue has
+//                                  played (playhistory.h), oldest first
 //     GET  /api/favourites         the starred tracks, as they stand now
 //     GET  /api/playlists          the playlists' names and sizes, as they stand
 //     GET  /api/playlist?name=...  one playlist's tracks, in its order
@@ -30,7 +32,13 @@
 //     GET  /api/bye                the app has let go: the status bar forgets it
 //                                  at once rather than after PEER_ALIVE_MS
 //     POST /api/command?do=...     play, pause, next, prev, seek, volume, mode,
-//                                  favourite, scan
+//                                  favourite, scan, and the queue page's own:
+//                                  queue_remove (indices in the body),
+//                                  queue_move&from=&to=, history_play&id=,
+//                                  history_insert&id=&at=. The three that
+//                                  change the order carry &rev=, the queue
+//                                  revision they were worked out against, and
+//                                  are dropped when the queue has moved on.
 //
 // Found two ways, so neither has to be perfect: a DNS-SD record for
 // `_sonixlink._tcp`, which Android resolves by itself, and a plain UDP
@@ -107,6 +115,10 @@ typedef struct {
 	// copies only when they are stale.
 	unsigned favourites_revision;
 	unsigned playlists_revision;
+
+	// The newest entry of the history, so the app reads it again only when
+	// something has been played since. 0 while there is none.
+	long long history_revision;
 } sonixlink_state_t;
 
 // The five orders the player understands, in the order the phone cycles them.
@@ -147,6 +159,15 @@ typedef enum {
 	SONIXLINK_CMD_FAVOURITES_REMOVE,
 	SONIXLINK_CMD_PLAYLIST_ADD,
 	SONIXLINK_CMD_PLAYLIST_REMOVE,
+
+	// The queue page, as on the player: the entries of `paths` (queue indices,
+	// as text) taken out; the entry at `arg` moved to `arg2`; an entry of the
+	// history (`id`) put in right after the track playing and played, or put
+	// in at slot `arg`. Only what comes after the track playing can change.
+	SONIXLINK_CMD_QUEUE_REMOVE,
+	SONIXLINK_CMD_QUEUE_MOVE,
+	SONIXLINK_CMD_HISTORY_PLAY,
+	SONIXLINK_CMD_HISTORY_INSERT,
 } sonixlink_command_kind_t;
 
 // The three rows of the circle-play menu.
@@ -190,6 +211,14 @@ typedef struct {
 	// lets go of it with sonixlink_command_free().
 	char *paths;
 	int path_count;
+
+	// For the queue page's commands: the second number of a move, the entry of
+	// the history, and the queue revision the phone saw (`has_revision` false
+	// when it sent none).
+	int arg2;
+	long long id;
+	unsigned revision;
+	bool has_revision;
 } sonixlink_command_t;
 
 void sonixlink_command_free(sonixlink_command_t *cmd);

@@ -355,6 +355,328 @@ static void q_cb(lv_event_t *e) {
 	band_commit(set_q, (int)lv_slider_get_value(q_slider));
 }
 
+// ---------------------------------------------------------------------------
+// Typing a value
+//
+// Tapping the gain or the Q over its slider opens a keypad, the way the stock
+// player does it, and what is typed goes into the band as it is, clamped to
+// the band's limits: the sliders move in steps of 0,5 dB and of a few
+// hundredths of Q.
+// ---------------------------------------------------------------------------
+
+typedef enum { ENTRY_GAIN, ENTRY_Q } entry_kind_t;
+
+#define ENTRY_MAX_CHARS 7
+
+static lv_obj_t *entry_layer;
+static lv_obj_t *entry_heading;
+static lv_obj_t *entry_display;
+static lv_obj_t *entry_sign_btn;
+static lv_obj_t *entry_ok_btn;
+static entry_kind_t entry_kind;
+static char entry_text[16]; // digits, one comma, a leading minus
+static bool entry_fresh;	// the shown value is the old one: the first key replaces it
+
+static void entry_paint(void) {
+	char shown[32];
+	const char *unit = entry_kind == ENTRY_GAIN ? " dB" : "";
+	snprintf(shown, sizeof(shown), "%s%s", entry_text[0] ? entry_text : "0", unit);
+	lv_label_set_text(entry_display, shown);
+	lv_obj_set_style_text_color(entry_display, entry_fresh ? theme()->text_secondary : theme()->text_primary, 0);
+}
+
+// Tenths or hundredths out of "12,5" or "-3": the number times 10^decimals,
+// rounded on the last place kept.
+static int entry_parse_scaled(const char *text, int decimals) {
+	bool negative = text[0] == '-';
+	const char *p = negative ? text + 1 : text;
+	long whole = 0, frac = 0;
+	int frac_digits = 0;
+	bool after_comma = false;
+	int round_digit = 0;
+	for (; *p; p++) {
+		if (*p == ',') {
+			after_comma = true;
+		} else if (!after_comma) {
+			whole = whole * 10 + (*p - '0');
+		} else if (frac_digits < decimals) {
+			frac = frac * 10 + (*p - '0');
+			frac_digits++;
+		} else if (frac_digits == decimals && round_digit == 0) {
+			round_digit = *p - '0';
+			frac_digits++;
+		}
+	}
+	for (int i = frac_digits < decimals ? frac_digits : decimals; i < decimals; i++) {
+		frac *= 10;
+	}
+	long scale = 1;
+	for (int i = 0; i < decimals; i++) {
+		scale *= 10;
+	}
+	long value = whole * scale + frac + (round_digit >= 5 ? 1 : 0);
+	if (value > 1000000) {
+		value = 1000000;
+	}
+	return (int)(negative ? -value : value);
+}
+
+// The keypad's own X is its way out: the back arrow goes while it is up.
+static void entry_hide(void) {
+	lv_obj_set_hidden(entry_layer, true);
+	back_btn_hide_on_screen(band_screen, false);
+}
+
+static void entry_cancel_cb(lv_event_t *e) {
+	(void)e;
+	entry_hide();
+}
+
+static void entry_set_gain(peq_band_t *b, int value) { b->gain_tenths = value; }
+static void entry_set_q(peq_band_t *b, int value) { b->q_cent = value; }
+
+static void entry_accept_cb(lv_event_t *e) {
+	(void)e;
+	if (!entry_text[0] || strcmp(entry_text, "-") == 0) {
+		entry_hide();
+		return;
+	}
+	int value;
+	switch (entry_kind) {
+	case ENTRY_GAIN:
+		value = entry_parse_scaled(entry_text, 1);
+		value = value < PEQ_GAIN_MIN_TENTHS ? PEQ_GAIN_MIN_TENTHS : (value > PEQ_GAIN_MAX_TENTHS ? PEQ_GAIN_MAX_TENTHS : value);
+		band_commit(entry_set_gain, value);
+		break;
+	case ENTRY_Q:
+		value = entry_parse_scaled(entry_text, 2);
+		value = value < PEQ_Q_MIN ? PEQ_Q_MIN : (value > PEQ_Q_MAX ? PEQ_Q_MAX : value);
+		band_commit(entry_set_q, value);
+		break;
+	}
+	entry_hide();
+}
+
+// One key: a digit, ',' or '-' (which flips the sign rather than typing one).
+static void entry_key_cb(lv_event_t *e) {
+	char key = (char)(intptr_t)lv_event_get_user_data(e);
+	if (entry_fresh) {
+		// The old value is there to be read, not edited: the first digit starts
+		// a new number, keeping only its sign for the gain. The sign key flips
+		// the old value and leaves it fresh, so a +4,5 that should have been
+		// -4,5 is one tap, and ± then 3 is -3.
+		if (key == '-') {
+			size_t len = strlen(entry_text);
+			if (entry_text[0] == '-') {
+				memmove(entry_text, entry_text + 1, len);
+			} else if (len < sizeof(entry_text) - 1) {
+				memmove(entry_text + 1, entry_text, len + 1);
+				entry_text[0] = '-';
+			}
+			entry_paint();
+			return;
+		}
+		bool negative = entry_text[0] == '-';
+		entry_text[0] = '\0';
+		if (negative && entry_kind == ENTRY_GAIN) {
+			snprintf(entry_text, sizeof(entry_text), "-");
+		}
+		entry_fresh = false;
+	}
+
+	size_t len = strlen(entry_text);
+	if (key == '-') {
+		if (entry_text[0] == '-') {
+			memmove(entry_text, entry_text + 1, len);
+		} else if (len < sizeof(entry_text) - 1) {
+			memmove(entry_text + 1, entry_text, len + 1);
+			entry_text[0] = '-';
+		}
+	} else if (key == ',') {
+		if (!strchr(entry_text, ',') && len < ENTRY_MAX_CHARS) {
+			if (len == 0 || (len == 1 && entry_text[0] == '-')) {
+				strcat(entry_text, "0");
+			}
+			strcat(entry_text, ",");
+		}
+	} else if (len < ENTRY_MAX_CHARS) {
+		// No run of leading zeros: "0" followed by a digit becomes the digit.
+		const char *digits = entry_text[0] == '-' ? entry_text + 1 : entry_text;
+		if (strcmp(digits, "0") == 0) {
+			entry_text[len - 1] = key;
+		} else {
+			entry_text[len] = key;
+			entry_text[len + 1] = '\0';
+		}
+	}
+	entry_paint();
+}
+
+static void entry_delete_cb(lv_event_t *e) {
+	(void)e;
+	if (entry_fresh) {
+		entry_text[0] = '\0';
+		entry_fresh = false;
+	} else {
+		size_t len = strlen(entry_text);
+		if (len) {
+			entry_text[len - 1] = '\0';
+		}
+	}
+	entry_paint();
+}
+
+static void entry_open(entry_kind_t kind) {
+	if (editing < 0 || switcher_back_drag_active()) {
+		return;
+	}
+	peq_band_t b;
+	peq_get_band(editing, &b);
+
+	entry_kind = kind;
+	switch (kind) {
+	case ENTRY_GAIN: {
+		lv_label_set_text(entry_heading, tr("gain"));
+		int t = b.gain_tenths < 0 ? -b.gain_tenths : b.gain_tenths;
+		snprintf(entry_text, sizeof(entry_text), "%s%d,%d", b.gain_tenths < 0 ? "-" : "", t / 10, t % 10);
+		break;
+	}
+	case ENTRY_Q:
+		lv_label_set_text(entry_heading, "Q");
+		snprintf(entry_text, sizeof(entry_text), "%d,%02d", b.q_cent / 100, b.q_cent % 100);
+		break;
+	}
+	entry_fresh = true;
+
+	// Only the gain has a sign.
+	lv_obj_set_hidden(entry_sign_btn, kind != ENTRY_GAIN);
+	// OK takes the whole last row, or what the sign key leaves of it.
+	lv_obj_set_width(entry_ok_btn, kind == ENTRY_GAIN ? lv_pct(66) : lv_pct(100));
+
+	entry_paint();
+	lv_obj_set_hidden(entry_layer, false);
+	lv_obj_move_foreground(entry_layer);
+	back_btn_hide_on_screen(band_screen, true);
+}
+
+// Leaving the band page by the back arrow or the gesture closes the keypad
+// with it, rather than having it greet the next band opened.
+static void entry_screen_unloaded_cb(lv_event_t *e) {
+	(void)e;
+	entry_hide();
+}
+
+static void entry_open_cb(lv_event_t *e) { entry_open((entry_kind_t)(intptr_t)lv_event_get_user_data(e)); }
+
+static lv_obj_t *entry_key(lv_obj_t *parent, const char *text, const lv_image_dsc_t *icon, lv_event_cb_t cb, intptr_t user, int width_pct) {
+	lv_obj_t *btn = lv_btn_create(parent);
+	lv_obj_set_size(btn, lv_pct(width_pct), lv_pct(18));
+	lv_obj_add_style(btn, &theme_style_card, 0);
+	lv_obj_add_style(btn, &theme_style_card_pressed, LV_STATE_PRESSED);
+	lv_obj_set_style_radius(btn, 14, 0);
+	lv_obj_set_style_border_width(btn, 0, 0);
+	lv_obj_set_style_shadow_width(btn, 0, 0);
+	lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, (void *)user);
+	if (icon) {
+		lv_obj_t *image = lv_image_create(btn);
+		lv_image_set_src(image, icon);
+		lv_obj_add_style(image, &theme_style_icon, 0);
+		lv_obj_center(image);
+	} else {
+		lv_obj_t *label = lv_label_create(btn);
+		lv_label_set_text(label, text);
+		lv_obj_add_style(label, &theme_style_text, 0);
+		lv_obj_set_style_text_font(label, &font_ui_32, 0);
+		lv_obj_center(label);
+	}
+	return btn;
+}
+
+static void build_entry_layer(gui_config_t *cfg) {
+	entry_layer = lv_obj_create(band_screen);
+	lv_obj_set_size(entry_layer, cfg->screen_width, cfg->screen_height);
+	lv_obj_align(entry_layer, LV_ALIGN_TOP_LEFT, 0, 0);
+	lv_obj_add_style(entry_layer, &theme_style_screen, 0);
+	lv_obj_set_style_bg_opa(entry_layer, LV_OPA_COVER, 0);
+	lv_obj_set_style_border_width(entry_layer, 0, 0);
+	lv_obj_set_style_radius(entry_layer, 0, 0);
+	lv_obj_set_style_pad_all(entry_layer, 0, 0);
+	lv_obj_set_scrollable(entry_layer, false);
+	lv_obj_set_hidden(entry_layer, true);
+	lv_obj_add_event_cb(band_screen, entry_screen_unloaded_cb, LV_EVENT_SCREEN_UNLOADED, NULL);
+
+	int top = cfg->padding + cfg->top_bar_height;
+
+	entry_heading = lv_label_create(entry_layer);
+	lv_obj_add_style(entry_heading, &theme_style_text, 0);
+	lv_obj_set_style_text_font(entry_heading, &font_ui_24, 0);
+	lv_obj_align(entry_heading, LV_ALIGN_TOP_LEFT, cfg->padding + 6, top + 10);
+
+	lv_obj_t *cancel = lv_btn_create(entry_layer);
+	lv_obj_set_size(cancel, 56, 56);
+	lv_obj_align(cancel, LV_ALIGN_TOP_RIGHT, -cfg->padding, top);
+	lv_obj_set_style_bg_opa(cancel, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_border_width(cancel, 0, 0);
+	lv_obj_set_style_shadow_width(cancel, 0, 0);
+	lv_obj_set_style_pad_all(cancel, 0, 0);
+	lv_obj_add_event_cb(cancel, entry_cancel_cb, LV_EVENT_CLICKED, NULL);
+	lv_obj_t *cancel_icon = lv_image_create(cancel);
+	lv_image_set_src(cancel_icon, &icon_close);
+	lv_obj_add_style(cancel_icon, &theme_style_icon, 0);
+	lv_obj_center(cancel_icon);
+
+	lv_obj_t *field = lv_obj_create(entry_layer);
+	lv_obj_set_size(field, cfg->screen_width - 2 * cfg->padding, 84);
+	lv_obj_align(field, LV_ALIGN_TOP_LEFT, cfg->padding, top + 66);
+	lv_obj_add_style(field, &theme_style_card, 0);
+	lv_obj_set_style_radius(field, 12, 0);
+	lv_obj_set_style_border_width(field, 0, 0);
+	lv_obj_set_style_shadow_width(field, 0, 0);
+	lv_obj_set_scrollable(field, false);
+	entry_display = lv_label_create(field);
+	lv_obj_set_style_text_font(entry_display, &font_ui_36_bold, 0);
+	lv_obj_align(entry_display, LV_ALIGN_RIGHT_MID, -10, 0);
+
+	int pad_top = top + 66 + 84 + 16;
+	lv_obj_t *pad = lv_obj_create(entry_layer);
+	lv_obj_set_size(pad, cfg->screen_width - 2 * cfg->padding, cfg->screen_height - pad_top - cfg->padding);
+	lv_obj_align(pad, LV_ALIGN_TOP_LEFT, cfg->padding, pad_top);
+	lv_obj_set_style_bg_opa(pad, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_border_width(pad, 0, 0);
+	lv_obj_set_style_pad_all(pad, 0, 0);
+	lv_obj_set_style_pad_row(pad, 10, 0);
+	lv_obj_set_style_pad_column(pad, 10, 0);
+	lv_obj_set_scrollable(pad, false);
+	lv_obj_set_flex_flow(pad, LV_FLEX_FLOW_ROW_WRAP);
+	lv_obj_set_flex_align(pad, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+
+	static const char *const DIGITS[9] = {"1", "2", "3", "4", "5", "6", "7", "8", "9"};
+	for (int i = 0; i < 9; i++) {
+		entry_key(pad, DIGITS[i], NULL, entry_key_cb, '1' + i, 31);
+	}
+	entry_key(pad, ",", NULL, entry_key_cb, ',', 31);
+	entry_key(pad, "0", NULL, entry_key_cb, '0', 31);
+	lv_obj_t *del = entry_key(pad, NULL, &icon_delete, entry_delete_cb, 0, 31);
+	lv_obj_add_event_cb(del, entry_delete_cb, LV_EVENT_LONG_PRESSED_REPEAT, NULL);
+
+	entry_sign_btn = entry_key(pad, "+/-", NULL, entry_key_cb, '-', 31);
+	entry_ok_btn = entry_key(pad, tr("ok"), NULL, entry_accept_cb, 0, 100);
+	lv_obj_add_style(entry_ok_btn, &theme_style_accent_bg, 0);
+	lv_obj_set_style_text_color(lv_obj_get_child(entry_ok_btn, 0), lv_color_white(), 0);
+}
+
+// The number over a slider becomes the way into the keypad: set on a rounded
+// box of the pressed-card colour, with a margin round it a finger can find.
+static void entry_attach(lv_obj_t *value_label, entry_kind_t kind) {
+	lv_obj_add_style(value_label, &theme_style_card_pressed, 0);
+	lv_obj_set_style_radius(value_label, 10, 0);
+	lv_obj_set_style_pad_hor(value_label, 12, 0);
+	lv_obj_set_style_pad_ver(value_label, 4, 0);
+	lv_obj_set_clickable(value_label, true);
+	lv_obj_set_ext_click_area(value_label, 20);
+	lv_obj_add_event_cb(value_label, entry_open_cb, LV_EVENT_CLICKED, (void *)(intptr_t)kind);
+}
+
 static lv_obj_t *make_pill(lv_obj_t *parent, const char *text, int value) {
 	lv_obj_t *btn = lv_btn_create(parent);
 	lv_obj_set_size(btn, LV_SIZE_CONTENT, 52);
@@ -463,6 +785,10 @@ static void build_band_page(gui_config_t *cfg) {
 	settingsrow_slider(container, "peq_frequency", FREQ_STEPS, &freq_value, &freq_slider, freq_cb);
 	gain_card = settingsrow_slider(container, "gain", GAIN_STEPS, &gain_value, &gain_slider, gain_cb);
 	settingsrow_slider(container, "Q", Q_STEPS, &q_value, &q_slider, q_cb);
+
+	build_entry_layer(cfg);
+	entry_attach(gain_value, ENTRY_GAIN);
+	entry_attach(q_value, ENTRY_Q);
 
 	switcher_attach_back_gesture(band_screen);
 }

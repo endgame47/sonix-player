@@ -371,18 +371,29 @@ void clock_set_auto(bool on) {
 	tz_refresh();
 }
 
+static void (*change_hook)(void);
+
+void clock_set_change_hook(void (*hook)(void)) { change_hook = hook; }
+
+static void notify_change(void) {
+	if (change_hook) {
+		change_hook();
+	}
+}
+
 // The IANA name of the zone the device is in, from its public address. Two
 // services, the second only when the first does not answer: neither needs a
-// key, and both name the zone the way the tz database does.
+// key, and both name the zone the way the tz database does. Plain HTTP first,
+// which answers in a fraction of the time a TLS handshake takes on this CPU.
 static bool zone_locate(char *out, size_t size) {
 	static const char *const SOURCES[] = {
-		"https://get.geojs.io/v1/ip/geo.json",
 		"http://ip-api.com/json/?fields=status,timezone",
+		"https://get.geojs.io/v1/ip/geo.json",
 	};
 	for (size_t i = 0; i < sizeof(SOURCES) / sizeof(SOURCES[0]); i++) {
 		char *body = NULL;
 		int status = 0;
-		if (!http_get_ex(SOURCES[i], NULL, false, &body, NULL, 16 * 1024, 8, &status)) {
+		if (!http_get_ex(SOURCES[i], NULL, false, &body, NULL, 16 * 1024, 5, &status)) {
 			continue;
 		}
 		bool found = false;
@@ -400,16 +411,43 @@ static bool zone_locate(char *out, size_t size) {
 	return false;
 }
 
+// Where, as well as when: the zone, and with it daylight saving. Run beside
+// ntpdate rather than after it, and handed to the interface the moment it is
+// known.
+static void *zone_worker(void *unused) {
+	(void)unused;
+	char zone[ZONE_TEXT_MAX] = "";
+	if (!zone_locate(zone, sizeof(zone))) {
+		printf("clock: no answer about the time zone\n");
+		return NULL;
+	}
+	const char *rule = tzrules_lookup(zone);
+	printf("clock: the network places the device in %s%s\n", zone, rule ? "" : ", a zone with no known rule");
+	if (rule) {
+		pthread_mutex_lock(&ntp_lock);
+		snprintf(pending_zone, sizeof(pending_zone), "%s", zone);
+		snprintf(pending_rule, sizeof(pending_rule), "%s", rule);
+		pthread_mutex_unlock(&ntp_lock);
+		notify_change();
+	}
+	return NULL;
+}
+
 static void *ntp_worker(void *unused) {
 	(void)unused;
 
+	pthread_t zone_thread;
+	bool zone_started = auto_on && pthread_create(&zone_thread, NULL, zone_worker, NULL) == 0;
+
 	time_t before = time(NULL);
 
-	// The firmware's own binary and servers. `-t 5` is the only addition: the
-	// stock player backgrounds the command with `&` and forgets it, which is
-	// fine for a shell but leaves this thread sitting in system() until DNS
-	// gives up.
-	int rc = system(NTPDATE_BIN " -t 5 " NTP_SERVERS " >/dev/null 2>&1");
+	// The firmware's own binary and servers. The stock player backgrounds the
+	// command with `&` and forgets it, which is fine for a shell but leaves
+	// this thread sitting in system() for as long as ntpdate takes. Two
+	// samples a server instead of four, two seconds each at most: a server
+	// that does not answer -- time.windows.com often does not -- otherwise
+	// holds the clock back for four times the timeout.
+	int rc = system(NTPDATE_BIN " -p 2 -t 2 " NTP_SERVERS " >/dev/null 2>&1");
 	time_t after = time(NULL);
 	bool ok = rc == 0 && after >= CLOCK_PLAUSIBLE_FROM;
 
@@ -424,31 +462,21 @@ static void *ntp_worker(void *unused) {
 		clock_set_flag = true;
 		config_set_bool("clock", "configured", true);
 		config_save();
+		notify_change(); // the status bar shows the time now, not at its next tick
 	} else {
 		printf("clock: ntpdate did not answer (%d)\n", rc);
 	}
 
-	// Where, as well as when: the zone, and with it daylight saving.
-	char zone[ZONE_TEXT_MAX] = "";
-	const char *rule = NULL;
-	if (auto_on) {
-		if (zone_locate(zone, sizeof(zone))) {
-			rule = tzrules_lookup(zone);
-			printf("clock: the network places the device in %s%s\n", zone, rule ? "" : ", a zone with no known rule");
-		} else {
-			printf("clock: no answer about the time zone\n");
-		}
+	if (zone_started) {
+		pthread_join(zone_thread, NULL);
 	}
 
 	pthread_mutex_lock(&ntp_lock);
-	if (rule) {
-		snprintf(pending_zone, sizeof(pending_zone), "%s", zone);
-		snprintf(pending_rule, sizeof(pending_rule), "%s", rule);
-	}
 	ntp_running = false;
 	ntp_last_ok = ok;
 	ntp_finished++;
 	pthread_mutex_unlock(&ntp_lock);
+	notify_change();
 	return NULL;
 }
 
@@ -767,24 +795,38 @@ void clock_set_use_24h(bool on) {
 	config_save();
 }
 
-void clock_format_hm(char *out, size_t out_size, int hour, int minute) {
-	if (!out || out_size == 0) {
+void clock_format_hm_parts(char *time_out, size_t time_size, char *suffix_out, size_t suffix_size, int hour, int minute) {
+	if (suffix_out && suffix_size > 0) {
+		suffix_out[0] = '\0';
+	}
+	if (!time_out || time_size == 0) {
 		return;
 	}
 
 	if (clock_use_24h()) {
-		snprintf(out, out_size, "%02d:%02d", hour, minute);
+		snprintf(time_out, time_size, "%02d:%02d", hour, minute);
 		return;
 	}
 
 	// Midnight and noon are the two that are always got wrong: 0 and 12 both
 	// display as "12", one AM and one PM.
-	const char *suffix = hour < 12 ? "AM" : "PM";
 	int shown = hour % 12;
 	if (shown == 0) {
 		shown = 12;
 	}
 	// No leading zero: "2:05 PM", not "02:05 PM", as no 12-hour clock pads the
 	// hour.
-	snprintf(out, out_size, "%d:%02d %s", shown, minute, suffix);
+	snprintf(time_out, time_size, "%d:%02d", shown, minute);
+	if (suffix_out && suffix_size > 0) {
+		snprintf(suffix_out, suffix_size, "%s", hour < 12 ? "AM" : "PM");
+	}
+}
+
+void clock_format_hm(char *out, size_t out_size, int hour, int minute) {
+	if (!out || out_size == 0) {
+		return;
+	}
+	char time_text[16], suffix[8];
+	clock_format_hm_parts(time_text, sizeof(time_text), suffix, sizeof(suffix), hour, minute);
+	snprintf(out, out_size, suffix[0] ? "%s %s" : "%s", time_text, suffix);
 }

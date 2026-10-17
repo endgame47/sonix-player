@@ -1329,9 +1329,15 @@ static void album_keys_fill(void) {
 	printf("library: album keys written down for %d tracks in %u ms\n", sqlite3_changes(db), now_ms() - started_ms);
 }
 
+// library_history_revision()'s answer, read from the table once and then kept
+// up by library_history_add(). -1 until it has been read.
+static long long history_newest = -1;
+
 // Opens the file and brings its schema up to date: everything library_open()
 // does before the index is shared with other threads.
 static bool db_open_file(const char *db_path) {
+	history_newest = -1; // a file opened afresh is read afresh
+
 	// A ceiling SQLite will stay under by recycling instead of growing. The
 	// scan is the only thing here that touches a lot of rows and it has no
 	// business holding megabytes on a device with ten of them.
@@ -2219,6 +2225,8 @@ void library_history_add(const char *path, const char *name, const char *artist,
 		sqlite3_bind_int64(stmt, 4, played_at);
 		if (sqlite3_step(stmt) != SQLITE_DONE) {
 			fprintf(stderr, "library: '%s' not added to the history: %s\n", path, sqlite3_errmsg(db));
+		} else {
+			history_newest = (long long)sqlite3_last_insert_rowid(db);
 		}
 		sqlite3_finalize(stmt);
 		// Only the latest are kept: the ids only grow, so everything this far
@@ -2260,6 +2268,20 @@ int library_history_items(library_history_item_t **out) {
 	}
 	pthread_mutex_unlock(&db_lock);
 	return count;
+}
+
+long long library_history_revision(void) {
+	pthread_mutex_lock(&db_lock);
+	if (history_newest < 0 && db) {
+		sqlite3_stmt *stmt = NULL;
+		if (sqlite3_prepare_v2(db, "SELECT COALESCE(MAX(id), 0) FROM PLAY_HISTORY", -1, &stmt, NULL) == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW) {
+			history_newest = sqlite3_column_int64(stmt, 0);
+		}
+		sqlite3_finalize(stmt);
+	}
+	long long newest = history_newest < 0 ? 0 : history_newest;
+	pthread_mutex_unlock(&db_lock);
+	return newest;
 }
 
 bool library_history_entry(long long id, char *path, size_t path_size, char *name, size_t name_size) {

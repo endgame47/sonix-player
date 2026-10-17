@@ -46,6 +46,7 @@
 #include "src/system/device/led.h"
 #include "src/system/device/sysinfo.h"
 #include "src/system/device/axpcharge.h"
+#include "src/system/device/chargescreen.h"
 #include "src/gui/shell/gui.h"
 
 #include <errno.h>
@@ -1055,12 +1056,21 @@ void power_shutdown(void) {
 	storage_release_for_shutdown();
 	sync();
 
-	int rc = system("poweroff");
+	// With the cable in, off is the charging screen, as on the stock player:
+	// the device restarts into it (chargescreen.h) rather than powering down.
+	bool to_charge = usb_vbus_present() && chargescreen_mark(CHARGESCREEN_MARK_REQUESTED);
+	if (!to_charge) {
+		chargescreen_mark(CHARGESCREEN_MARK_NONE);
+	}
+	printf("power: %s\n", to_charge ? "restarting into the charging screen" : "powering off");
+	fflush(NULL);
+
+	int rc = system(to_charge ? "reboot" : "poweroff");
 	(void)rc;
 	sleep(8);
 
 	// Last resort if init never got there.
-	reboot(RB_POWER_OFF);
+	reboot(to_charge ? RB_AUTOBOOT : RB_POWER_OFF);
 }
 
 // The automatic shutdown, from the normal awake tick and from the RTC alarm

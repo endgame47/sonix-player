@@ -294,6 +294,12 @@ static int cover_box_w, cover_box_h;   // the artwork spans the full screen widt
 #define ALT_FAV_SIZE 64
 #define ALT_PILL_PAD_H 18 // what a pill keeps to the left and right of its text
 #define ALT_PILL_PAD_V 8
+// How far past its own edges a transport button takes a press in this
+// arrangement: into the gaps between them. The star takes the whole of its disc
+// instead (apply_layout()).
+#define ALT_EXT_CLICK 14
+#define FAV_BTN_W 48
+#define FAV_BTN_H 44
 
 // What the sleeve's colour becomes once it has to be painted rather than
 // thrown.
@@ -2345,9 +2351,99 @@ static void *lyrics_fetch_worker(void *arg) {
 	return NULL;
 }
 
+static void lyrics_search_run(void);
+
+// ---------------------------------------------------------------------------
+// Wi-Fi switched on for a search
+//
+// With Wi-Fi off the question offers to switch it on instead of searching; the
+// search then starts by itself once the link has an address, for the file that
+// was playing when the question was answered.
+// ---------------------------------------------------------------------------
+
+#define LYRICS_WIFI_POLL_MS 500
+#define LYRICS_WIFI_WAIT_MS 30000
+
+static lv_timer_t *lyrics_wifi_timer;
+static uint32_t lyrics_wifi_since;
+static char lyrics_wifi_path[1024];
+
+static bool lyrics_wifi_online(void) {
+	wifi_status_t wifi;
+	wifi_get_status(&wifi);
+	return wifi.state == WIFI_STATE_CONNECTED && wifi.ip[0] != '\0';
+}
+
+static void lyrics_wifi_wait_end(void) {
+	if (lyrics_wifi_timer) {
+		lv_timer_delete(lyrics_wifi_timer);
+		lyrics_wifi_timer = NULL;
+	}
+}
+
+static void lyrics_wifi_tick_cb(lv_timer_t *t) {
+	(void)t;
+	device_state_t state;
+	device_state_get(&state);
+	// Another track, or Wi-Fi switched off again: the search is no longer wanted.
+	if (!wifi_get_enabled() || strcmp(state.current_file, lyrics_wifi_path) != 0) {
+		lyrics_wifi_wait_end();
+		toast_busy_end();
+		return;
+	}
+	if (lyrics_wifi_online()) {
+		lyrics_wifi_wait_end();
+		toast_busy_end();
+		lyrics_search_run();
+		return;
+	}
+	if (lv_tick_elaps(lyrics_wifi_since) >= LYRICS_WIFI_WAIT_MS) {
+		lyrics_wifi_wait_end();
+		toast_busy_end();
+		toast_error("lyrics_wifi_failed");
+	}
+}
+
+static void lyrics_enable_wifi_cb(void *user) {
+	(void)user;
+	device_state_t state;
+	device_state_get(&state);
+	if (!state.current_file[0] || !playing_local_file(&state)) {
+		return;
+	}
+	snprintf(lyrics_wifi_path, sizeof(lyrics_wifi_path), "%s", state.current_file);
+	wifi_set_enabled(true);
+	lyrics_wifi_since = lv_tick_get();
+	if (!lyrics_wifi_timer) {
+		lyrics_wifi_timer = lv_timer_create(lyrics_wifi_tick_cb, LYRICS_WIFI_POLL_MS, NULL);
+	}
+	toast_busy_dismissable("lyrics_wifi_connecting");
+}
+
+// Wi-Fi is off and can be switched on: the question offers that in place of
+// the search.
+static bool lyrics_offer_wifi(void) {
+	if (lyrics_wifi_timer) {
+		toast_busy_dismissable("lyrics_wifi_connecting");
+		return true;
+	}
+	if (wifi_get_enabled() || !wifi_available()) {
+		return false;
+	}
+	confirm_show("lyrics_download_title", "lyrics_wifi_off_note", "lyrics_enable_wifi", lyrics_enable_wifi_cb, NULL);
+	return true;
+}
+
 // The file playing looked up on LRCLIB, on a thread of its own; what is found
 // is listed to pick from.
 static void lyrics_search_start(void) {
+	if (!lyrics_fetching && lyrics_offer_wifi()) {
+		return;
+	}
+	lyrics_search_run();
+}
+
+static void lyrics_search_run(void) {
 	if (lyrics_fetching) {
 		toast_busy_dismissable("lyrics_downloading");
 		return;
@@ -2407,6 +2503,9 @@ static void lyrics_find_cb(lv_event_t *e) {
 static void lyrics_offer_download(void) {
 	if (lyrics_fetching) {
 		toast_busy_dismissable("lyrics_downloading");
+		return;
+	}
+	if (lyrics_offer_wifi()) {
 		return;
 	}
 	confirm_show("lyrics_download_title", "lyrics_download_note", "lyrics_download", lyrics_download_cb, NULL);
@@ -3158,6 +3257,20 @@ static void apply_layout(void) {
 			if (wave_box) {
 				lv_obj_set_hidden(wave_box, true);
 			}
+		}
+	}
+
+	// Bigger targets in this arrangement. The star's button is as big as the
+	// disc it sits in, which is what a finger aims at; a press beyond the disc
+	// could not reach it anyway, since LVGL looks for a child only inside its
+	// parent.
+	if (fav_btn_obj) {
+		lv_obj_set_size(fav_btn_obj, layout_alt_now ? ALT_FAV_SIZE : FAV_BTN_W, layout_alt_now ? ALT_FAV_SIZE : FAV_BTN_H);
+	}
+	lv_obj_t *const transport[] = {prev_btn_obj, play_btn, next_btn_obj};
+	for (size_t i = 0; i < sizeof(transport) / sizeof(transport[0]); i++) {
+		if (transport[i]) {
+			lv_obj_set_ext_click_area(transport[i], layout_alt_now ? ALT_EXT_CLICK : 0);
 		}
 	}
 
@@ -4058,15 +4171,15 @@ static void update_format_label(const device_state_t *state) {
 	}
 
 	if (state->live) {
-		// No bit depth to quote on a stream: what a station is, is its
-		// bitrate. Nothing at all until the first frame has been decoded.
+		// A lossy station is quoted by its bitrate, a lossless one by depth and
+		// rate like a track from the card ("16/44.1 FLAC"). The codec is the
+		// decoder's, not the directory's claim. Nothing at all until the first
+		// frame has been decoded.
 		radio_now_t now;
 		radio_get_now(&now);
-		// The format was written "MP3" because that was the only thing the
-		// stream path could decode. It reads AAC too now, and a station that
-		// says MP3 while an AAC decoder is running on it is a lie the log
-		// cannot correct.
-		if (now.bitrate > 0) {
+		if (now.bits > 0 && now.sample_rate > 0 && now.codec[0]) {
+			lv_label_set_text_fmt(format_label, "%d/%g %s", now.bits, now.sample_rate / 1000.0, now.codec);
+		} else if (now.bitrate > 0) {
 			lv_label_set_text_fmt(format_label, "%d kbps %s", now.bitrate, now.codec[0] ? now.codec : "MP3");
 		} else if (now.codec[0]) {
 			lv_label_set_text(format_label, now.codec);
@@ -5367,7 +5480,7 @@ void player_init(gui_config_t *cfg) {
 
 	lv_obj_t *fav_btn = lv_btn_create(song_side);
 	fav_btn_obj = fav_btn;
-	lv_obj_set_size(fav_btn, 48, 44);
+	lv_obj_set_size(fav_btn, FAV_BTN_W, FAV_BTN_H);
 	lv_obj_set_style_bg_opa(fav_btn, LV_OPA_TRANSP, 0);
 	lv_obj_set_style_border_width(fav_btn, 0, 0);
 	lv_obj_set_style_shadow_width(fav_btn, 0, 0);

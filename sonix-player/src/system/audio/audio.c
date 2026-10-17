@@ -427,6 +427,11 @@ static bool output_is_bluetooth(void) {
 // lost by it: there is no DAC to keep warm at that end of the link.
 static long paused_device_close_ms(void) { return output_is_bluetooth() ? 0 : PAUSED_DEVICE_CLOSE_MS; }
 
+// Set while the metronome waits for the output that a paused track still holds
+// (audio_external_begin_yielding): the pause hands it back at its next check
+// rather than when PAUSED_DEVICE_CLOSE_MS is up.
+static volatile bool paused_release_wanted;
+
 bool audio_output_is_bluetooth(void) { return output_is_bluetooth(); }
 
 // ---------------------------------------------------------------------------
@@ -2816,7 +2821,7 @@ static void play_wav_file(const char *filepath) {
 			if (entering) {
 				paused_at_ms = log_ms();
 			}
-			if (pcm_handle && (log_ms() - paused_at_ms) >= paused_device_close_ms()) {
+			if (pcm_handle && (paused_release_wanted || (log_ms() - paused_at_ms) >= paused_device_close_ms())) {
 				snd_pcm_close(pcm_handle);
 				pcm_handle = NULL;
 				pcm_device_open = false;
@@ -3507,7 +3512,7 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 			if (entering) {
 				paused_at_ms = log_ms();
 			}
-			if (pcm_handle && (log_ms() - paused_at_ms) >= paused_device_close_ms()) {
+			if (pcm_handle && (paused_release_wanted || (log_ms() - paused_at_ms) >= paused_device_close_ms())) {
 				snd_pcm_close(pcm_handle);
 				pcm_handle = NULL;
 				pcm_device_open = false;
@@ -4705,6 +4710,19 @@ bool audio_external_begin_yielding(int sample_rate, int channels, int bits, int 
 			fprintf(stderr, "audio: the output is held by another source; not shared\n");
 			return false;
 		}
+	}
+
+	// A track paused a moment ago keeps the device for a few seconds more;
+	// paused, it is not playing, so it is asked to give it back now.
+	pthread_mutex_lock(&audio_mutex);
+	bool paused_holding = playback_status == AUDIO_STATUS_PAUSED && pcm_device_open;
+	pthread_mutex_unlock(&audio_mutex);
+	if (paused_holding) {
+		paused_release_wanted = true;
+		for (int waited = 0; pcm_device_open && waited < EXTERNAL_YIELD_WAIT_MS; waited += 10) {
+			usleep(10 * 1000);
+		}
+		paused_release_wanted = false;
 	}
 
 	if (!audio_external_begin_latency(sample_rate, channels, bits, buffer_ms)) {

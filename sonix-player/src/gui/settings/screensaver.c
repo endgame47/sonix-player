@@ -9,6 +9,7 @@
 #include "src/gui/nowplaying/cover.h"
 #include "src/gui/nowplaying/coverloader.h"
 #include "src/gui/fonts/fonts.h"
+#include "src/gui/shell/clocklabel.h"
 #include "src/gui/shell/icons.h"
 #include "src/gui/nowplaying/player.h"
 #include "src/gui/shell/scrolltext.h"
@@ -211,21 +212,7 @@ void screensaver_set_enabled(bool on) {
 // what it shows
 // ---------------------------------------------------------------------------
 
-static void refresh_clock(void) {
-	if (!clock_label) {
-		return;
-	}
-	if (!clock_is_set()) {
-		lv_label_set_text(clock_label, "--:--");
-		return;
-	}
-	time_t now = time(NULL);
-	struct tm local;
-	localtime_r(&now, &local);
-	char text[16];
-	clock_format_hm(text, sizeof(text), local.tm_hour, local.tm_min);
-	lv_label_set_text(clock_label, text);
-}
+static void refresh_clock(void) { clocklabel_refresh(clock_label); }
 
 // What refresh_content() last drew, so the tick below can tell an idle moment
 // from a track that changed while the screensaver was up.
@@ -678,8 +665,7 @@ void screensaver_init(gui_config_t *cfg) {
 	scrolltext_apply(artist_label);
 
 	// The time, in the largest figures the screen has.
-	clock_label = lv_label_create(info_strip);
-	lv_obj_set_style_text_font(clock_label, &font_ui_72, 0);
+	clock_label = clocklabel_create(info_strip, &font_ui_72, 72, &font_ui_32, 32);
 	lv_obj_set_style_text_color(clock_label, lv_color_white(), 0);
 	lv_obj_set_style_pad_top(clock_label, 6, 0);
 

@@ -431,6 +431,10 @@ int library_history_items(library_history_item_t **out);
 // One entry's file and title. False when it is not there.
 bool library_history_entry(long long id, char *path, size_t path_size, char *name, size_t name_size);
 
+// The id of the newest entry, 0 while there is none: it only grows, so it
+// changes whenever an entry is added.
+long long library_history_revision(void);
+
 bool library_fav_contains(const char *path);
 
 // Stars every track in `rows` that is not starred yet, in one transaction and

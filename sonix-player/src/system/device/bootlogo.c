@@ -24,6 +24,11 @@
 #define MARKER_WRITE_FILE "/tmp/.bootlogo_marker_new"
 #define CUSTOM_TMP_FILE BOOTLOGO_CUSTOM_FILE ".tmp"
 
+// What S11jpeg_display_shell shows, and with what.
+#define LOGO_DIR "/etc/boot-logo"
+#define STOCK_LOGO_FILE "/etc/logo.jpeg"
+#define JPEG_DISPLAY_BIN "/usr/bin/cmd_jpeg_display"
+
 // Pictures larger than this are refused rather than read into memory.
 #define SOURCE_MAX_BYTES (32L * 1024 * 1024)
 
@@ -167,6 +172,30 @@ void bootlogo_follow(bool dark, int accent) {
 	want_accent = accent;
 	pthread_mutex_unlock(&lock);
 	kick();
+}
+
+// The colour names in the theme logos' file names, in ACCENT_COLORS' order.
+static const char *const ACCENT_NAMES[ACCENT_COUNT] = {"blue", "orange", "yellow", "green", "purple", "pink"};
+
+static bool show_file(const char *path) {
+	if (access(path, R_OK) != 0) {
+		return false;
+	}
+	char cmd[300];
+	snprintf(cmd, sizeof(cmd), JPEG_DISPLAY_BIN " '%s' >/dev/null 2>&1", path);
+	return system(cmd) == 0;
+}
+
+bool bootlogo_show_now(bool dark, int accent) {
+	if (accent < 0 || accent >= ACCENT_COUNT) {
+		accent = 0;
+	}
+	if (bootlogo_has_custom() && show_file(BOOTLOGO_CUSTOM_FILE)) {
+		return true;
+	}
+	char path[160];
+	snprintf(path, sizeof(path), LOGO_DIR "/%s-theme-%s.jpeg", dark ? "dark" : "light", ACCENT_NAMES[accent]);
+	return show_file(path) || show_file(STOCK_LOGO_FILE);
 }
 
 void bootlogo_clear_custom(void) {

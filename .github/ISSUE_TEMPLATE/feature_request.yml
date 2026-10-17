@@ -1,0 +1,94 @@
+name: Feature request
+description: Ask for something that Sonix Player does not do yet, or for a change to an existing feature.
+title: "[Feature] "
+labels: ["enhancement"]
+type: Feature
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > [!NOTE]
+        > **Read this before you go on.**
+        >
+        > A **feature request** is for something Sonix Player **does not do yet**, or for a **change** to how an existing feature works.
+        >
+        > If a feature that is in the **[feature list](https://github.com/Jepl4r/sonix-player/blob/main/FEATURES.md)** does not work as it should, that is a **bug**: open a **Bug report** instead.
+        >
+        > Please keep in mind:
+        >
+        > - Sonix Player is made by me in my free time, with the help of people who contribute to the project voluntarily. A request is not a promise, and there is no date for it.
+        > - Some things cannot be done on this hardware.
+        > - Requests that are already open, or that are only "add everything the stock firmware has", will be closed.
+        >
+        > One feature per request, please. Write in English.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you open this request
+      description: All boxes must be ticked.
+      options:
+        - label: I checked the [feature list](https://github.com/Jepl4r/sonix-player/blob/main/FEATURES.md), and what I am asking for is **not** already there.
+          required: true
+        - label: I searched the [open and closed issues](https://github.com/Jepl4r/sonix-player/issues?q=is%3Aissue), and nobody has asked for this yet.
+          required: true
+        - label: I understand that a request is not a promise, and that it may be turned down.
+          required: true
+
+  - type: dropdown
+    id: device
+    attributes:
+      label: Device
+      description: Which device would you use it on?
+      options:
+        - R1
+        - R3 Pro II
+        - Both
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is missing
+      description: What you would like to do, and why you cannot do it today.
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: How it should work
+      description: Describe the feature step by step, as you would use it on the device. Where would it be? What would you tap?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: stock
+    attributes:
+      label: Does the stock HiBy firmware have it?
+      options:
+        - "No"
+        - "Yes"
+        - "I don't know"
+      default: 0
+    validations:
+      required: true
+
+  - type: textarea
+    id: stock_how
+    attributes:
+      label: If yes, how does it work there?
+      description: Optional. Screenshots of the stock firmware help.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Anything you tried instead
+      description: Optional. Other ways you found to do the same thing, and why they are not enough.
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Screenshots, mockups and anything else
+      description: Optional.

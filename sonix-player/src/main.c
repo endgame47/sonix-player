@@ -33,6 +33,7 @@
 #include "src/system/bluetooth/btlog.h"
 #include "src/system/bluetooth/btplayer.h"
 #include "src/system/device/clock.h"
+#include "src/system/device/chargescreen.h"
 #include "src/system/device/factoryreset.h"
 #include "src/system/core/config.h"
 #include "src/system/core/lang.h"
@@ -1893,6 +1894,12 @@ int main(int argc, char **argv) {
 	bool first_start = stat(config_file, &config_st) != 0;
 #endif
 	config_init(config_file);
+
+	// A start by the cable is the charging screen alone, until the power key is
+	// held: before anything else opens the display, the keys or the audio.
+	chargescreen_run_if_wanted();
+	chargescreen_mark(CHARGESCREEN_MARK_STARTED);
+
 #ifndef HOST_BUILD
 	// Before the card is mounted and before either radio starts.
 	factoryreset_clear_stock_data(first_start);

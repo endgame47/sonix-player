@@ -3,6 +3,34 @@
 A replacement player for the **HiBy R3 Pro II** and the **HiBy R1**, written on
 LVGL.
 
+Everything it can do is in **[FEATURES.md](FEATURES.md)**.
+
+## Install
+
+1. Download the firmware for your player from the
+   **[latest release](https://github.com/Jepl4r/sonix-player/releases/latest)**:
+   `r3proii.upt` for the R3 Pro II, `r1.upt` for the R1. **Never the other
+   one**: the update does not check which player it is given.
+2. Charge the player **above 30%**.
+3. Copy the `.upt` file to the **root of the microSD card** and put the card
+   in the player.
+4. Start the update:
+   - **from the stock firmware** - use its firmware update from the microSD
+     card.
+   - **from Sonix Player** - Settings > System > Update firmware > From SD
+     card.
+5. Let it flash: it says "Upgrading...", then "Succeeded", and reboots by
+   itself.
+
+Once Sonix Player is installed, later versions can be installed straight from
+the player: Settings > System > Update firmware > Via internet downloads the
+right file from the latest release by itself.
+
+> **Going back to the stock firmware:** flash the original firmware from
+> HiBy's website the same way.
+
+---
+
 ## Supported players
 
 One binary runs on both. It reads which player it is on from
@@ -16,6 +44,7 @@ into each image.
 | headphone outputs | 3.5 mm, 4.4 mm balanced | 3.5 mm |
 | DAC controls | digital filters, DRE, NOS | digital filters, NOS |
 | touch | Goodix gt9xx, open-source driver, five fingers | Hynitron CST8xx, open-source driver, two fingers |
+| charger | MP2731 | the AXP2101 PMIC |
 | kernel | custom 4.4.94, see [hiby-custom-kernel](https://github.com/Jepl4r/hiby-custom-kernel) | the same |
 | double tap to wake | yes | no |
 | buttons | volume on the left flank, playback on the right | all on the right flank, one skip key |
@@ -86,6 +115,7 @@ usr/
         ├── components/
         │   ├── streaming-keys.bin       Tidal / Qobuz / Podcast Index / Last.fm keys, sealed - see "Streaming keys" below.
         │   └── system-info.json         its device-name picks the player the simulator plays
+        ├── fonts/                       the interface faces, and ebook/ with Bookerly for the EPUB reader
         └── gui/                         some of the .png assets the UI loads at runtime - the rest are inside the binary.
 ```
 
@@ -148,6 +178,8 @@ The device's buttons are on the keyboard:
 | `SONIX_LOG` | write the log to a file |
 | `SONIX_BATTERY_CAPACITY`, `SONIX_BATTERY_STATUS` | two files to fake a battery |
 | `SONIX_NO_MOUNT`, `SONIX_NO_SYSSERVER` | leave the host's own system alone |
+| `SONIX_GBDB_DIR` | where the Game Boy ROM databases are read from |
+| `SONIX_AIRPODS_FAKE` | a pair of AirPods to show without any Bluetooth: model, three battery levels and the noise mode |
 
 
 ## Building for the device
@@ -223,20 +255,25 @@ inside the folder. That is how the resource tree gets installed:
 
 ```
 assets/R3PII/                           (and assets/R1/, the same shape)
-├── etc/                             boot logos at the panel's size, D-Bus policy, certificates, S80_bt_init
+├── etc/
+│   ├── boot-logo/                   the default boot logo at the panel's size, one per theme and accent colour
+│   ├── init.d/                      the changed start scripts: boot logo, zram, the user data partition, Wi-Fi, Bluetooth
+│   ├── dbus-1/                      sonix-player.conf, the D-Bus policy that lets the player talk to the Bluetooth stack
+│   └── ssl/                         cert.pem, the certificate list for HTTPS
 ├── usr/
-│   ├── bin/                         bluealsa, ntfs-3g, thttpd
+│   ├── bin/                         bluealsa, ntfs-3g, thttpd, wlbt-wifi, the launcher script and the Wi-Fi and AirPlay scripts
 │   ├── lib/                         the bluealsa ALSA plugin, and OpenSSL, libupnp, libsndfile and fdk-aac (see "System libraries" below)
-│   ├── resource/
-│   │   └── sonix/
-│   │       ├── language/            the 12 .ini files
-│   │       ├── components/
-│   │       │   ├── streaming-keys.bin   Tidal / Qobuz / Podcast Index / Last.fm keys, sealed - see "Streaming keys" below.
-│   │       │   ├── system-info.json     required: names the player, and the packer writes to it
-│   │       │   └── GB*-Database.dat     the Game Boy ROM databases
-│   │       ├── fonts/               default.otf, bold.otf, then korean, thai and arabic .otf, each with a -bold
-│   │       └── gui/                 some of the .png assets the UI loads at runtime - the rest are inside the binary.
-│   └── share/web/                   icons and images for the Wi-Fi transfer page                        
+│   └── resource/
+│       └── sonix/
+│           ├── language/            the 12 .ini files
+│           ├── components/
+│           │   ├── streaming-keys.bin   Tidal / Qobuz / Podcast Index / Last.fm keys, sealed - see "Streaming keys" below.
+│           │   ├── system-info.json     required: names the player, and the packer writes to it
+│           │   └── GB*-Database.dat     the Game Boy ROM databases
+│           ├── fonts/               default.otf, bold.otf, then japanese, korean, thai and arabic .otf, each with a -bold;
+│           │                        ebook/ holds Bookerly for the EPUB reader
+│           └── gui/                 some of the .png assets the UI loads at runtime (Flappy Bird, the remap pictures,
+│                                    the donation QR codes) - the rest are inside the binary.
 └── module_driver/                   the open-source modules and the changed load scripts
 ```
 
@@ -311,7 +348,8 @@ It runs through without asking anything, once for each model:
    takes the place of the stock one: the stock versioned file it replaces goes
    (`libupnp.so.6.3.4` for `libupnp.so.6`, and so on), the symlinks to it are
    pointed at the new file, and the stock `libntfs-3g` goes, which the new
-   `ntfs-3g` has linked in
+   `ntfs-3g` has linked in. The stock Wi-Fi driver (`cywdhd`) goes too, once
+   `brcmfmac` and `bcm_wlbt_power` are there to replace it
 6. deletes the stock interface's own resources - `litegui`, `layout`, `str`,
    `fonts`.
 7. checks the `device-name` in `system-info.json` and writes the build stamp
@@ -341,7 +379,7 @@ carried across from the stock firmware.
 | keys | `keyboard_adc.ko` | `keyboard_adc_multifunc.ko` |
 | LEDs | `leds_sgm31324_add.ko` | `leds_pwm_add.ko` |
 | Type-C | `fusb302b_add.ko` | `tcs1421_add.ko` |
-| charger | `mp2731.ko`, which also wakes the player from standby when the cable goes in or out, and keeps the charge limit itself | |
+| charger | `mp2731.ko`, which also wakes the player from standby when the cable goes in or out, and keeps the charge limit itself | the PMIC, `axp2101.ko`: the player writes the charge limit into it directly |
 | board | `gpio_aw95016_add.ko`, `sau.ko`, `sa_sound_hbc3000.ko` (the HBC3000 FPGA; its configuration comes from the stock firmware, see step 5 above) | |
 | on both | `cw2015.ko` (fuel gauge), `soc_efuse.ko`, `soc_adc.ko`, `rmem_manager.ko`, `i2c_gpio_add.ko` (the DAC's I2C bus), `keyboard_gpio_add.ko` (power and track keys), `sa_sound_switch.ko`, `sa_earpods_adc.ko`, `pwm_backlight.ko`, `soc_utils.ko`, `sa_config_module.ko`, `utils.ko` (the helpers the other modules link against), `soc_gpio.ko` (`/dev/gpio`), `sa_hgl_dma.ko` (`/dev/sa_hgl_dma`), `soc_aic.ko` (the I2S controller), `soc_pwm.ko` (the PWM controller), `soc_i2c.ko` (the I2C controllers), `soc_fb.ko` (the LCD controller, `/dev/fb0`), `soc_msc.ko` (the MMC/SD controllers: the microSD slot and the Wi-Fi chip's SDIO), `axp2101.ko` (the PMIC: regulators and power off) | the same |
 | Wi-Fi | `brcmfmac.ko`, `brcmutil.ko` and `bcm_wlbt_power.ko` in place of `cywdhd.ko` | the same |
@@ -400,19 +438,25 @@ the overlay - any other file need to be in the respective folder mirroring the r
 
 ## Generated files
 
-Three files in the tree are produced by a script and committed, so an ordinary
+A few files in the tree are produced by a script and committed, so an ordinary
 build needs no Python at all. Re-run the script only when its input changes.
 
 | generated | from | script |
 |---|---|---|
 | `src/gui/shell/icons.c`, `icons.h` | `assets/icons/*.svg`, `*.png` | `tools/svg_to_lvgl.py` |
 | `src/system/net/webpage.h` | `web/index.html`, `web/icons`, `web/img` | `tools/web_to_c.py` |
+| `src/system/device/tzrules.c` | the system's tzdata (`/usr/share/zoneinfo`) | `tools/tz_rules.py` |
+| `ZAP_POINTS` in `src/system/device/chargescreen.c` | `assets/icons/zap-device-off.svg` | `tools/charge_zap.py` prints the table, to paste in |
 
 ```bash
 pip install cairosvg pillow
 python3 tools/svg_to_lvgl.py
 
 python3 tools/web_to_c.py
+
+python3 tools/tz_rules.py > src/system/device/tzrules.c
+
+python3 tools/charge_zap.py
 ```
 
 
@@ -421,14 +465,16 @@ python3 tools/web_to_c.py
 ```
 sonix-player/
 │
+├── .github/                         the issue forms, and the workflow that checks bug reports for a log
+│
 ├── sonix-packer/
 │   ├── assets/
 │   │   ├── R3PII/                   the R3 Pro II overlay
-│   │   │   ├── etc/                 boot logos (480x720), sonix-player.conf, cert.pem, modified S80_bt_init
+│   │   │   ├── etc/                 boot logos (480x720), start scripts, D-Bus policy, cert.pem
 │   │   │   ├── module_driver/       the open-source modules, gt9xx_touch.ko among them; gt9xx_touch.sh for five fingers and leds_sgm31324_add.sh with 3 added LED registers
 │   │   │   └── usr/                 bluealsa 4.3.1, resources required by Sonix Player
 │   │   └── R1/                      the R1 overlay
-│   │       ├── etc/                 boot logos (480x800), sonix-player.conf, cert.pem, modified S80_bt_init
+│   │       ├── etc/                 boot logos (480x800), start scripts, D-Bus policy, cert.pem
 │   │       ├── module_driver/       the open-source modules, cst8xx_touch.ko among them; cst8xx_touch.sh for two fingers
 │   │       └── usr/                 bluealsa 4.3.1, resources required by Sonix Player
 │   │                                
@@ -439,8 +485,8 @@ sonix-player/
 ├── sonix-player/                    
 │   ├── assets/                      
 │   │   ├── gui/                     some of the .png assets the UI loads at runtime - the rest are inside the binary.
-│   │   ├── fonts/ 					 the faces: default, bold, Korean (Hangul from Pretendard, OFL), Thai, Arabic
-│   │   └── icons/                   196 SVGs and PNGs, baked into src/gui/shell/icons.c
+│   │   ├── fonts/                   the faces: default, bold, Japanese, Korean (Hangul from Pretendard, OFL), Thai, Arabic
+│   │   └── icons/                   237 SVGs and PNGs, baked into src/gui/shell/icons.c
 │   │   
 │   │
 │   ├── launcher/                    sonix_launch.c: runs the player, reboots when it exits
@@ -455,17 +501,20 @@ sonix-player/
 │   │   │   └── miniz/               reads a ROM straight out of a .zip
 │   │   │
 │   │   ├── gui/                     
-│   │   │   ├── audio/               EQ, PEQ, MSEB and the DAC page
+│   │   │   ├── audio/               EQ, PEQ, AutoEq, MSEB, the DAC page and the metronome
 │   │   │   ├── bluetooth/           pairing, codec, AirPods, receiver mode
 │   │   │   ├── ebook/               EPUB reader: pages, shelf, bar, bookmarks, themes
+│   │   │   ├── flappybird/          the game and its sounds
 │   │   │   ├── fonts/               the lv_font_t objects FreeType fills in at startup
 │   │   │   ├── gearboy/             game list, screen and button pad
-│   │   │   ├── library/             file browser, media lists, playlists, search
-│   │   │   ├── nowplaying/          player screen, cover art, cover flow, waveform, queue
-│   │   │   ├── settings/            26 files, one page each
-│   │   │   ├── shell/               40 files: theme, screen switcher, status bar, control
-│   │   │   │                        centre, keyboard, popups, toasts, settings rows, icons.c
-│   │   │   ├── streaming/           Tidal, Qobuz, podcast and radio pages
+│   │   │   ├── library/             browser, media lists, playlists, search, audiobooks, library scan,
+│   │   │   │                        file manager, picture and text viewer
+│   │   │   ├── nowplaying/          player screen, cover art, cover flow, waveform, queue, chapters,
+│   │   │   │                        lyrics search
+│   │   │   ├── settings/            18 files, one page each
+│   │   │   ├── shell/               28 files: theme, screen switcher, status bar, control centre,
+│   │   │   │                        keyboard, popups, toasts, settings rows, first start, icons.c
+│   │   │   ├── streaming/           Tidal, Qobuz, podcast and radio pages, OPML import
 │   │   │   └── wireless/            Wi-Fi, file transfer, AirPlay, DLNA, SonixLink
 │   │   │
 │   │   ├── system/                  
@@ -474,21 +523,25 @@ sonix-player/
 │   │   │   ├── core/                config, language, logging, paths, utils
 │   │   │   ├── db/                  SQLite
 │   │   │   ├── decode/              one file per format, plus the dispatcher and CUE handling
-│   │   │   ├── device/              power, screen, buttons, USB, storage, ADB, firmware, LED
+│   │   │   ├── device/              power, screen, buttons, USB, storage, ADB, firmware and online
+│   │   │   │                        updates, LED, clock and time zones, boot logo, charging screen
 │   │   │   ├── ebook/               EPUB parsing: zip, XML, XHTML, CSS, OPF, arenas
 │   │   │   ├── gearboy/             the emulator's glue: input, ROM database, save states
 │   │   │   ├── image/               JPEG and PNG decoder
-│   │   │   ├── input/               key mapping
-│   │   │   ├── library/             index, tag reading, cover art, playlists, audiobooks
+│   │   │   ├── input/               key mapping, keyboard layouts
+│   │   │   ├── lastfm/              scrobbling
+│   │   │   ├── library/             index, tag reading, cover art, playlists, audiobooks, lyrics and
+│   │   │   │                        LRCLIB, play counts
 │   │   │   ├── net/                 HTTP, TLS, HLS, mDNS, transfer page
-│   │   │   ├── playback/            queue, device state, audiobooks, sleep timers
+│   │   │   ├── playback/            queue, play history, device state, audiobooks, sleep timers
 │   │   │   ├── remote/              AirPlay, DLNA, SonixLink
-│   │   │   └── streaming/           service clients and their caches
+│   │   │   └── streaming/           Tidal, Qobuz, radio and podcast clients, downloads, OPML, caches
 │   │   │
 │   │   └── main.c                   entry point: display, input, and the startup order
 │   │
-│   ├── tools/                       generators, the multitouch patches for the stock touch drivers,
-│   │                                and system-libs/, the build of the system libraries in the assets
+│   ├── tools/                       generators, seal_streamkeys.py, the multitouch patches for the stock
+│   │                                touch drivers, and system-libs/, the build of the system libraries
+│   │                                in the assets
 │   │
 │   ├── web/                         Wi-Fi transfer page, source of src/system/net/webpage.h
 │   │   ├── icons/                   26 Lucide glyphs, inlined as <symbol>

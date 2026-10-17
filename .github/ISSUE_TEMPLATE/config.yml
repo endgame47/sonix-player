@@ -1,1 +1,5 @@
 blank_issues_enabled: false
+contact_links:
+  - name: Feature list
+    url: https://github.com/Jepl4r/sonix-player/blob/main/FEATURES.md
+    about: Everything Sonix Player can do today. If something is not in this list, it is a feature request, not a bug.
