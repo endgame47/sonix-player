@@ -1407,12 +1407,12 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 	
 	bool playing = audio_get_status() == AUDIO_STATUS_PLAYING;
 
-	lv_color_t complement = chrome_accent();
-	lv_color_t accent = theme()->panel;
+	lv_color_t complement = chrome_accent(); 	// lv_color_make(255, 0, 255);
+	lv_color_t accent = theme()->text_primary; 	// lv_color_make(0, 128, 255);
 
-	// Increase saturation
 	lv_color_hsv_t complement_hsv = lv_color_to_hsv(complement);
-	complement_hsv.s = LV_MIN(100, complement_hsv.s + 40);
+	complement_hsv.s = LV_MIN(complement_hsv.s + 1.3f, 100); // Increase saturation
+	complement_hsv.v = LV_MIN(complement_hsv.v * 1.4f, 100); // Increase value (brightness)
 	complement = lv_color_hsv_to_rgb(complement_hsv.h, complement_hsv.s, complement_hsv.v);
 
 	int baseline = height;
@@ -1441,6 +1441,7 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 
 		// Opacity is based on magnitude. Used for bars only.
 		opa = (uint8_t)(LV_OPA_COVER * magnitude + 40.0f);
+		opa = LV_MIN(opa, LV_OPA_COVER);
 
 		if (playing) {
 			// Bars
