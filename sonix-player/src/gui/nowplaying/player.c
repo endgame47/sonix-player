@@ -1265,6 +1265,10 @@ static void cover_panel_hit_test_cb(lv_event_t *e) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Visualizer: draw spectrum bars over the sleeve, and let the user tap to show/hide them. 
+// ---------------------------------------------------------------------------
+
 static bool visualizer_on_screen(void) { return visualizer_canvas && !lv_obj_is_hidden(visualizer_canvas); }
 
 static void visualizer_screen_hold_update(void) { power_hold_screen_for_view(visualizer_visible && visualizer_on_screen()); }
@@ -1273,11 +1277,31 @@ static void visualizer_open(void) {
 	if (!visualizer_canvas || visualizer_visible) {
 		return;
 	}
-	visualizer_visible = true;
+
+	printf(">>> visualizer_open\n");
+
+	if (visualizer_buf) {
+		free(visualizer_buf);
+		visualizer_buf = NULL;
+	}
+
 	memset(visualizer_bin_peaks, 0, sizeof(visualizer_bin_peaks));
+
+	visualizer_visible = true;
+
+	int size_x = (int)lv_obj_get_width(visualizer_canvas);
+	int size_y = (int)lv_obj_get_height(visualizer_canvas);
+
+	// printf(">>> visualizer_canvas: size_x %d, size_y %d\n", size_x, size_y);
+
+	visualizer_buf = malloc((size_t)size_x * (size_t)size_y * 3);
+	if (visualizer_buf) {
+		lv_canvas_set_buffer(visualizer_canvas, visualizer_buf,
+			size_x, size_y, LV_COLOR_FORMAT_RGB565A8);
+	}
+
 	audio_set_visualizer_enabled(true);
 	lv_obj_set_hidden(visualizer_canvas, false);
-	lv_obj_move_foreground(visualizer_canvas);
 	lv_timer_resume(visualizer_timer);
 	visualizer_screen_hold_update();
 }
@@ -1286,12 +1310,20 @@ static void visualizer_close(void) {
 	if (!visualizer_canvas || !visualizer_visible) {
 		return;
 	}
-	lv_timer_pause(visualizer_timer);
+
+	printf(">>> visualizer_close\n");
+
 	visualizer_visible = false;
+
+	lv_timer_pause(visualizer_timer);
 	audio_set_visualizer_enabled(false);
 	lv_obj_set_hidden(visualizer_canvas, true);
-	memset(visualizer_bin_peaks, 0, sizeof(visualizer_bin_peaks));
 	visualizer_screen_hold_update();
+	
+	memset(visualizer_bin_peaks, 0, sizeof(visualizer_bin_peaks));
+	
+	free(visualizer_buf);
+	visualizer_buf = NULL;
 }
 
 static void visualizer_canvas_click_cb(lv_event_t *e) {
@@ -1306,9 +1338,28 @@ static void cover_panel_visualizer_cb(lv_event_t *e) {
 	}
 }
 
+static void visualizer_layout(lv_obj_t *parent, int size_x, int size_y) {
+	if (visualizer_canvas) {
+		// delete canvas in case the parent changed
+		lv_obj_delete(visualizer_canvas);
+		visualizer_canvas = NULL;
+	}	
+	visualizer_canvas = lv_canvas_create(parent);
+
+	player_sheet_attach_drag(visualizer_canvas, false);
+	lv_obj_set_size(visualizer_canvas, size_x, size_y);
+	lv_obj_set_pos(visualizer_canvas, 0, 0);
+	lv_obj_set_clickable(visualizer_canvas, true);
+	lv_obj_add_event_cb(visualizer_canvas, visualizer_canvas_click_cb, LV_EVENT_CLICKED, NULL);
+	lv_obj_set_hidden(visualizer_canvas, true);
+}
+
 // Convert 24-bit RGB888 color to 16-bit RGB565 format. 
-static uint16_t rgb888_to_rgb565(lv_color_t color) {
-	return (uint16_t)(((color.red & 0xF8) << 8) | ((color.green & 0xFC) << 3) | (color.blue >> 3));
+static inline uint16_t rgb_to_rgb565_rounded(lv_color_t color) {
+	uint32_t r5 = (color.red * 249 + 1014) >> 11;
+	uint32_t g6 = (color.green * 253 + 505) >> 10;
+	uint32_t b5 = (color.blue * 249 + 1014) >> 11;
+	return (uint16_t)((r5 << 11) | (g6 << 5) | b5);
 }
 
 static void visualizer_timer_cb(lv_timer_t *timer) {
@@ -1320,25 +1371,12 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 	int width = (int)lv_obj_get_width(visualizer_canvas);
 	int height = (int)lv_obj_get_height(visualizer_canvas);
 	
-	// uint16_t packed;
 	size_t at;
 	uint8_t opa;
 
 	uint16_t *colour = (uint16_t *)visualizer_buf;
 	uint8_t *alpha = visualizer_buf + (size_t)width * height * 2;
 	memset(alpha, 0, (size_t)width * height);
-
-	/*
-	// Fill the canvas with a dark background, which is the same colour as the panel behind it. 
-	lv_color_t visualizer_bg = lv_color_make(12, 5, 24);
-
-	packed = rgb888_to_rgb565(visualizer_bg);
-
-	for (size_t i = 0; i < width * height; i++) {
-    	colour[i] = packed;
-		alpha[i] = 0;
-	}
-	*/
 
 	float level = 0.0f;
 	float peak_level = 0.0f;
@@ -1350,182 +1388,66 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 	lv_color_t complement = chrome_accent();
 	lv_color_t accent = theme()->panel;
 
-	//*
-	lv_color_hsv_t complement_hsv = lv_color_to_hsv(complement);
 	// Increase saturation
+	lv_color_hsv_t complement_hsv = lv_color_to_hsv(complement);
 	complement_hsv.s = LV_MIN(100, complement_hsv.s + 20);
 	complement = lv_color_hsv_to_rgb(complement_hsv.h, complement_hsv.s, complement_hsv.v);
-	//*/
 
-	if ( 1 == 1 ) {
-		// Horizontal spectrum 
-		
-		// Baseline
-		int baseline = height; // height * 3 / 4;
-		int max_height = height * 48 / 100;
-		int bar_top_limit = LV_MAX(0, baseline - max_height);
+	int baseline = height;
+	int max_height = height * 48 / 100;
+	int bar_top_limit = LV_MAX(0, baseline - max_height);
 
-		/*
-		lv_color_t baseline_color = lv_color_make(35, 94, 116);
-
-		packed = rgb888_to_rgb565(baseline_color);
-
-		for (int x = 0; x < width; x++) {
-			at = (size_t)baseline * width + x;
-			colour[at] = packed;
-			alpha[at] = 255;
+	for (int segment = 0; segment < AUDIO_VISUALIZER_BINS; segment++) {
+		float magnitude = spectrum[segment];
+		magnitude *= 0.55f + sqrtf(level) * 0.45f;
+		float *held_peak = &visualizer_bin_peaks[segment];
+		if (magnitude >= *held_peak) {
+			*held_peak = magnitude;
+		} else {
+			*held_peak = fmaxf(magnitude, *held_peak - 0.012f);
 		}
-		*/
 
-		for (int segment = 0; segment < AUDIO_VISUALIZER_BINS; segment++) {
-			float magnitude = spectrum[segment];
-			magnitude *= 0.55f + sqrtf(level) * 0.45f;
-			float *held_peak = &visualizer_bin_peaks[segment];
-			if (magnitude >= *held_peak) {
-				*held_peak = magnitude;
-			} else {
-				*held_peak = fmaxf(magnitude, *held_peak - 0.012f);
-			}
+		int slot_start = segment * width / AUDIO_VISUALIZER_BINS;
+		int slot_end = (segment + 1) * width / AUDIO_VISUALIZER_BINS;
+		int slot_width = slot_end - slot_start;
+		int bar_width = LV_MAX(1, slot_width * 3 / 4);
+		int x_start = slot_start + (slot_width - bar_width) / 2;
+		int x_end = LV_MIN(width, x_start + bar_width);
+		int bar_height = (int)(magnitude * max_height);
+		int bar_top = LV_MAX(bar_top_limit, baseline - bar_height);
+		int peak_y = LV_MAX(bar_top_limit, baseline - (int)(*held_peak * max_height));
 
-			int slot_start = segment * width / AUDIO_VISUALIZER_BINS;
-			int slot_end = (segment + 1) * width / AUDIO_VISUALIZER_BINS;
-			int slot_width = slot_end - slot_start;
-			int bar_width = LV_MAX(1, slot_width * 3 / 4);
-			int x_start = slot_start + (slot_width - bar_width) / 2;
-			int x_end = LV_MIN(width, x_start + bar_width);
-			int bar_height = (int)(magnitude * max_height);
-			int bar_top = LV_MAX(bar_top_limit, baseline - bar_height);
-			int peak_y = LV_MAX(bar_top_limit, baseline - (int)(*held_peak * max_height));
+		// Opacity is based on magnitude. Used for bars and peak marker.
+		opa = (uint8_t)(215.0f * magnitude * 3); // boost by * 3 to make it more opaque
+		opa = LV_MIN(opa, 255);
 
-			// Opacity is based on magnitude. Used for bars and peak marker.
-			opa = (uint8_t)(215.0f * magnitude * 3); // boost by * 3 to make it more opaque
-			opa = LV_MIN(opa, 255);
-
-			if (playing) {
-				// Bar
-				for (int y = baseline - 1; y >= bar_top; y--) {
-					float position = (float)(baseline - 1 - y) / LV_MAX(1, bar_height - 1);
-					lv_color_t color = lv_color_make(
-						(uint8_t)(accent.red + (complement.red - accent.red) * position),
-						(uint8_t)(accent.green + (complement.green - accent.green) * position),
-						(uint8_t)(accent.blue + (complement.blue - accent.blue) * position));
-					for (int x = x_start; x < x_end; x++) {
-						at = (size_t)y * width + x;
-						colour[at] = rgb888_to_rgb565(color);
-						alpha[at] = opa;
-					}
-				}
-
-				/*
-				// Round the tops of the bars
-				int used_width = x_end - x_start;
-				int cap_radius = LV_MAX(1, LV_MIN(used_width / 2, LV_MAX(1, bar_height / 2)));
-				int cap_center_x = (x_start + x_end) / 2;
-				int cap_center_y = bar_top + cap_radius;
-				for (int y = bar_top; y <= cap_center_y; y++) {
-					int dy = y - cap_center_y;
-					int half_width = (int)sqrtf((float)cap_radius * cap_radius - (float)dy * dy);
-					if (half_width <= 0) {
-						continue;
-					}
-					int x0 = cap_center_x - half_width;
-					int x1 = cap_center_x + half_width;
-					for (int x = LV_MAX(x_start, x0); x <= LV_MIN(x_end - 1, x1); x++) {
-						float position = (float)(baseline - 1 - y) / LV_MAX(1, bar_height - 1);
-						lv_color_t color = lv_color_make(
-							(uint8_t)(accent.red + (complement.red - accent.red) * position),
-							(uint8_t)(accent.green + (complement.green - accent.green) * position),
-							(uint8_t)(accent.blue + (complement.blue - accent.blue) * position));
-						at = (size_t)y * width + x;
-						colour[at] = rgb888_to_rgb565(color);
-						alpha[at] = opa * 2;
-					}
-				}
-				*/
-
-				/*
-				// Reflection
-				int reflection_height = bar_height / 3;
-				for (int y = baseline + 1; y <= baseline + reflection_height && y < height; y++) {
-					float fade = 1.0f - (float)(y - baseline) / LV_MAX(1, reflection_height);
-					lv_color_t reflection = lv_color_make(8, (uint8_t)(42.0f * fade), (uint8_t)(88.0f * fade));
-					for (int x = x_start; x < x_end; x++) {
-						at = (size_t)y * width + x;
-						colour[at] = rgb888_to_rgb565(reflection);
-					}
-				}
-				*/
-			}
-
-			// Peak marker
-			if (peak_y < baseline) {
-				float brightness = 0.65f + 0.35f * peak_level;
-				lv_color_t marker = lv_color_make(
-					(uint8_t)(accent.red + (complement.red - accent.red) * brightness),
-					(uint8_t)(accent.green + (complement.green - accent.green) * brightness),
-					(uint8_t)(accent.blue + (complement.blue - accent.blue) * brightness));				
+		if (playing) {
+			// Bars
+			for (int y = baseline - 1; y >= bar_top; y--) {
+				float position = (float)(baseline - 1 - y) / LV_MAX(1, bar_height - 1);
+				lv_color_t color = lv_color_make(
+					(uint8_t)(accent.red + (complement.red - accent.red) * position),
+					(uint8_t)(accent.green + (complement.green - accent.green) * position),
+					(uint8_t)(accent.blue + (complement.blue - accent.blue) * position));
 				for (int x = x_start; x < x_end; x++) {
-					at = (size_t)peak_y * width + x;
-					colour[at] = rgb888_to_rgb565(marker);
+					at = (size_t)y * width + x;
+					colour[at] = rgb_to_rgb565_rounded(color);
 					alpha[at] = opa;
 				}
 			}
 		}
-	} else {
-		// Circular spectrum, which is a set of radial bars that grow from the inner ring
-		// to the outer ring. The bars are modulated in length and colour to make
-		// them feel like a spectrum rather than a set of unrelated dots.
 
-		int cx = width / 2;
-		int cy = height / 2;
-		float time = (float)lv_tick_get() / 1000.0f;
-		float inner_radius = LV_MIN(width, height) * 0.18f;
-		float outer_radius = LV_MIN(width, height) * 0.36f;
-
-		lv_color_t spectrum_color = playing ? lv_color_make(72, 150, 255) : lv_color_make(125, 125, 155);
-
-		// Draw the circular spectrum as a set of radial bars. Each segment grows
-		// from the inner ring in proportion to the live PCM level.
-		for (int segment = 0; segment < AUDIO_VISUALIZER_BINS; segment++) {
-			float angle = 2.0f * M_PI * segment / AUDIO_VISUALIZER_BINS + time * 0.08f;
-			float band = 0.22f + 0.78f *
-				(0.5f + 0.5f * sinf((float)segment * 0.48f + time * 1.4f));
-
-			// The bands come on a dB scale already, 0..1.
-			float magnitude = spectrum[segment];
-			magnitude *= 0.55f + sqrtf(level) * 0.45f;
-
-			float color_intensity = 0.2f + magnitude * 0.8f;
-			lv_color_t bar_color = lv_color_make(
-				(uint8_t)(spectrum_color.red * color_intensity),
-				(uint8_t)(spectrum_color.green * color_intensity),
-				(uint8_t)(spectrum_color.blue * color_intensity));
-
-			float bar_length = inner_radius + (outer_radius - inner_radius) * (0.08f + magnitude * 0.92f * band);
-			float start_radius = inner_radius;
-			float end_radius = bar_length;
-			int start_x = cx + (int)(cosf(angle) * start_radius);
-			int start_y = cy + (int)(sinf(angle) * start_radius);
-			int end_x = cx + (int)(cosf(angle) * end_radius);
-			int end_y = cy + (int)(sinf(angle) * end_radius);
-			int dx = end_x - start_x;
-			int dy = end_y - start_y;
-			int perpendicular_x = (int)roundf(-sinf(angle));
-			int perpendicular_y = (int)roundf(cosf(angle));
-			int steps = LV_MAX(1, LV_MAX(abs(dx), abs(dy)));
-
-			// Draw
-			for (int i = 0; i <= steps; i++) {
-				int x = start_x + dx * i / steps;
-				int y = start_y + dy * i / steps;
-				for (int thickness = -1; thickness <= 1; thickness++) {
-					int px = x + perpendicular_x * thickness;
-					int py = y + perpendicular_y * thickness;
-					if (px >= 0 && px < width && py >= 0 && py < height) {
-						at = (size_t)py * width + px;
-						colour[at] = rgb888_to_rgb565(bar_color);
-					}
-				}
+		// Peak marker
+		if (peak_y < baseline) {
+			float brightness = 0.65f + 0.35f * peak_level;
+			lv_color_t marker = lv_color_make(
+				(uint8_t)(accent.red + (complement.red - accent.red) * brightness),
+				(uint8_t)(accent.green + (complement.green - accent.green) * brightness),
+				(uint8_t)(accent.blue + (complement.blue - accent.blue) * brightness));				
+			for (int x = x_start; x < x_end; x++) {
+				at = (size_t)peak_y * width + x;
+				colour[at] = rgb_to_rgb565_rounded(marker);
+				alpha[at] = opa;
 			}
 		}
 	}
@@ -2936,6 +2858,7 @@ static void studio_place(void) {
 	lv_obj_set_size(studio_quality, size, STUDIO_QUALITY_H);
 	lv_obj_set_pos(studio_quality, cover_x, cover_y + size + STUDIO_QUALITY_GAP);
 
+	visualizer_layout(studio_cover, size, size);
 	lyrics_layout();
 }
 
@@ -2948,6 +2871,7 @@ static void studio_refresh_cover(void) {
 	lv_image_set_src(studio_cover, have ? &current_cover.dsc : NULL);
 	if (have) {
 		lv_obj_set_hidden(studio_cover, false);
+		lv_obj_set_parent(visualizer_canvas, studio_cover);
 	} else {
 		lv_obj_set_hidden(studio_cover, true);
 	}
@@ -2960,6 +2884,7 @@ static void studio_refresh_cover(void) {
 			lv_obj_set_hidden(studio_empty, true);
 		} else {
 			lv_obj_set_hidden(studio_empty, false);
+			lv_obj_set_parent(visualizer_canvas, studio_empty);
 		}
 	}
 	if (studio_empty_icon) {
@@ -5857,27 +5782,7 @@ void player_init(gui_config_t *cfg) {
 	lv_obj_center(cover_img);
 	lv_obj_set_hidden(cover_img, true);
 
-	// FIXME: position/size correctly for alternative layout.
-
-	// The generated visualizer is a sibling of the artwork panel. It has no
-	// image source or artwork child and is hidden until the cover panel opens it.
-	visualizer_canvas = lv_canvas_create(cover_panel);
-	player_sheet_attach_drag(visualizer_canvas, false);
-	lv_obj_set_size(visualizer_canvas, cover_size, cover_size);
-	lv_obj_set_pos(visualizer_canvas, 0, 0);
-	lv_obj_set_clickable(visualizer_canvas, true);
-	lv_obj_add_event_cb(visualizer_canvas, visualizer_canvas_click_cb,
-		LV_EVENT_CLICKED, NULL);
-	lv_obj_set_hidden(visualizer_canvas, true);
-	visualizer_buf = malloc((size_t)cover_size *
-		(size_t)cover_size * 3);
-	if (visualizer_buf) {
-		lv_canvas_set_buffer(visualizer_canvas, visualizer_buf,
-			cover_size, cover_size, LV_COLOR_FORMAT_RGB565A8);
-	}
-
-	// Blend mode experiment
-	// lv_obj_set_style_blend_mode(visualizer_canvas, LV_BLEND_MODE_DIFFERENCE, 0);
+	visualizer_layout(cover_panel, cover_size, cover_size);
 
 	// ---------------------------------------------------------------------
 	// Studio: the blurred sleeve behind the whole screen, and everything else
