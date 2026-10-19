@@ -1,0 +1,53 @@
+name: Issue title check
+
+# An issue whose title is only the form's prefix ("[BUG] ", "[Feature] ") gets
+# the "needs title" label and a comment asking for one. Once the title is
+# edited, the label goes away. The issue itself stays open either way.
+
+on:
+  issues:
+    types: [opened, edited]
+
+permissions:
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const label = 'needs title';
+
+            // Not the maintainer's own issues.
+            if (issue.user.login === context.repo.owner) return;
+
+            // What is left of the title once the prefix and the punctuation
+            // around it are taken away.
+            const rest = (issue.title || '')
+              .replace(/^\s*\[(bug|feature)\]\s*/i, '')
+              .replace(/[\s\-_.,:;!?*#()\[\]]+/g, '');
+            const labels = issue.labels.map(l => l.name);
+            const params = { owner: context.repo.owner, repo: context.repo.repo, issue_number: issue.number };
+
+            if (rest.length > 0) {
+              if (labels.includes(label)) {
+                await github.rest.issues.removeLabel({ ...params, name: label }).catch(() => {});
+                await github.rest.issues.createComment({ ...params, body: 'Thanks, the title is there now.' });
+              }
+              return;
+            }
+
+            // Asked once: an edit that still has no title does not ask again.
+            if (labels.includes(label)) return;
+
+            await github.rest.issues.addLabels({ ...params, labels: [label] });
+            await github.rest.issues.createComment({ ...params, body: [
+              'This issue has no title: only the `[BUG]` or `[Feature]` prefix of the form is there.',
+              '',
+              'Please **edit the title** and add a few words that say what the problem or the request is, after the prefix.',
+              '',
+              'For example: `[BUG] Gap between tracks with Gapless on` or `[Feature] Sort playlists by date`.',
+            ].join('\n') });

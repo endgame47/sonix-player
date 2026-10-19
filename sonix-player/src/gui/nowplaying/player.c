@@ -2838,7 +2838,9 @@ static const lv_image_dsc_t *studio_quality_mark(const device_state_t *state) {
 	int rate = 0, channels = 0;
 	audio_get_stream_info(&rate, &channels);
 	int bits = audio_get_stream_bits();
-	if (rate > 48000 || bits > 16) {
+	// CD is 16 bit at 44.1 kHz or below, as in the library lists
+	// (library_track_quality); 48 kHz and up is Hi-Res.
+	if (rate > 44100 || bits > 16) {
 		return &icon_quality_hifi;
 	}
 	if (rate > 0) {
