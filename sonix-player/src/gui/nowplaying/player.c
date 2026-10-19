@@ -1265,6 +1265,33 @@ static void cover_panel_hit_test_cb(lv_event_t *e) {
 	}
 }
 
+static void slider_over_waveform(bool over) {
+	if (!progress_slider) {
+		return;
+	}
+
+	if (over && wave_box) {
+		lv_obj_set_parent(progress_slider, wave_box);
+		lv_obj_set_size(progress_slider, lv_pct(100), WAVE_HEIGHT);
+		lv_obj_align(progress_slider, LV_ALIGN_CENTER, 0, 0);
+		lv_obj_set_style_bg_opa(progress_slider, LV_OPA_TRANSP, LV_PART_MAIN);
+		lv_obj_set_style_bg_opa(progress_slider, LV_OPA_TRANSP, LV_PART_INDICATOR);
+		lv_obj_set_style_opa(progress_slider, LV_OPA_TRANSP, LV_PART_KNOB);
+		lv_obj_move_foreground(progress_slider); // over the canvas, which takes no presses anyway
+		return;
+	}
+
+	if (lv_obj_get_parent(progress_slider) == wave_box) {
+		lv_obj_set_parent(progress_slider, player_menu);
+		lv_obj_move_to_index(progress_slider, lv_obj_get_index(wave_box) + 1);
+	}
+	lv_obj_set_size(progress_slider, lv_pct(100), PROGRESS_TRACK_HEIGHT);
+	lv_obj_remove_local_style_prop(progress_slider, LV_STYLE_BG_OPA, LV_PART_MAIN);
+	lv_obj_set_style_bg_opa(progress_slider, LV_OPA_30, LV_PART_MAIN);
+	lv_obj_remove_local_style_prop(progress_slider, LV_STYLE_BG_OPA, LV_PART_INDICATOR);
+	lv_obj_remove_local_style_prop(progress_slider, LV_STYLE_OPA, LV_PART_KNOB);
+}
+
 // ---------------------------------------------------------------------------
 // Visualizer: draw spectrum bars over the sleeve, and let the user tap to show/hide them. 
 // ---------------------------------------------------------------------------
@@ -1278,7 +1305,6 @@ static void visualizer_open(void) {
 		return;
 	}
 
-	printf(">>> visualizer_open\n");
 
 	if (visualizer_buf) {
 		free(visualizer_buf);
@@ -1291,8 +1317,6 @@ static void visualizer_open(void) {
 
 	int size_x = (int)lv_obj_get_width(visualizer_canvas);
 	int size_y = (int)lv_obj_get_height(visualizer_canvas);
-
-	// printf(">>> visualizer_canvas: size_x %d, size_y %d\n", size_x, size_y);
 
 	visualizer_buf = malloc((size_t)size_x * (size_t)size_y * 3);
 	if (visualizer_buf) {
@@ -1310,8 +1334,6 @@ static void visualizer_close(void) {
 	if (!visualizer_canvas || !visualizer_visible) {
 		return;
 	}
-
-	printf(">>> visualizer_close\n");
 
 	visualizer_visible = false;
 
@@ -1390,7 +1412,7 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 
 	// Increase saturation
 	lv_color_hsv_t complement_hsv = lv_color_to_hsv(complement);
-	complement_hsv.s = LV_MIN(100, complement_hsv.s + 20);
+	complement_hsv.s = LV_MIN(100, complement_hsv.s + 40);
 	complement = lv_color_hsv_to_rgb(complement_hsv.h, complement_hsv.s, complement_hsv.v);
 
 	int baseline = height;
@@ -1417,9 +1439,8 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 		int bar_top = LV_MAX(bar_top_limit, baseline - bar_height);
 		int peak_y = LV_MAX(bar_top_limit, baseline - (int)(*held_peak * max_height));
 
-		// Opacity is based on magnitude. Used for bars and peak marker.
-		opa = (uint8_t)(215.0f * magnitude * 3); // boost by * 3 to make it more opaque
-		opa = LV_MIN(opa, 255);
+		// Opacity is based on magnitude. Used for bars only.
+		opa = (uint8_t)(LV_OPA_COVER * magnitude + 40.0f);
 
 		if (playing) {
 			// Bars
@@ -1447,39 +1468,12 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 			for (int x = x_start; x < x_end; x++) {
 				at = (size_t)peak_y * width + x;
 				colour[at] = rgb_to_rgb565_rounded(marker);
-				alpha[at] = opa;
+				alpha[at] = LV_OPA_COVER;
 			}
 		}
 	}
 
 	lv_obj_invalidate(visualizer_canvas);
-}
-
-static void slider_over_waveform(bool over) {
-	if (!progress_slider) {
-		return;
-	}
-
-	if (over && wave_box) {
-		lv_obj_set_parent(progress_slider, wave_box);
-		lv_obj_set_size(progress_slider, lv_pct(100), WAVE_HEIGHT);
-		lv_obj_align(progress_slider, LV_ALIGN_CENTER, 0, 0);
-		lv_obj_set_style_bg_opa(progress_slider, LV_OPA_TRANSP, LV_PART_MAIN);
-		lv_obj_set_style_bg_opa(progress_slider, LV_OPA_TRANSP, LV_PART_INDICATOR);
-		lv_obj_set_style_opa(progress_slider, LV_OPA_TRANSP, LV_PART_KNOB);
-		lv_obj_move_foreground(progress_slider); // over the canvas, which takes no presses anyway
-		return;
-	}
-
-	if (lv_obj_get_parent(progress_slider) == wave_box) {
-		lv_obj_set_parent(progress_slider, player_menu);
-		lv_obj_move_to_index(progress_slider, lv_obj_get_index(wave_box) + 1);
-	}
-	lv_obj_set_size(progress_slider, lv_pct(100), PROGRESS_TRACK_HEIGHT);
-	lv_obj_remove_local_style_prop(progress_slider, LV_STYLE_BG_OPA, LV_PART_MAIN);
-	lv_obj_set_style_bg_opa(progress_slider, LV_OPA_30, LV_PART_MAIN);
-	lv_obj_remove_local_style_prop(progress_slider, LV_STYLE_BG_OPA, LV_PART_INDICATOR);
-	lv_obj_remove_local_style_prop(progress_slider, LV_STYLE_OPA, LV_PART_KNOB);
 }
 
 // ---------------------------------------------------------------------------
