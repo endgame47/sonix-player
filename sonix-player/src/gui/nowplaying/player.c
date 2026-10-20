@@ -1384,6 +1384,26 @@ static inline uint16_t rgb_to_rgb565_rounded(lv_color_t color) {
 	return (uint16_t)((r5 << 11) | (g6 << 5) | b5);
 }
 
+// The bar colours, from the accent of the moment: `low` at the foot of a bar,
+// `high` at its top and `peak` for the held peak marker.
+//
+// The accent is made more vivid first: the cover tone is usually a muted
+// one, and drawn over the artwork as it is the bars read as grey. The top is
+// the same hue turned a little and brighter, so a bar lights up as it rises.
+// An accent with almost no colour (a black and white cover) gives no hue to
+// work from, and the theme accent is used instead.
+static void visualizer_palette(lv_color_t *low, lv_color_t *high, lv_color_t *peak) {
+	lv_color_hsv_t hsv = lv_color_to_hsv(chrome_accent());
+	if (hsv.s < 15) {
+		hsv = lv_color_to_hsv(theme()->accent);
+	}
+	uint16_t h = hsv.h;
+	uint8_t s = (uint8_t)LV_MAX(70, LV_MIN(85, hsv.s + 20));
+	*low = lv_color_hsv_to_rgb(h, s, 75);
+	*high = lv_color_hsv_to_rgb((uint16_t)((h + 24) % 360), (uint8_t)(s * 70 / 100), 95);
+	*peak = lv_color_mix(lv_color_white(), *high, 200);
+}
+
 static void visualizer_timer_cb(lv_timer_t *timer) {
 	(void)timer;
 	if (!visualizer_visible || !visualizer_canvas || !visualizer_buf) {
@@ -1407,13 +1427,10 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 	
 	bool playing = audio_get_status() == AUDIO_STATUS_PLAYING;
 
-	lv_color_t complement = chrome_accent(); 	// lv_color_make(255, 0, 255);
-	lv_color_t accent = theme()->text_primary; 	// lv_color_make(0, 128, 255);
-
-	lv_color_hsv_t complement_hsv = lv_color_to_hsv(complement);
-	complement_hsv.s = LV_MIN(complement_hsv.s + 1.3f, 100); // Increase saturation
-	complement_hsv.v = LV_MIN(complement_hsv.v * 1.4f, 100); // Increase value (brightness)
-	complement = lv_color_hsv_to_rgb(complement_hsv.h, complement_hsv.s, complement_hsv.v);
+	lv_color_t accent;
+	lv_color_t complement;
+	lv_color_t marker;
+	visualizer_palette(&accent, &complement, &marker);
 
 	int baseline = height;
 	int max_height = height * 48 / 100;
@@ -1439,9 +1456,10 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 		int bar_top = LV_MAX(bar_top_limit, baseline - bar_height);
 		int peak_y = LV_MAX(bar_top_limit, baseline - (int)(*held_peak * max_height));
 
-		// Opacity is based on magnitude. Used for bars only.
-		opa = (uint8_t)(LV_OPA_COVER * magnitude + 40.0f);
-		opa = LV_MIN(opa, LV_OPA_COVER);
+		// Opacity rises with the magnitude, from a floor that keeps even a quiet
+		// bar solid over the artwork.
+		// 50%: 127.0f + 128.0f * magnitude
+		opa = (uint8_t)LV_MIN(LV_OPA_COVER, 150.0f + 105.0f * magnitude); 
 
 		if (playing) {
 			// Bars
@@ -1461,11 +1479,6 @@ static void visualizer_timer_cb(lv_timer_t *timer) {
 
 		// Peak marker
 		if (peak_y < baseline) {
-			float brightness = 0.65f + 0.35f * peak_level;
-			lv_color_t marker = lv_color_make(
-				(uint8_t)(accent.red + (complement.red - accent.red) * brightness),
-				(uint8_t)(accent.green + (complement.green - accent.green) * brightness),
-				(uint8_t)(accent.blue + (complement.blue - accent.blue) * brightness));				
 			for (int x = x_start; x < x_end; x++) {
 				at = (size_t)peak_y * width + x;
 				colour[at] = rgb_to_rgb565_rounded(marker);
