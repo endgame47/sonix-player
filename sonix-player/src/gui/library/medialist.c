@@ -1832,46 +1832,67 @@ static void thumbs_update(panel_t *p) {
 	}
 
 	bool anything_pending = false;
+	bool on_screen_pending = false;
+	int top = lv_obj_get_scroll_y(p->list);
+	int bottom = top + lv_obj_get_height(p->list);
 
-	for (int i = 0; i < ROW_POOL; i++) {
-		row_t *row = &p->rows[i];
-		if (row->index < 0 || row->index >= p->count || row->thumb_settled) {
-			continue;
-		}
-
-		const char *source = NULL;
-		if (!row_at(p, row->index, NULL, &source)) {
-			// The list went stale under the row: the next window_update() reads
-			// it again and binds the row anew. Not "no artwork".
-			if (!p->from_paths && library_index_stale(p->ix)) {
-				anything_pending = true;
+	// The rows on screen first, then those kept either side of it. The worker
+	// serves the lowest slot first, whatever the screen shows, so a row off the
+	// screen is only asked for once every row on it has its answer -- otherwise
+	// the rows kept above the screen are decoded before the ones in sight.
+	for (int pass = 0; pass < 2; pass++) {
+		for (int i = 0; i < ROW_POOL; i++) {
+			row_t *row = &p->rows[i];
+			if (row->index < 0 || row->index >= p->count || row->thumb_settled) {
 				continue;
 			}
-			row->thumb_settled = true;
-			continue;
-		}
-		if (!source) {
-			row->thumb_settled = true; // nothing to load art from
-			continue;
-		}
+			int y = row_y(p, row->index);
+			bool on_screen = y + ROW_HEIGHT > top && y < bottom;
+			if (on_screen != (pass == 0)) {
+				continue;
+			}
 
-		if (!row->thumb_requested) {
-			coverloader_request(row_slot(p, row), source, THUMB_SIZE);
-			row->thumb_requested = true;
-			snprintf(row->thumb_path, sizeof(row->thumb_path), "%s", source);
-		}
+			const char *source = NULL;
+			if (!row_at(p, row->index, NULL, &source)) {
+				// The list went stale under the row: the next window_update()
+				// reads it again and binds the row anew. Not "no artwork".
+				if (!p->from_paths && library_index_stale(p->ix)) {
+					anything_pending = true;
+					continue;
+				}
+				row->thumb_settled = true;
+				continue;
+			}
+			if (!source) {
+				row->thumb_settled = true; // nothing to load art from
+				continue;
+			}
 
-		bool finished = false;
-		cover_image_t image;
-		if (coverloader_take(row_slot(p, row), &image, &finished)) {
-			row->thumb = image;
-			row->has_thumb = true;
-			row->thumb_settled = true;
-			row_show_cover(row, &row->thumb.dsc);
-		} else if (finished) {
-			row->thumb_settled = true; // no artwork in this file
-		} else {
-			anything_pending = true;
+			if (!row->thumb_requested) {
+				if (!on_screen && on_screen_pending) {
+					anything_pending = true; // its turn comes on a later tick
+					continue;
+				}
+				coverloader_request(row_slot(p, row), source, THUMB_SIZE);
+				row->thumb_requested = true;
+				snprintf(row->thumb_path, sizeof(row->thumb_path), "%s", source);
+			}
+
+			bool finished = false;
+			cover_image_t image;
+			if (coverloader_take(row_slot(p, row), &image, &finished)) {
+				row->thumb = image;
+				row->has_thumb = true;
+				row->thumb_settled = true;
+				row_show_cover(row, &row->thumb.dsc);
+			} else if (finished) {
+				row->thumb_settled = true; // no artwork in this file
+			} else {
+				anything_pending = true;
+				if (on_screen) {
+					on_screen_pending = true;
+				}
+			}
 		}
 	}
 
@@ -2923,9 +2944,26 @@ static void reorder_stop(panel_t *p) {
 	}
 }
 
+// Lets go of the artwork a panel asked for and has not got yet. The worker
+// takes requests lowest slot first, and the name lists' slots come before the
+// track lists': left queued, a page of covers nobody can see any more is
+// decoded before the rows of the album just opened. Coming back to the panel
+// asks for them again (screen_loaded_cb), and what was finished meanwhile is
+// in the thumbnail cache by then.
+static void panel_abandon_thumbs(panel_t *p) {
+	for (int i = 0; i < ROW_POOL; i++) {
+		row_t *row = &p->rows[i];
+		if (row->thumb_requested && !row->thumb_settled) {
+			coverloader_release(row_slot(p, row));
+			row->thumb_requested = false;
+		}
+	}
+}
+
 static void screen_unloaded_cb(lv_event_t *e) {
 	reorder_stop(lv_event_get_user_data(e));
 	selection_stop(lv_event_get_user_data(e));
+	panel_abandon_thumbs(lv_event_get_user_data(e));
 }
 
 // Set while a list is reopened under a new ordering: it comes back at the top,

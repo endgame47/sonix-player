@@ -135,6 +135,20 @@ static const layout_info_t layouts[KB_LAYOUT_COUNT] = {
 						  "WXYZ\xc3\x9d\xc5\xbd"},
 						 "\xc4\x8c"
 						 "e\xc5\xa1tina"},
+	// Japanese has no letters of its own here: the kana are typed through the
+	// Latin rows as romaji, and through the ten-key keypad of kana.c. Both are
+	// switched on by the layout in keyboard.c, and what is below is what they
+	// fall back to: the Latin letters, for the mode that types them as they are
+	// (the "A" of the key beside "123"). The "-" at the end of the third row is
+	// the long-vowel mark while romaji is being turned into kana ("ra-men" is the
+	// word for ramen), a hyphen in Latin mode; with shift it is "_". The name is the
+	// layout's name in its own language.
+	[KB_LAYOUT_JAPANESE] = {"\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e",
+						   {"qwertyuiop", "asdfghjkl", "zxcvbnm-"},
+						   {"QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM_"},
+						   {T9_LATIN_LOWER},
+						   {T9_LATIN_UPPER},
+						   "Japanese"},
 };
 
 // The letters a held key offers, the way a phone keyboard does: one entry per
@@ -178,8 +192,8 @@ static const struct {
 };
 
 // The config file keeps names, not indices.
-static const char *const layout_keys[KB_LAYOUT_COUNT] = {"english", "italian", "german", "spanish",	 "french",
-														 "russian", "dutch",   "polish", "portuguese", "czech"};
+static const char *const layout_keys[KB_LAYOUT_COUNT] = {"english", "italian", "german", "spanish",	 "french", "russian",
+														 "dutch",   "polish",  "portuguese", "czech", "japanese"};
 
 static uint8_t in_use[KB_LAYOUT_COUNT];
 static uint8_t in_use_n;

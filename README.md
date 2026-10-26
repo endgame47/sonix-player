@@ -447,6 +447,7 @@ build needs no Python at all. Re-run the script only when its input changes.
 | `src/system/net/webpage.h` | `web/index.html`, `web/icons`, `web/img` | `tools/web_to_c.py` |
 | `src/system/device/tzrules.c` | the system's tzdata (`/usr/share/zoneinfo`) | `tools/tz_rules.py` |
 | `ZAP_POINTS` in `src/system/device/chargescreen.c` | `assets/icons/zap-device-off.svg` | `tools/charge_zap.py` prints the table, to paste in |
+| `src/system/input/jpdict_data.c`, `jpdict_data.h` | the default dictionary of `lv_ime_jp_lite.c` | `tools/gen_jpdict.py` |
 
 ```bash
 pip install cairosvg pillow
@@ -457,7 +458,16 @@ python3 tools/web_to_c.py
 python3 tools/tz_rules.py > src/system/device/tzrules.c
 
 python3 tools/charge_zap.py
+
+python3 tools/gen_jpdict.py path/to/lv_ime_jp_lite.c
 ```
+
+The Japanese dictionary is the default one of `lv_ime_jp_lite.c`
+(https://github.com/fukuen/lvgl, a fork of LVGL with the Japanese IME added), which
+includes SKK-JISYO.S (https://github.com/skk-dev). The notices at the top of
+`lv_ime_jp_lite.c`, which give both under the GNU General Public License version 3,
+are copied into `jpdict_data.c` as they are, and the script records the exact
+upstream there.
 
 
 ## Source code tree
@@ -528,7 +538,7 @@ sonix-player/
 │   │   │   ├── ebook/               EPUB parsing: zip, XML, XHTML, CSS, OPF, arenas
 │   │   │   ├── gearboy/             the emulator's glue: input, ROM database, save states
 │   │   │   ├── image/               JPEG and PNG decoder
-│   │   │   ├── input/               key mapping, keyboard layouts
+│   │   │   ├── input/               key mapping, keyboard layouts, Japanese kana and kanji input
 │   │   │   ├── lastfm/              scrobbling
 │   │   │   ├── library/             index, tag reading, cover art, playlists, audiobooks, lyrics and
 │   │   │   │                        LRCLIB, play counts

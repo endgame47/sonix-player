@@ -1,6 +1,8 @@
 #include "keyboard.h"
 
 #include "src/gui/shell/popover.h"
+#include "src/system/input/jpdict.h"
+#include "src/system/input/kana.h"
 #include "src/system/input/kblayout.h"
 
 #include <stdint.h>
@@ -26,6 +28,21 @@
 // ---------------------------------------------------------------------------
 
 #define KB_MAX_KEYS KB_LAYOUT_MAX_KEYS
+
+// What the Japanese layout's letter rows type: romaji turned into hiragana or
+// into katakana, or the Latin letters as they are. The key beside "123" steps
+// through them. A keyboard opens in KB_JP_DEFAULT_MODE; password fields are
+// always typed as Latin, whatever this says.
+enum { KB_JP_HIRAGANA = 0, KB_JP_KATAKANA, KB_JP_LATIN, KB_JP_MODE_COUNT };
+#define KB_JP_DEFAULT_MODE KB_JP_HIRAGANA
+
+// The kanji candidates offered for the hiragana before the caret (jpdict.c):
+// how many buttons the strip has (a reading can have dozens of candidates, so
+// the strip pages through them with a key at its end), and how many characters
+// back a reading may start.
+#define KB_CAND_PAGE 6
+#define KB_CAND_READING_CHARS 8
+#define KB_CAND_READING_BYTES (3 * KB_CAND_READING_CHARS + 1)
 
 // A letter key's event user data is the instance and the index packed
 // together, because LVGL gives a callback exactly one pointer. One set per
@@ -72,6 +89,22 @@ static const char *const KB_SYM2_ROWS[KB_LAYOUT_ROWS] = {
 // exists in both modes; in number mode shift turns to the second symbol set.
 // ---------------------------------------------------------------------------
 #define KB_T9_KEYS KB_LAYOUT_T9_KEYS
+#define KB_T9_MAX_KEYS KANA_KEY_COUNT // the kana pad's keys share the T9 key handler and its references
+#define KB_KP_KEYS KANA_KEY_COUNT	  // the keys of the Japanese kana pad
+
+// The dakuten / handakuten / small-kana key is three labels in a row (the voiced
+// mark, "small", the half-voiced mark), so that the gaps between them can be set
+// one by one: the two marks are spacing characters whose ink sits in a corner of
+// their cell, and in a single label the gaps came out unequal.
+#define KB_MARK_GAP_BEFORE 0	 // pixels between the voiced mark and "small"
+#define KB_MARK_GAP_AFTER 3		 // pixels between "small" and the half-voiced mark
+#define KB_MARK_SHIFT_DAKUTEN 15 // pixels the voiced mark is drawn to the right: its ink is in the left of its cell
+#define KB_PUNCT_SHIFT 6		 // pixels the punctuation key's label is drawn to the right: same reason
+
+// A finger that travels this many pixels across a kana key before it lifts has
+// flicked it (kana_flick_dir): the kana of that direction is written, and the
+// key is not tapped. Less than this, and it is a tap.
+#define KB_FLICK_THRESHOLD 22
 #define KB_T9_COMMIT_MS 800
 
 // Number mode: the digit first, then the sixteen symbols of the first QWERTY
@@ -124,7 +157,7 @@ struct keyboard_s {
 	lv_obj_t *t9_shift_btn;
 	lv_obj_t *t9_shift_icon;
 	lv_obj_t *t9_accept_btn;
-	key_ref_t t9_refs[KB_T9_KEYS];
+	key_ref_t t9_refs[KB_T9_MAX_KEYS];
 	int t9_last_key; // -1 = no pending character
 	int t9_tap;		 // position in the key's cycle
 	lv_timer_t *t9_timer; // the pause that commits the character
@@ -148,6 +181,55 @@ struct keyboard_s {
 	int variant_count;
 	int variant_sel; // -1 while the strip is closed
 	bool variant_swallow;
+
+	// Japanese: the romaji that has not become kana yet (it is written into the
+	// field as typed, see kana_edit_key), where the caret stood after it so a
+	// tap elsewhere in the field is noticed, and the mode key beside "123" on the
+	// QWERTY rows. The kana pad is the third panel of the tray, a ten-key layout
+	// that is shown in place of the T9 panel for the Japanese layout while it
+	// types kana (kb_show_panel).
+	kana_t kana;
+	uint32_t kana_cursor;
+	uint8_t jp_mode;
+	lv_obj_t *jp_btn;
+	lv_obj_t *jp_label;
+	lv_obj_t *kpad;
+	lv_obj_t *kp_label[KB_KP_KEYS];
+	lv_obj_t *kp_jp_label;
+	lv_obj_t *kp_accept_btn;
+	bool kana_overflow; // a letter did not fit in the field (max length) while it was being written
+
+	// The Japanese parts (mode key, kana pad, candidate strip) are built the first
+	// time the layout is Japanese (kb_japanese_ensure), so that a keyboard that never
+	// types Japanese does not carry their objects. What building them needs is kept.
+	bool jp_built;
+	int jp_width, jp_height, jp_row_h, jp_key_w;
+	lv_obj_t *qwerty_row4;
+	const lv_image_dsc_t *accept_icon;
+	const char *accept_text;
+	lv_event_cb_t on_accept;
+	void *accept_user;
+	lv_obj_t *kp_btn[KB_KP_KEYS];
+	int flick_x, flick_y; // where the finger went down on a kana key
+	kana_dir_t flick_dir; // the direction it was last taking
+	bool flick_consumed;  // the release was a flick: the click after it is not a tap
+
+	// Kanji candidates: the strip above the tray (it lives in the host page, like
+	// the bubble), one button per candidate of the page shown, and what it was
+	// built from -- the reading, how many characters of the field that is, and the
+	// entry's hit. The field is the only truth: the strip is rebuilt from the text
+	// before the caret after every edit (kb_cand_refresh), and checked again before
+	// a pick.
+	lv_obj_t *cand_bar;
+	lv_obj_t *cand_list;
+	lv_obj_t *cand_next;
+	lv_obj_t *cand_btn[KB_CAND_PAGE];
+	lv_obj_t *cand_label[KB_CAND_PAGE];
+	key_ref_t cand_refs[KB_CAND_PAGE];
+	jpdict_hit_t cand_hit;
+	char cand_reading[KB_CAND_READING_BYTES];
+	unsigned cand_chars;
+	int cand_page;
 
 	bool mode_long_pressed; // the "123" key opened the layout menu; eat its click
 	bool shift;
@@ -192,6 +274,207 @@ static lv_color_t kb_tray_color(void) {
 	return theme()->dark ? lv_color_make(22, 22, 22) : lv_color_make(206, 209, 216);
 }
 
+// ---------------------------------------------------------------------------
+// Japanese: romaji to kana on the letter rows (kana.c)
+// ---------------------------------------------------------------------------
+
+// A password is typed as Latin, whatever the Japanese mode key was left at.
+static bool kb_is_password(const keyboard_t *kb) { return kb->field && lv_textarea_get_password_mode(kb->field); }
+
+// The mode of the Japanese layout as it is in force.
+static uint8_t kb_jp_mode_now(const keyboard_t *kb) { return kb_is_password(kb) ? KB_JP_LATIN : kb->jp_mode; }
+
+// Romaji becomes kana on the letter rows of the Japanese layout, except in a
+// password, where what is typed has to be what is stored.
+static bool kb_romaji_active(const keyboard_t *kb) { return kb->layout == KB_LAYOUT_JAPANESE && !kb->symbols && kb->jp_mode != KB_JP_LATIN && kb->field && !lv_textarea_get_password_mode(kb->field); }
+
+// The keypad shows kana, not Latin letters or digits: the Japanese layout, in
+// hiragana or katakana, on the letters page.
+static bool kb_t9_kana(const keyboard_t *kb) { return kb->layout == KB_LAYOUT_JAPANESE && kb->jp_mode != KB_JP_LATIN && !kb->t9_numbers; }
+
+// Which of the three panels of the tray is showing. The QWERTY is the default
+// and the T9 panel is for [other] keyboard_t9. On the Japanese layout the T9
+// setting shows the kana pad, with the ten-key layout of a Japanese phone;
+// Latin letters ("A" on the mode key) are typed on the QWERTY, since "abc" on
+// ten keys is of no use for romaji. The number page is the T9 panel's. A password
+// field is always typed on the QWERTY.
+static void kb_show_panel(keyboard_t *kb) {
+	if (!kb->qwerty || !kb->t9) {
+		return;
+	}
+	bool t9 = config_get_int("other", "keyboard_t9", 0) != 0;
+	bool japanese = kb->layout == KB_LAYOUT_JAPANESE && !kb->t9_numbers;
+	// What is typed into a password has to be what is stored: Latin, on the QWERTY.
+	bool password = kb->field && lv_textarea_get_password_mode(kb->field);
+	bool kana_pad = kb->kpad && t9 && japanese && kb->jp_mode != KB_JP_LATIN && !password;
+	bool qwerty = !t9 || (japanese && (kb->jp_mode == KB_JP_LATIN || password));
+	if (kb->kpad) {
+		lv_obj_set_hidden(kb->kpad, !kana_pad);
+	}
+	lv_obj_set_hidden(kb->qwerty, !qwerty);
+	lv_obj_set_hidden(kb->t9, qwerty || kana_pad);
+}
+
+static void kb_kana_erase(void *ctx, int count) {
+	keyboard_t *kb = ctx;
+	for (int i = 0; i < count; i++) {
+		lv_textarea_delete_char(kb->field);
+	}
+}
+
+// How many characters (not bytes) a UTF-8 text has.
+static unsigned kb_utf8_count(const char *text) {
+	unsigned count = 0;
+	for (; *text; text++) {
+		if (((unsigned char)*text & 0xC0) != 0x80) {
+			count++;
+		}
+	}
+	return count;
+}
+
+static void kb_kana_insert(void *ctx, const char *text) {
+	keyboard_t *kb = ctx;
+	uint32_t before = lv_textarea_get_cursor_pos(kb->field);
+	lv_textarea_add_text(kb->field, text);
+	if (lv_textarea_get_cursor_pos(kb->field) - before < kb_utf8_count(text)) {
+		kb->kana_overflow = true; // a field with a maximum length is full
+	}
+}
+
+static const kana_sink_t KB_KANA_SINK = {kb_kana_erase, kb_kana_insert};
+
+// The waiting letters are in the field, in front of the caret. If the caret has
+// been moved since, they are ordinary text now and are left alone.
+static void kb_kana_check_caret(keyboard_t *kb) {
+	if (kana_pending(&kb->kana)[0] && (!kb->field || lv_textarea_get_cursor_pos(kb->field) != kb->kana_cursor)) {
+		kana_reset(&kb->kana);
+	}
+}
+
+// Settles what is waiting: a lone "n" becomes the kana n, other letters stay as typed.
+static void kb_kana_flush(keyboard_t *kb) {
+	kb_kana_check_caret(kb);
+	if (kana_pending(&kb->kana)[0]) {
+		kana_edit_flush(&kb->kana, kb->jp_mode == KB_JP_KATAKANA, &KB_KANA_SINK, kb);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Japanese: kanji candidates (jpdict.c)
+//
+// There is no pre-edit string: the kana are already in the field. So the
+// candidates are offered for the hiragana just before the caret, the longest
+// run the dictionary knows, and picking one swaps that run for the candidate.
+// A verb or adjective stem comes out with its okurigana put back, so a candidate
+// always stands for the whole run. The reading is offered again after every
+// edit, so the strip is only ever as old as the last key.
+// ---------------------------------------------------------------------------
+
+static void kb_cand_hide(keyboard_t *kb) {
+	kb->cand_chars = 0;
+	kb->cand_page = 0;
+	kb->cand_reading[0] = '\0';
+	if (kb->cand_bar) {
+		lv_obj_set_hidden(kb->cand_bar, true);
+	}
+}
+
+// Kanji are offered while typing hiragana, in the Japanese layout, into a
+// field that is not a password, with the keyboard on screen.
+static bool kb_cand_active(const keyboard_t *kb) { return kb->layout == KB_LAYOUT_JAPANESE && kb->jp_mode == KB_JP_HIRAGANA && !kb->symbols && !kb->t9_numbers && kb->field && !lv_textarea_get_password_mode(kb->field) && kb->tray && !lv_obj_is_hidden(kb->tray); }
+
+// The buttons carry the candidates of the current page; the key at the end
+// turns the page and is there only when there is more than one.
+static void kb_cand_show_page(keyboard_t *kb) {
+	char text[JPDICT_CAND_MAX];
+	for (int i = 0; i < KB_CAND_PAGE; i++) {
+		int index = kb->cand_page * KB_CAND_PAGE + i;
+		bool on = index < kb->cand_hit.count && jpdict_candidate(&kb->cand_hit, index, text, sizeof(text)) > 0;
+		lv_obj_set_hidden(kb->cand_btn[i], !on);
+		if (on) {
+			lv_label_set_text(kb->cand_label[i], text);
+		}
+	}
+	lv_obj_set_hidden(kb->cand_next, kb->cand_hit.count <= KB_CAND_PAGE);
+	lv_obj_scroll_to_x(kb->cand_list, 0, LV_ANIM_OFF);
+}
+
+static void kb_cand_refresh(keyboard_t *kb) {
+	if (!kb->cand_bar) {
+		return; // still being built
+	}
+	if (!kb_cand_active(kb) || kana_pending(&kb->kana)[0]) {
+		kb_cand_hide(kb); // a romaji letter still waiting is not a reading yet
+		return;
+	}
+	jpdict_hit_t hit;
+	char reading[KB_CAND_READING_BYTES];
+	unsigned chars = 0;
+	if (!jpdict_lookup_before(lv_textarea_get_text(kb->field), lv_textarea_get_cursor_pos(kb->field), KB_CAND_READING_CHARS, &hit, reading, sizeof(reading), &chars)) {
+		kb_cand_hide(kb);
+		return;
+	}
+
+	// The same reading as a moment ago (a shift tap passes through here too)
+	// keeps the page the finger turned to.
+	bool same = chars == kb->cand_chars && strcmp(reading, kb->cand_reading) == 0;
+	kb->cand_hit = hit;
+	kb->cand_chars = chars;
+	snprintf(kb->cand_reading, sizeof(kb->cand_reading), "%s", reading);
+	if (!same) {
+		kb->cand_page = 0;
+	}
+	kb_cand_show_page(kb);
+	lv_obj_set_hidden(kb->cand_bar, false);
+}
+
+static void kb_cand_next_cb(lv_event_t *e) {
+	keyboard_t *kb = lv_event_get_user_data(e);
+	if (!kb || !kb->cand_chars) {
+		return;
+	}
+	int pages = (kb->cand_hit.count + KB_CAND_PAGE - 1) / KB_CAND_PAGE;
+	kb->cand_page = (kb->cand_page + 1) % pages; // after the last page, the first again
+	kb_cand_show_page(kb);
+}
+
+static void kb_cand_cb(lv_event_t *e) {
+	key_ref_t *ref = lv_event_get_user_data(e);
+	if (!ref || !ref->kb || !ref->kb->field) {
+		return;
+	}
+	keyboard_t *kb = ref->kb;
+
+	// The caret may have been moved, or the text changed by the page, since the
+	// strip was built. Take the reading again and pick only if it is the same
+	// one; otherwise show what is really there and leave the text alone.
+	jpdict_hit_t now_hit;
+	char now[KB_CAND_READING_BYTES];
+	unsigned now_chars = 0;
+	if (!kb->cand_chars || !jpdict_lookup_before(lv_textarea_get_text(kb->field), lv_textarea_get_cursor_pos(kb->field), KB_CAND_READING_CHARS, &now_hit, now, sizeof(now), &now_chars) || now_chars != kb->cand_chars || strcmp(now, kb->cand_reading) != 0) {
+		kb_cand_refresh(kb);
+		return;
+	}
+
+	char cand[JPDICT_CAND_MAX];
+	if (jpdict_candidate(&kb->cand_hit, kb->cand_page * KB_CAND_PAGE + ref->index, cand, sizeof(cand)) == 0) {
+		return;
+	}
+	// A kana still cycling on the keypad is finished: tapping the same key again
+	// must start a new one, not cycle the kanji that is about to be put there.
+	kb->t9_last_key = -1;
+	kb->t9_tap = 0;
+	if (kb->t9_timer) {
+		lv_timer_pause(kb->t9_timer);
+	}
+	for (unsigned i = 0; i < kb->cand_chars; i++) {
+		lv_textarea_delete_char(kb->field);
+	}
+	lv_textarea_add_text(kb->field, cand);
+	kb_cand_hide(kb); // the new text is not offered again until the next key
+}
+
 // How many keys a row of the panel carries now, and what the one at `col`
 // says. The symbol page and the alphabets are asked in the same shape, so
 // everything above them treats a key as a place on a grid rather than as a
@@ -200,8 +483,16 @@ static int kb_row_len(const keyboard_t *kb, int row) {
 	if (row < 0 || row >= KB_LAYOUT_ROWS) {
 		return 0;
 	}
-	return kb->symbols ? (int)strlen((kb->symbols2 ? KB_SYM2_ROWS : KB_SYM_ROWS)[row])
-					   : kblayout_row_len(kb->layout, row);
+	if (kb->symbols) {
+		return (int)strlen((kb->symbols2 ? KB_SYM2_ROWS : KB_SYM_ROWS)[row]);
+	}
+	int len = kblayout_row_len(kb->layout, row);
+	// The "-" at the end of the Japanese layout's third row types the long-vowel
+	// mark. In Latin mode it would be a key the English layout does not have.
+	if (kb->layout == KB_LAYOUT_JAPANESE && kb_jp_mode_now(kb) == KB_JP_LATIN && row == 2) {
+		len--;
+	}
+	return len;
 }
 
 static const char *kb_key_text(const keyboard_t *kb, int row, int col) {
@@ -217,12 +508,25 @@ static const char *kb_key_text(const keyboard_t *kb, int row, int col) {
 	return kblayout_letter(kb->layout, row, col, kb->shift);
 }
 
+// What a letter key is labelled with. The "-" of the Japanese layout types the
+// long-vowel mark while romaji is being turned into kana, and says so.
+static const char *kb_key_cap(const keyboard_t *kb, int row, int col) {
+	const char *text = kb_key_text(kb, row, col);
+	if (text[0] == '-' && !text[1] && !kb->shift && kb_romaji_active(kb)) {
+		return "\xe3\x83\xbc"; // the long-vowel mark
+	}
+	return text;
+}
+
 static void kb_refresh_caps(keyboard_t *kb); // just below, once the keys are placed
 
 // One step of a keypad key's cycle, and how many steps it has. The number page
 // is the same everywhere and stays a plain byte table; the letters come from
 // the alphabet in use, which may be Cyrillic and so cannot be indexed by byte.
 static int kb_t9_len(const keyboard_t *kb, int key) {
+	if (kb_t9_kana(kb)) {
+		return kana_key_len(key);
+	}
 	if (key < 0 || key >= KB_T9_KEYS) {
 		return 0;
 	}
@@ -231,6 +535,9 @@ static int kb_t9_len(const keyboard_t *kb, int key) {
 }
 
 static const char *kb_t9_step(const keyboard_t *kb, int key, int tap) {
+	if (kb_t9_kana(kb)) {
+		return kana_key_step(key, tap, kb->jp_mode == KB_JP_KATAKANA);
+	}
 	if (kb->t9_numbers) {
 		static char one[2];
 		one[0] = (kb->symbols2 ? KB_T9_NUM2 : KB_T9_NUM)[key][tap];
@@ -246,9 +553,14 @@ static const char *kb_t9_step(const keyboard_t *kb, int key, int tap) {
 // The keys are re-parented rather than rebuilt: a change of layout or a tap on
 // "123" would otherwise destroy and recreate thirty buttons, and destroying a
 // widget while a finger is on it is how a keyboard crashes.
+static void kb_japanese_ensure(keyboard_t *kb); // below, with the keys it builds
+
 static void kb_apply_layout(keyboard_t *kb) {
 	if (!kb->rows[0]) {
 		return;
+	}
+	if (kb->layout == KB_LAYOUT_JAPANESE) {
+		kb_japanese_ensure(kb);
 	}
 
 	int index = 0;
@@ -304,6 +616,7 @@ static void kb_layout_pick(void *user) {
 		return;
 	}
 	keyboard_t *kb = layout_choices[i].kb;
+	kb_kana_flush(kb); // the romaji typed so far belongs to the layout being left
 	kb->layout = layout_choices[i].layout;
 	kb->symbols = false;	 // the letters are the point of the choice
 	kb->symbols2 = false;
@@ -315,7 +628,14 @@ static void kb_layout_pick(void *user) {
 // The page carrying this keyboard has been left.
 static void kb_screen_left_cb(lv_event_t *e) {
 	keyboard_t *kb = lv_event_get_user_data(e);
-	if (!kb || kb->layout == kblayout_default()) {
+	if (!kb) {
+		return;
+	}
+	kana_reset(&kb->kana); // the field is not in front of anyone any more
+	kb_cand_hide(kb);
+	kb->jp_mode = KB_JP_DEFAULT_MODE;
+	if (kb->layout == kblayout_default()) {
+		kb_apply_layout(kb); // the mode key and the third row follow the mode it was put back to
 		return;
 	}
 	kb->layout = kblayout_default();
@@ -354,10 +674,25 @@ static void kb_layouts_cb(lv_event_t *e) {
 
 // Repaints the letter caps and the shift key for the current mode.
 static void kb_refresh_caps(keyboard_t *kb) {
+	kb_show_panel(kb);
 	for (int i = 0; i < kb->key_count; i++) {
-		lv_label_set_text(kb->letter_label[i], kb_key_text(kb, kb->key_row[i], kb->key_col[i]));
+		lv_label_set_text(kb->letter_label[i], kb_key_cap(kb, kb->key_row[i], kb->key_col[i]));
 	}
 	lv_label_set_text(kb->mode_label, kb->symbols ? "abc" : "123");
+
+	// The Japanese keys exist only in the Japanese layout: the mode key beside
+	// "123" on the QWERTY rows (not on the symbol pages), and on the kana pad.
+	bool japanese = kb->layout == KB_LAYOUT_JAPANESE;
+	const char *jp_cap = kb->jp_mode == KB_JP_KATAKANA ? "\xe3\x82\xa2" // katakana A
+						 : kb->jp_mode == KB_JP_LATIN  ? "A"
+													   : "\xe3\x81\x82"; // hiragana A
+	if (kb->jp_btn) {
+		lv_obj_set_hidden(kb->jp_btn, !japanese || kb->symbols || kb_is_password(kb));
+		lv_label_set_text(kb->jp_label, jp_cap);
+	}
+	if (kb->kp_jp_label) {
+		lv_label_set_text(kb->kp_jp_label, jp_cap);
+	}
 
 	// Shift wears the caps-lock icon while caps lock is on (set by a fast
 	// double tap), on both keyboards.
@@ -397,6 +732,13 @@ static void kb_refresh_caps(keyboard_t *kb) {
 		}
 		lv_label_set_text(kb->t9_label[i], cap);
 	}
+	// The kana pad's caps: the first kana of each row, hiragana or katakana (tap a
+	// key again for the next kana of its row).
+	for (int i = 0; i < KB_KP_KEYS; i++) {
+		if (kb->kp_label[i] && i != KANA_KEY_MARK) {
+			lv_label_set_text(kb->kp_label[i], kana_key_cap(i, kb->jp_mode == KB_JP_KATAKANA));
+		}
+	}
 	if (kb->t9_mode_label) {
 		lv_label_set_text(kb->t9_mode_label, kb->t9_numbers ? "abc" : "123");
 	}
@@ -414,6 +756,10 @@ static void kb_refresh_caps(keyboard_t *kb) {
 		}
 		lv_obj_set_style_image_recolor_opa(kb->t9_shift_icon, LV_OPA_COVER, 0);
 	}
+
+	// Every change of mode, layout or field passes through here, and the strip
+	// follows what the keyboard now types.
+	kb_cand_refresh(kb);
 }
 
 // ---------------------------------------------------------------------------
@@ -453,8 +799,12 @@ static void kb_t9_key_cb(lv_event_t *e) {
 		return;
 	}
 	keyboard_t *kb = ref->kb;
+	if (kb->flick_consumed) {
+		kb->flick_consumed = false; // the release was a flick, already written
+		return;
+	}
 	int k = ref->index;
-	if (k < 0 || k >= KB_T9_KEYS) {
+	if (k < 0 || k >= KB_T9_MAX_KEYS) {
 		return;
 	}
 
@@ -478,6 +828,7 @@ static void kb_t9_key_cb(lv_event_t *e) {
 	}
 
 	lv_textarea_add_text(kb->field, kb_t9_step(kb, k, kb->t9_tap));
+	kb_cand_refresh(kb);
 
 	if (kb->t9_timer) {
 		lv_timer_reset(kb->t9_timer);
@@ -494,6 +845,7 @@ static void kb_t9_space_cb(lv_event_t *e) {
 	}
 	kb_t9_commit(kb);
 	lv_textarea_add_text(kb->field, " ");
+	kb_cand_refresh(kb);
 }
 
 // The letters <-> numbers switch: the key that always sits first on the bottom
@@ -534,13 +886,33 @@ static void kb_t9_shift_cb(lv_event_t *e) {
 	kb_shift_press(kb);
 }
 
+// The kana pad's dakuten key: the kana before the caret takes its next form
+// (ka -> ga -> ka, ha -> ba -> pa -> ha, tsu -> small tsu -> dzu -> tsu), the way
+// the * key of a Japanese phone does.
+static void kb_t9_mark_cb(lv_event_t *e) {
+	keyboard_t *kb = lv_event_get_user_data(e);
+	if (!kb || !kb->field) {
+		return;
+	}
+	kb_t9_commit(kb); // the kana being cycled is finished: the mark is for it
+	char prev[8], next[8];
+	if (!kana_prev_char(lv_textarea_get_text(kb->field), lv_textarea_get_cursor_pos(kb->field), prev, sizeof(prev)) || !kana_cycle_mark(prev, next, sizeof(next))) {
+		return;
+	}
+	lv_textarea_delete_char(kb->field);
+	lv_textarea_add_text(kb->field, next);
+	kb_cand_refresh(kb);
+}
+
 // ---------------------------------------------------------------------------
 // keys
 // ---------------------------------------------------------------------------
 
 // Writes one letter and consumes a one-shot shift.
 static void kb_type(keyboard_t *kb, const char *text) {
+	kb_kana_flush(kb); // a capital or an accented letter ends the romaji before it
 	lv_textarea_add_text(kb->field, text);
+	kb_cand_refresh(kb);
 	if (kb->symbols) {
 		return; // on the symbol pages shift picks the page and stays
 	}
@@ -565,7 +937,24 @@ static void kb_letter_cb(lv_event_t *e) {
 		kb->variant_swallow = false; // the hold wrote its letter on release
 		return;
 	}
-	kb_type(kb, kb_key_text(kb, kb->key_row[index], kb->key_col[index]));
+	const char *text = kb_key_text(kb, kb->key_row[index], kb->key_col[index]);
+
+	// A lower case letter on the Japanese layout is romaji. With shift it is the
+	// Latin capital, as typed, so a word in English can be spelled out.
+	if (kb_romaji_active(kb) && !kb->shift && text[0] && !text[1]) {
+		kb_kana_check_caret(kb);
+		kb->kana_overflow = false;
+		kana_edit_key(&kb->kana, kb->jp_mode == KB_JP_KATAKANA, (unsigned char)text[0], &KB_KANA_SINK, kb);
+		if (kb->kana_overflow) {
+			// A waiting letter that did not fit is not in the field: the next letter
+			// must not take back a character that is.
+			kana_reset(&kb->kana);
+		}
+		kb->kana_cursor = lv_textarea_get_cursor_pos(kb->field);
+		kb_cand_refresh(kb);
+		return;
+	}
+	kb_type(kb, text);
 }
 
 // A second shift tap within this window turns caps lock on.
@@ -604,6 +993,13 @@ static void kb_shift_cb(lv_event_t *e) {
 static void kb_delete_cb(lv_event_t *e) {
 	keyboard_t *kb = lv_event_get_user_data(e);
 	if (kb && kb->field) {
+		// A romaji letter still waiting goes first, one at a time.
+		kb_kana_check_caret(kb);
+		if (kana_edit_backspace(&kb->kana, &KB_KANA_SINK, kb)) {
+			kb->kana_cursor = lv_textarea_get_cursor_pos(kb->field);
+			kb_cand_refresh(kb);
+			return;
+		}
 		// A pending T9 character is exactly the one being deleted, so the
 		// cycle resets without consuming shift.
 		kb->t9_last_key = -1;
@@ -612,6 +1008,7 @@ static void kb_delete_cb(lv_event_t *e) {
 			lv_timer_pause(kb->t9_timer);
 		}
 		lv_textarea_delete_char(kb->field);
+		kb_cand_refresh(kb);
 	}
 }
 
@@ -627,6 +1024,7 @@ static void kb_mode_cb(lv_event_t *e) {
 		kb->mode_long_pressed = false;
 		return;
 	}
+	kb_kana_flush(kb); // the symbol pages are typed as they are
 	kb->symbols = !kb->symbols;
 	kb->symbols2 = false;
 	kb->shift = false;
@@ -638,7 +1036,33 @@ static void kb_mode_cb(lv_event_t *e) {
 static void kb_space_cb(lv_event_t *e) {
 	keyboard_t *kb = lv_event_get_user_data(e);
 	if (kb && kb->field) {
+		kb_kana_flush(kb); // a waiting n becomes its kana before the space
 		lv_textarea_add_text(kb->field, " ");
+		kb_cand_refresh(kb);
+	}
+}
+
+// The key beside "123" on the Japanese layout: hiragana -> katakana -> Latin.
+static void kb_jp_mode_cb(lv_event_t *e) {
+	keyboard_t *kb = lv_event_get_user_data(e);
+	if (!kb) {
+		return;
+	}
+	if (kb->field) {
+		kb_kana_flush(kb); // what was typed is settled in the mode it was typed in
+	}
+	kb_t9_commit(kb);	  // and a kana still cycling on the keypad
+	kb->t9_last_key = -1; // a cycle does not carry across a table change
+	kb->jp_mode = (uint8_t)((kb->jp_mode + 1) % KB_JP_MODE_COUNT);
+	kb_apply_layout(kb); // the third row is one key shorter in Latin mode
+}
+
+// Pressed before the page's own accept handler (registered after it in
+// keyboard_create), so a waiting n is its kana by the time the page reads the field.
+static void kb_accept_flush_cb(lv_event_t *e) {
+	keyboard_t *kb = lv_event_get_user_data(e);
+	if (kb && kb->field) {
+		kb_kana_flush(kb);
 	}
 }
 
@@ -918,6 +1342,88 @@ static lv_obj_t *kb_key_icon(lv_obj_t *btn, const lv_image_dsc_t *glyph) {
 	return icon;
 }
 
+// Flick on the kana pad. The finger's way across the key is followed while it
+// is down, the bubble above the key shows the kana that letting go would write,
+// and the release writes it. A tap, which does not travel, is left to the T9
+// handler (kb_t9_key_cb), which steps through the row; a flick that has been
+// written tells it to ignore the click that comes after the release.
+static void kb_flick_cb(lv_event_t *e) {
+	key_ref_t *ref = lv_event_get_user_data(e);
+	if (!ref || !ref->kb || ref->index < 0 || ref->index >= KB_KP_KEYS) {
+		return;
+	}
+	keyboard_t *kb = ref->kb;
+	lv_event_code_t code = lv_event_get_code(e);
+
+	lv_point_t point = {0, 0};
+	lv_indev_t *indev = lv_indev_active();
+	if (indev) {
+		lv_indev_get_point(indev, &point);
+	}
+
+	if (code == LV_EVENT_PRESSED) {
+		kb->flick_x = point.x;
+		kb->flick_y = point.y;
+		kb->flick_dir = KANA_DIR_CENTER;
+		kb->flick_consumed = false; // a fresh press, whatever the last one left
+		return;
+	}
+
+	kana_dir_t dir = indev ? kana_flick_dir(point.x - kb->flick_x, point.y - kb->flick_y, KB_FLICK_THRESHOLD) : kb->flick_dir;
+	bool katakana = kb->jp_mode == KB_JP_KATAKANA;
+	const char *kana = kana_flick_step(ref->index, dir, katakana);
+
+	if (code == LV_EVENT_PRESSING) {
+		if (dir != kb->flick_dir) {
+			kb->flick_dir = dir;
+			if (dir != KANA_DIR_CENTER && kana[0] && kb->kp_btn[ref->index]) {
+				kb_preview_show(kb, kb->kp_btn[ref->index], kana);
+			} else {
+				kb_preview_hide(kb);
+			}
+		}
+		return;
+	}
+
+	// LV_EVENT_RELEASED, or LV_EVENT_PRESS_LOST when the finger left the key.
+	kb_preview_hide(kb);
+	if (dir == KANA_DIR_CENTER) {
+		return; // a tap
+	}
+	if (code == LV_EVENT_RELEASED) {
+		kb->flick_consumed = true; // the click that follows is the same gesture
+	}
+	if (kana[0] && kb->field) {
+		kb_t9_commit(kb); // a kana still cycling on the keys is finished
+		lv_textarea_add_text(kb->field, kana);
+		kb_cand_refresh(kb);
+	}
+}
+
+// A key of the kana pad: the first kana of its row on the cap, and the T9
+// handler under it, so tapping again steps through the row; flicking it writes
+// the kana of that direction.
+static lv_obj_t *kb_make_kana_key(keyboard_t *kb, lv_obj_t *row, int width, int k) {
+	kb->t9_refs[k].kb = kb;
+	kb->t9_refs[k].index = k;
+	lv_obj_t *btn = kb_make_key(row, width, kb_t9_key_cb, &kb->t9_refs[k]);
+	kb->kp_btn[k] = btn;
+	lv_obj_add_event_cb(btn, kb_flick_cb, LV_EVENT_PRESSED, &kb->t9_refs[k]);
+	lv_obj_add_event_cb(btn, kb_flick_cb, LV_EVENT_PRESSING, &kb->t9_refs[k]);
+	lv_obj_add_event_cb(btn, kb_flick_cb, LV_EVENT_RELEASED, &kb->t9_refs[k]);
+	lv_obj_add_event_cb(btn, kb_flick_cb, LV_EVENT_PRESS_LOST, &kb->t9_refs[k]);
+	kb->kp_label[k] = lv_label_create(btn);
+	lv_obj_add_style(kb->kp_label[k], &theme_style_text, 0);
+	// The punctuation key is as wide as half a key, and carries two marks.
+	lv_obj_set_style_text_font(kb->kp_label[k], k == 9 ? &font_ui_20 : &font_ui_26, 0);
+	lv_obj_set_style_text_align(kb->kp_label[k], LV_TEXT_ALIGN_CENTER, 0);
+	lv_obj_center(kb->kp_label[k]);
+	if (k == 9) {
+		lv_obj_set_style_translate_x(kb->kp_label[k], KB_PUNCT_SHIFT, 0); // moves the ink, not the layout
+	}
+	return btn;
+}
+
 // Letter keys carry the preview bubble; the control keys (shift, delete, 123,
 // space, accept) do not, exactly like a phone keyboard.
 static void kb_attach_preview(lv_obj_t *btn, key_ref_t *ref) {
@@ -936,9 +1442,15 @@ static void kb_refresh_theme(void) {
 		if (kb->t9_accept_btn) {
 			lv_obj_set_style_bg_color(kb->t9_accept_btn, theme()->accent, 0);
 		}
+		if (kb->kp_accept_btn) {
+			lv_obj_set_style_bg_color(kb->kp_accept_btn, theme()->accent, 0);
+		}
 		if (kb->tray) {
 			lv_obj_set_style_bg_color(kb->tray, kb_tray_color(), 0);
 			lv_obj_set_style_bg_opa(kb->tray, LV_OPA_COVER, 0);
+		}
+		if (kb->cand_bar) {
+			lv_obj_set_style_bg_color(kb->cand_bar, kb_tray_color(), 0);
 		}
 		kb_refresh_caps(kb);
 	}
@@ -946,6 +1458,166 @@ static void kb_refresh_theme(void) {
 	for (int i = 0; i < caret_field_count; i++) {
 		keyboard_style_caret(caret_fields[i]);
 	}
+}
+
+// The Japanese parts of the keyboard, built the first time its layout is Japanese
+// (kb_japanese_ensure): the mode key on the QWERTY rows, the kana pad of the tray
+// and the candidate strip above it. A keyboard that never types Japanese does not
+// carry them.
+static void kb_build_japanese(keyboard_t *kb) {
+	int width = kb->jp_width;
+	int height = kb->jp_height;
+	int row_h = kb->jp_row_h;
+	int key_w = kb->jp_key_w;
+	lv_obj_t *parent = kb->host;
+	const lv_image_dsc_t *accept_icon = kb->accept_icon;
+	const char *accept_text = kb->accept_text;
+	lv_event_cb_t on_accept = kb->on_accept;
+	void *user = kb->accept_user;
+
+	// The mode key sits right after "123": hiragana / katakana / Latin.
+	kb->jp_btn = kb_make_key(kb->qwerty_row4, key_w + 14, kb_jp_mode_cb, kb);
+	kb->jp_label = kb_key_label(kb->jp_btn);
+	lv_obj_move_to_index(kb->jp_btn, 1);
+
+	// --- the Japanese kana pad ---
+	// The ten-key layout of a Japanese phone, with the controls inside the grid so
+	// that the kana keys get the room:
+	//
+	//     a     ka    sa    <-
+	//     ta    na    ha    123
+	//     ma    ya    ra    space
+	//   marks   wa   [mode][punct]  search
+	//
+	// (the kana of the rows are the first of each row of the syllabary, the marks key
+	// is the dakuten / handakuten / small-kana key, and the punctuation key holds the
+	// comma, the full stop and a few more). The mode key steps through hiragana,
+	// katakana and Latin; Latin is typed on the QWERTY (kb_show_panel).
+	kb->kpad = lv_obj_create(kb->tray);
+	lv_obj_set_size(kb->kpad, lv_pct(100), lv_pct(100));
+	lv_obj_set_style_bg_opa(kb->kpad, 0, 0);
+	lv_obj_set_style_border_width(kb->kpad, 0, 0);
+	lv_obj_set_style_pad_all(kb->kpad, 0, 0);
+	lv_obj_set_style_pad_gap(kb->kpad, 7, 0);
+	lv_obj_set_scrollable(kb->kpad, false);
+	lv_obj_set_flex_flow(kb->kpad, LV_FLEX_FLOW_COLUMN);
+	lv_obj_set_flex_align(kb->kpad, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+	int kp_w = (width - 16 - 3 * 6) / 4;
+	int kp_half = (kp_w - 6) / 2;
+	for (int r = 0; r < 3; r++) {
+		lv_obj_t *prow = kb_make_row(kb->kpad, row_h);
+		for (int c = 0; c < 3; c++) {
+			kb_make_kana_key(kb, prow, kp_w, r * 3 + c);
+		}
+		if (r == 0) {
+			lv_obj_t *del = kb_make_key(prow, kp_w, kb_delete_cb, kb);
+			kb_key_icon(del, &icon_delete);
+			lv_obj_add_event_cb(del, kb_delete_cb, LV_EVENT_LONG_PRESSED_REPEAT, kb);
+		} else if (r == 1) {
+			// Letters <-> numbers, the same key as the T9 panel's; held, it offers the layouts.
+			lv_obj_t *mode = kb_make_key(prow, kp_w, kb_t9_mode_cb, kb);
+			lv_label_set_text(kb_key_label(mode), "123");
+			lv_obj_add_event_cb(mode, kb_layouts_cb, LV_EVENT_LONG_PRESSED, kb);
+		} else {
+			lv_obj_t *space = kb_make_key(prow, kp_w, kb_t9_space_cb, kb);
+			lv_label_set_text(kb_key_label(space), "\xe7\xa9\xba\xe7\x99\xbd"); // the word for "space", as on a Japanese phone
+		}
+	}
+	lv_obj_t *prow4 = kb_make_row(kb->kpad, row_h);
+	// The voiced / half-voiced / small form of the kana before the caret.
+	lv_obj_t *mark = kb_make_key(prow4, kp_w, kb_t9_mark_cb, kb);
+	lv_obj_t *mark_row = lv_obj_create(mark);
+	lv_obj_set_size(mark_row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+	lv_obj_set_style_bg_opa(mark_row, 0, 0);
+	lv_obj_set_style_border_width(mark_row, 0, 0);
+	lv_obj_set_style_pad_all(mark_row, 0, 0);
+	lv_obj_set_scrollable(mark_row, false);
+	lv_obj_set_clickable(mark_row, false); // the press belongs to the key
+	lv_obj_set_flex_flow(mark_row, LV_FLEX_FLOW_ROW);
+	lv_obj_set_flex_align(mark_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+	lv_obj_center(mark_row);
+	static const char *const MARK_PARTS[3] = {"\xe3\x82\x9b", "\xe5\xb0\x8f", "\xe3\x82\x9c"}; // voiced mark, "small", half-voiced mark
+	for (int i = 0; i < 3; i++) {
+		lv_obj_t *part = lv_label_create(mark_row);
+		lv_obj_add_style(part, &theme_style_text, 0);
+		lv_obj_set_style_text_font(part, &font_ui_26, 0);
+		lv_label_set_text(part, MARK_PARTS[i]);
+		if (i == 0) {
+			lv_obj_set_style_translate_x(part, KB_MARK_SHIFT_DAKUTEN, 0); // moves the ink, not the layout
+		}
+		if (i == 1) {
+			lv_obj_set_style_pad_left(part, KB_MARK_GAP_BEFORE, 0);
+			lv_obj_set_style_pad_right(part, KB_MARK_GAP_AFTER, 0);
+		}
+	}
+	kb_make_kana_key(kb, prow4, kp_w, 11); // the wa row
+	lv_obj_t *kp_jp = kb_make_key(prow4, kp_half, kb_jp_mode_cb, kb);
+	kb->kp_jp_label = kb_key_label(kp_jp);
+	kb_make_kana_key(kb, prow4, kp_half, 9); // the punctuation
+	kb->kp_accept_btn = kb_make_key(prow4, kp_w, NULL, NULL);
+	lv_obj_add_event_cb(kb->kp_accept_btn, kb_accept_flush_cb, LV_EVENT_CLICKED, kb);
+	if (on_accept) {
+		lv_obj_add_event_cb(kb->kp_accept_btn, on_accept, LV_EVENT_CLICKED, user);
+	}
+	lv_obj_set_style_bg_color(kb->kp_accept_btn, theme()->accent, 0);
+	if (accept_icon) {
+		lv_obj_t *glyph = kb_key_icon(kb->kp_accept_btn, accept_icon);
+		lv_obj_set_style_image_recolor(glyph, lv_color_white(), 0);
+	} else {
+		lv_obj_t *label = kb_key_label(kb->kp_accept_btn);
+		lv_label_set_text(label, tr(accept_text ? accept_text : "ok"));
+		lv_obj_set_style_text_color(label, lv_color_white(), 0);
+	}
+
+	// The kanji candidates: a strip standing on the tray, in the host page like
+	// the bubble so the keys keep their size. The candidates are buttons as wide
+	// as their text, in a row that scrolls sideways when they do not all fit; the
+	// key that turns the page stays at the right end, out of the row.
+	kb->cand_bar = lv_obj_create(parent);
+	lv_obj_set_size(kb->cand_bar, width, row_h);
+	lv_obj_align(kb->cand_bar, LV_ALIGN_BOTTOM_MID, 0, -height);
+	lv_obj_set_style_bg_color(kb->cand_bar, kb_tray_color(), 0);
+	lv_obj_set_style_bg_opa(kb->cand_bar, LV_OPA_COVER, 0);
+	lv_obj_set_style_border_width(kb->cand_bar, 0, 0);
+	lv_obj_set_style_radius(kb->cand_bar, 0, 0);
+	lv_obj_set_style_pad_all(kb->cand_bar, 6, 0);
+	lv_obj_set_scrollable(kb->cand_bar, false);
+
+	int next_w = key_w + 14;
+	kb->cand_next = kb_make_key(kb->cand_bar, next_w, kb_cand_next_cb, kb);
+	lv_obj_align(kb->cand_next, LV_ALIGN_RIGHT_MID, 0, 0);
+	lv_label_set_text(kb_key_label(kb->cand_next), ">");
+
+	kb->cand_list = lv_obj_create(kb->cand_bar);
+	lv_obj_set_size(kb->cand_list, width - 12 - next_w - 6, lv_pct(100));
+	lv_obj_align(kb->cand_list, LV_ALIGN_LEFT_MID, 0, 0);
+	lv_obj_set_style_bg_opa(kb->cand_list, 0, 0);
+	lv_obj_set_style_border_width(kb->cand_list, 0, 0);
+	lv_obj_set_style_pad_all(kb->cand_list, 0, 0);
+	lv_obj_set_style_pad_gap(kb->cand_list, 6, 0);
+	lv_obj_set_flex_flow(kb->cand_list, LV_FLEX_FLOW_ROW);
+	lv_obj_set_flex_align(kb->cand_list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+	lv_obj_set_scroll_dir(kb->cand_list, LV_DIR_HOR);
+	lv_obj_set_scrollbar_mode(kb->cand_list, LV_SCROLLBAR_MODE_OFF);
+	for (int i = 0; i < KB_CAND_PAGE; i++) {
+		kb->cand_refs[i].kb = kb;
+		kb->cand_refs[i].index = i;
+		kb->cand_btn[i] = kb_make_key(kb->cand_list, key_w, kb_cand_cb, &kb->cand_refs[i]);
+		lv_obj_set_width(kb->cand_btn[i], LV_SIZE_CONTENT);
+		lv_obj_set_style_min_width(kb->cand_btn[i], key_w, 0);
+		lv_obj_set_style_pad_hor(kb->cand_btn[i], 14, 0);
+		kb->cand_label[i] = kb_key_label(kb->cand_btn[i]);
+	}
+	kb_cand_hide(kb);
+	kb->jp_built = true;
+}
+
+static void kb_japanese_ensure(keyboard_t *kb) {
+	if (kb->jp_built || !kb->qwerty_row4 || !kb->tray) {
+		return;
+	}
+	kb_build_japanese(kb);
 }
 
 keyboard_t *keyboard_create(lv_obj_t *parent, int width, int height, lv_obj_t *field,
@@ -957,6 +1629,13 @@ keyboard_t *keyboard_create(lv_obj_t *parent, int width, int height, lv_obj_t *f
 	}
 	kb->field = field;
 	kb->host = parent;
+	kb->jp_mode = KB_JP_DEFAULT_MODE;
+	kb->jp_width = width;
+	kb->jp_height = height;
+	kb->accept_icon = accept_icon;
+	kb->accept_text = accept_text;
+	kb->on_accept = on_accept;
+	kb->accept_user = user;
 
 	kb->tray = lv_obj_create(parent);
 	lv_obj_set_size(kb->tray, width, height);
@@ -973,6 +1652,8 @@ keyboard_t *keyboard_create(lv_obj_t *parent, int width, int height, lv_obj_t *f
 
 	int row_h = (height - 16 - 3 * 7) / 4;
 	int key_w = (width - 16 - 9 * 6) / 10;
+	kb->jp_row_h = row_h;
+	kb->jp_key_w = key_w;
 	int index = 0;
 
 	// The two panels, stacked inside the tray: QWERTY and T9. Only one stays
@@ -1026,9 +1707,14 @@ keyboard_t *keyboard_create(lv_obj_t *parent, int width, int height, lv_obj_t *f
 	kb->mode_label = kb_key_label(mode);
 	// Held rather than tapped, the same key offers the other alphabets in use.
 	lv_obj_add_event_cb(mode, kb_layouts_cb, LV_EVENT_LONG_PRESSED, kb);
+	kb->qwerty_row4 = row4;
 	lv_obj_t *space = kb_make_key(row4, 0, kb_space_cb, kb); // grows
 	kb_key_icon(space, &icon_space);
-	kb->accept_btn = kb_make_key(row4, 84, on_accept, user);
+	kb->accept_btn = kb_make_key(row4, 84, NULL, NULL);
+	lv_obj_add_event_cb(kb->accept_btn, kb_accept_flush_cb, LV_EVENT_CLICKED, kb);
+	if (on_accept) {
+		lv_obj_add_event_cb(kb->accept_btn, on_accept, LV_EVENT_CLICKED, user);
+	}
 	lv_obj_set_style_bg_color(kb->accept_btn, theme()->accent, 0);
 	if (accept_icon) {
 		lv_obj_t *glyph = kb_key_icon(kb->accept_btn, accept_icon);
@@ -1082,7 +1768,11 @@ keyboard_t *keyboard_create(lv_obj_t *parent, int width, int height, lv_obj_t *f
 	lv_obj_t *t9_del = kb_make_key(t9_row4, key_w + 14, kb_delete_cb, kb);
 	kb_key_icon(t9_del, &icon_delete);
 	lv_obj_add_event_cb(t9_del, kb_delete_cb, LV_EVENT_LONG_PRESSED_REPEAT, kb);
-	kb->t9_accept_btn = kb_make_key(t9_row4, 84, on_accept, user);
+	kb->t9_accept_btn = kb_make_key(t9_row4, 84, NULL, NULL);
+	lv_obj_add_event_cb(kb->t9_accept_btn, kb_accept_flush_cb, LV_EVENT_CLICKED, kb);
+	if (on_accept) {
+		lv_obj_add_event_cb(kb->t9_accept_btn, on_accept, LV_EVENT_CLICKED, user);
+	}
 	lv_obj_set_style_bg_color(kb->t9_accept_btn, theme()->accent, 0);
 	if (accept_icon) {
 		lv_obj_t *glyph = kb_key_icon(kb->t9_accept_btn, accept_icon);
@@ -1098,12 +1788,8 @@ keyboard_t *keyboard_create(lv_obj_t *parent, int width, int height, lv_obj_t *f
 	kb->t9_timer = lv_timer_create(kb_t9_timer_cb, KB_T9_COMMIT_MS, kb);
 	lv_timer_pause(kb->t9_timer);
 
-	// One of the two panels is hidden, per the setting.
-	if (config_get_int("other", "keyboard_t9", 0) != 0) {
-		lv_obj_set_hidden(kb->qwerty, true);
-	} else {
-		lv_obj_set_hidden(kb->t9, true);
-	}
+	// One of the three panels shows, per the setting and the layout.
+	kb_show_panel(kb);
 
 	// The preview bubble lives above the keyboard, on the page itself, so it
 	// can overhang the top row.
@@ -1186,8 +1872,10 @@ void keyboard_set_visible(keyboard_t *kb, bool visible) {
 	}
 	if (visible) {
 		lv_obj_set_hidden(kb->tray, false);
+		kb_cand_refresh(kb);
 	} else {
 		lv_obj_set_hidden(kb->tray, true);
+		kb_cand_hide(kb);
 		kb_preview_hide(kb);
 		kb_variants_close(kb);
 	}
@@ -1198,6 +1886,8 @@ bool keyboard_is_visible(keyboard_t *kb) { return kb && kb->tray && !lv_obj_is_h
 void keyboard_set_field(keyboard_t *kb, lv_obj_t *field) {
 	if (kb) {
 		kb->field = field;
+		kana_reset(&kb->kana); // the waiting letters were in the other field
+		kb_apply_layout(kb);   // a password is typed as Latin: no mode key, no "-" key
 	}
 }
 
@@ -1308,6 +1998,13 @@ void keyboard_refresh_password(lv_obj_t *field) {
 	for (unsigned i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
 		lv_obj_set_style_pad_left(field, dots ? KB_PASSWORD_CARET_PAD : 0, parts[i]);
 	}
+
+	// A password is typed as Latin: the keyboard in front of it follows.
+	for (keyboard_t *kb = kb_list; kb; kb = kb->next) {
+		if (kb->field == field) {
+			kb_apply_layout(kb); // the mode key and the "-" key are not there for a password
+		}
+	}
 }
 
 static void kb_password_changed_cb(lv_event_t *e) { keyboard_refresh_password(lv_event_get_target(e)); }
@@ -1347,6 +2044,8 @@ void keyboard_reset(keyboard_t *kb) {
 	kb->t9_last_key = -1;
 	kb->t9_tap = 0;
 	kb->t9_numbers = false;
+	kana_reset(&kb->kana);
+	kb->jp_mode = KB_JP_DEFAULT_MODE;
 	if (kb->t9_timer) {
 		lv_timer_pause(kb->t9_timer);
 	}
@@ -1370,25 +2069,19 @@ void keyboard_refresh_layout(void) {
 			continue;
 		}
 		kb->layout = now;
+		kana_reset(&kb->kana);
 		kb_apply_layout(kb);
 	}
 }
 
-// Applies [other] keyboard_t9 to every live keyboard, for the same reason: both
+// Applies [other] keyboard_t9 to every live keyboard, for the same reason: the
 // panels already exist inside each keyboard, so only their visibility changes.
 void keyboard_refresh_type(void) {
-	bool t9 = config_get_int("other", "keyboard_t9", 0) != 0;
 	for (keyboard_t *kb = kb_list; kb; kb = kb->next) {
 		if (!kb->qwerty || !kb->t9) {
 			continue;
 		}
-		if (t9) {
-			lv_obj_set_hidden(kb->qwerty, true);
-			lv_obj_set_hidden(kb->t9, false);
-		} else {
-			lv_obj_set_hidden(kb->t9, true);
-			lv_obj_set_hidden(kb->qwerty, false);
-		}
+		kb_show_panel(kb);
 		keyboard_reset(kb);
 	}
 }

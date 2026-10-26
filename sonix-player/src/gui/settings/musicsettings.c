@@ -24,7 +24,6 @@
 #include "src/gui/shell/theme.h"
 #include "src/system/audio/alsa-controls.h"
 #include "src/gui/shell/topbar.h"
-#include "src/system/device/sysinfo.h"
 #include "src/system/playback/playlist.h"
 #include "src/system/playback/sleeptimer.h"
 #include "src/system/audio/audio.h"
@@ -583,7 +582,10 @@ static const volume_output_t VLIMIT_OUTPUTS[VLIMIT_OUTPUT_COUNT] = {VOLUME_OUTPU
 
 #define VLIMIT_STEPS (100 - VOLUME_LIMIT_MIN + 1)
 
-static bool vlimit_has_balanced(void) { return !sysinfo_model()->cs43131; }
+// Asked of the audio board rather than the model: sysinfo_model() is NULL when
+// system-info.json is missing or names a player this build does not know, and
+// the board can still be told by its chip.
+static bool vlimit_has_balanced(void) { return !alsa_board_is_cs43131(); }
 
 static void vlimit_refresh(void) {
 	bool on = volume_limit_enabled();

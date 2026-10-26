@@ -1,3 +1,4 @@
+
 #ifndef KBLAYOUT_H
 #define KBLAYOUT_H
 
@@ -20,8 +21,8 @@
 // The letters are the layouts real keyboards have. English, Italian, Dutch and
 // Polish carry the same ones, as they do on a phone; what differs is German
 // (QWERTZ and the umlauts), Czech (QWERTZ), Spanish (the ñ), French (AZERTY),
-// Brazilian Portuguese (the ç) and Russian (ЙЦУКЕН). Accented letters come from
-// holding a key (kblayout_variant), on every layout.
+// Brazilian Portuguese (the ç), Russian (ЙЦУКЕН) and Japanese. Accented letters
+// come from holding a key (kblayout_variant), on every layout.
 
 typedef enum {
 	KB_LAYOUT_ENGLISH = 0,
@@ -34,6 +35,7 @@ typedef enum {
 	KB_LAYOUT_POLISH,
 	KB_LAYOUT_PORTUGUESE,
 	KB_LAYOUT_CZECH,
+	KB_LAYOUT_JAPANESE,
 	KB_LAYOUT_COUNT,
 } kblayout_t;
 

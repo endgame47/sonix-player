@@ -220,6 +220,7 @@ static bool press_dragged;
 // The now-playing card's widgets.
 static lv_obj_t *np_title;
 static lv_obj_t *np_artist;
+static lv_obj_t *np_transport; // the row of buttons under them
 static lv_obj_t *np_play_btn;
 static lv_obj_t *np_play_icon;
 static lv_obj_t *np_repeat_icon;
@@ -1883,6 +1884,42 @@ static lv_obj_t *make_flat_button(lv_obj_t *parent, int size, lv_event_cb_t cb) 
 	return btn;
 }
 
+// The now-playing card above its buttons -- the title, the artist and the space
+// over them -- is the way to the player: the sheet goes away and the player
+// comes up, as from the Music page. A tap only: a press that moved the sheet is
+// not one, as for the sheet's other tap targets. Taps on the row of buttons are
+// the buttons' own, and those between them, bubbled up from the row, are nobody's.
+static void np_card_clicked_cb(lv_event_t *e) {
+	if (press_dragged) {
+		return;
+	}
+	if (lv_event_get_target(e) != np_card) {
+		return;
+	}
+	lv_indev_t *indev = lv_indev_active();
+	if (indev && np_transport) {
+		lv_point_t p;
+		lv_area_t row;
+		lv_indev_get_point(indev, &p);
+		lv_obj_get_coords(np_transport, &row);
+		if (p.y >= row.y1) {
+			return; // under the title and artist: the card's edge round the buttons
+		}
+	}
+
+	device_state_t state;
+	device_state_get(&state);
+	if (!state.live && !state.current_file[0]) {
+		return; // nothing playing, and no player to show
+	}
+
+	quickpanel_close();
+	if (!player_sheet_is_open()) {
+		player_refresh_now_playing();
+		switch_screen(player_screen);
+	}
+}
+
 // The rounded surface each half of the panel sits on. Both cards are the same
 // size and stack from the top of the sheet with one gap between them, so
 // together they fill the screen instead of floating in the middle of it.
@@ -2166,6 +2203,7 @@ void quickpanel_init(gui_config_t *cfg) {
 	lv_obj_set_flex_flow(np_card, LV_FLEX_FLOW_COLUMN);
 	lv_obj_set_flex_align(np_card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 	lv_obj_set_style_pad_gap(np_card, 6, 0);
+	lv_obj_add_event_cb(np_card, np_card_clicked_cb, LV_EVENT_CLICKED, NULL);
 
 	// Title and artist are centred and scroll when too long, the same treatment
 	// as the player's now-playing lines. Each is exactly one line of its own
@@ -2189,6 +2227,7 @@ void quickpanel_init(gui_config_t *cfg) {
 	scrolltext_apply(np_artist);
 
 	lv_obj_t *transport = lv_obj_create(np_card);
+	np_transport = transport;
 	lv_obj_set_size(transport, lv_pct(100), 96);
 	lv_obj_set_style_bg_opa(transport, 0, 0);
 	lv_obj_set_style_border_width(transport, 0, 0);
