@@ -6,7 +6,8 @@
 
 // A 10-band graphic equalizer applied in software to the decoded PCM, the
 // same shape as the stock player's "geq_band_gain" (10 bands): peaking
-// biquads at the standard octave centres, +/-12 dB per band.
+// biquads at the standard octave centres, +/-12 dB per band in half-dB steps,
+// of one of three widths.
 //
 // The UI thread sets gains; the audio thread calls eq_process() on every
 // buffer and quietly rebuilds its filter state when something changed.
@@ -14,6 +15,10 @@
 #define EQ_BANDS 10
 #define EQ_GAIN_MIN_DB (-12)
 #define EQ_GAIN_MAX_DB 12
+#define EQ_STEP_TENTHS 5
+
+// How wide each band reaches into its neighbours. [eq] width.
+enum { EQ_WIDTH_WIDE, EQ_WIDTH_NORMAL, EQ_WIDTH_NARROW, EQ_WIDTHS };
 
 // Loads enabled + band gains from the config. Call once at boot, before
 // playback can start.
@@ -22,8 +27,21 @@ void eq_init(void);
 void eq_set_enabled(bool enabled); // saved to config
 bool eq_get_enabled(void);
 
-void eq_set_band(int band, int gain_db); // clamped, saved to config
-int eq_get_band(int band);
+void eq_set_band(int band, int gain_db); // whole dB, clamped, saved to config
+
+// Tenths of a dB, clamped and rounded to EQ_STEP_TENTHS. The setter does not
+// write the file: eq_save() does, when a finger lifts.
+void eq_set_band_tenths(int band, int tenths);
+int eq_get_band_tenths(int band);
+void eq_save(void);
+
+void eq_set_width(int width); // saved to config
+int eq_get_width(void);
+
+// The graphic equaliser's response at each of `count` frequencies in `freqs`
+// (Hz), into `out_tenths` in tenths of a dB, as the engine builds it at
+// `sample_rate`: the curve the page draws.
+void eq_response_curve(const int *freqs, int count, int sample_rate, int *out_tenths);
 
 // Every band back to 0 dB.
 void eq_reset(void);

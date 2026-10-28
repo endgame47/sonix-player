@@ -12,7 +12,7 @@
 #include "src/gui/library/libraryscan.h"
 #include "src/gui/nowplaying/player.h"
 #include "src/gui/shell/confirm.h"
-#include "src/gui/audio/eqsettings.h"
+#include "src/gui/audio/eqpage.h"
 #include "src/gui/audio/msebsettings.h"
 #include "src/gui/audio/peqpage.h"
 #include "src/gui/nowplaying/coverflow.h"
@@ -172,7 +172,6 @@ static lv_obj_t *mseb_sliders[MSEB_BANDS];
 static lv_obj_t *mseb_values[MSEB_BANDS];
 
 static lv_obj_t *mseb_reset_btn;
-static lv_obj_t *eq_reset_btn;
 
 // A reset that would reset nothing is not offered: the button greys out with
 // the page's own switch.
@@ -295,7 +294,17 @@ static void fade_slider_cb(lv_event_t *e) {
 
 static void build_fade_page(gui_config_t *cfg) {
 	fade_screen = lv_obj_create(NULL);
-	lv_obj_t *container = settingsrow_page(fade_screen, cfg, "fade");
+	lv_obj_t *container = settingsrow_page(fade_screen, cfg, "musicsettings_crossfade_gapless");
+	settingsrow_title_corner_slots(settingsrow_page_title(fade_screen), cfg, 0);
+
+	// No gaps between tracks. Underneath it is a PCM that stays open (see
+	// audio.h): it works only for music on the card, and only between tracks of
+	// the same format. The engine's state and not the file's: with nothing
+	// saved the engine starts with gapless off (see main.c).
+	settingsrow_toggle(container, "musicsettings_gapless_playback", &gapless_switch, gapless_toggle_cb);
+	if (musicsettings_gapless_enabled()) {
+		lv_obj_add_state(gapless_switch, LV_STATE_CHECKED);
+	}
 
 	fade_card = settingsrow_toggle_slider(container, "fade", FADE_STEPS, &fade_switch, &fade_value,
 										  &fade_slider, fade_toggle_cb, fade_slider_cb);
@@ -541,9 +550,17 @@ static void balance_slider_cb(lv_event_t *e) {
 	balance_set_value_label(balance_get_value());
 }
 
+static lv_obj_t *mono_row, *mono_switch;
+
+static void mono_cb(lv_event_t *e) {
+	(void)e;
+	mono_set_enabled(lv_obj_has_state(mono_switch, LV_STATE_CHECKED));
+}
+
 static void build_balance_page(gui_config_t *cfg) {
 	balance_screen = lv_obj_create(NULL);
-	lv_obj_t *container = settingsrow_page(balance_screen, cfg, "musicsettings_channel_balance");
+	lv_obj_t *container = settingsrow_page(balance_screen, cfg, "musicsettings_balance_mono");
+	settingsrow_title_corner_slots(settingsrow_page_title(balance_screen), cfg, 0);
 
 	balance_card = settingsrow_toggle_slider(container, "musicsettings_balance", BALANCE_STEPS, &balance_switch,
 											 &balance_value, &balance_slider, balance_toggle_cb, balance_slider_cb);
@@ -555,6 +572,12 @@ static void build_balance_page(gui_config_t *cfg) {
 	lv_obj_add_style(note, &theme_style_text_dim, 0);
 	lv_obj_set_style_text_font(note, &font_ui_22, 0);
 	lv_label_set_text(note, tr("musicsettings_balance_note"));
+
+	// Both channels as one, for a single earbud or one ear.
+	mono_row = settingsrow_toggle(container, "musicsettings_mono_audio", &mono_switch, mono_cb);
+	if (mono_get_enabled()) {
+		lv_obj_add_state(mono_switch, LV_STATE_CHECKED);
+	}
 
 	balance_refresh();
 	switcher_attach_back_gesture(balance_screen);
@@ -814,27 +837,9 @@ static void mseb_reset_cb(lv_event_t *e) {
 	confirm_show("musicsettings_reset_mseb", "musicsettings_mseb_reset_confirm_note", "reset", mseb_reset_action, NULL);
 }
 
-static void refresh_eq_sliders_values(void);
-
-static void eq_reset_action(void *user) {
-	(void)user;
-	eq_reset();
-	refresh_eq_sliders_values();
-}
-
-static void eq_reset_cb(lv_event_t *e) {
-	(void)e;
-	confirm_show("musicsettings_reset_the_equaliser", "musicsettings_eq_reset_confirm_note", "reset", eq_reset_action, NULL);
-}
-
 static void mseb_open_settings_cb(lv_event_t *e) {
 	(void)e;
 	switch_screen(msebsettings_screen());
-}
-
-static void eq_open_settings_cb(lv_event_t *e) {
-	(void)e;
-	switch_screen(eqsettings_screen());
 }
 
 // Puts every MSEB slider where the engine's values are -- after a reset, a
@@ -968,161 +973,8 @@ static void remember_volume_cb(lv_event_t *e) {
 	config_save();
 }
 
-// ---------------------------------------------------------------------------
-// Equaliser: the 10-band graphic EQ (src/system/eq.c), one vertical slider per
-// octave band, +/-12 dB.
-// ---------------------------------------------------------------------------
-
+// The graphic equaliser's page lives in eqpage.c.
 static lv_obj_t *eq_screen;
-static lv_obj_t *eq_enable_switch;
-static lv_obj_t *eq_sliders[EQ_BANDS];
-
-// Puts every equalizer slider where the engine's gains are, after a reset.
-static void refresh_eq_sliders_values(void) {
-	for (int i = 0; i < EQ_BANDS; i++) {
-		if (eq_sliders[i]) {
-			lv_slider_set_value(eq_sliders[i], eq_get_band(i), LV_ANIM_OFF);
-		}
-	}
-}
-
-static void eq_apply_sliders_enabled(bool enabled) {
-	for (int i = 0; i < EQ_BANDS; i++) {
-		if (!eq_sliders[i]) {
-			continue;
-		}
-		if (enabled) {
-			lv_obj_remove_state(eq_sliders[i], LV_STATE_DISABLED);
-		} else {
-			lv_obj_add_state(eq_sliders[i], LV_STATE_DISABLED);
-		}
-	}
-}
-
-static void eq_enable_cb(lv_event_t *e) {
-	(void)e;
-	bool on = lv_obj_has_state(eq_enable_switch, LV_STATE_CHECKED);
-	eq_set_enabled(on);
-	eq_apply_sliders_enabled(on);
-	reset_button_enabled(eq_reset_btn, on);
-}
-
-static void eq_slider_cb(lv_event_t *e) {
-	int band = (int)(intptr_t)lv_event_get_user_data(e);
-	if (band >= 0 && band < EQ_BANDS && eq_sliders[band]) {
-		eq_set_band(band, (int)lv_slider_get_value(eq_sliders[band]));
-	}
-}
-
-// "31" ... "16k": the label under each slider.
-static void eq_freq_text(int freq, char *out, size_t size) {
-	freq &= 0xffff; // the table tops out at 16000; quiets -Wformat-truncation
-	if (freq >= 1000) {
-		snprintf(out, size, "%dk", freq / 1000);
-	} else {
-		snprintf(out, size, "%d", freq);
-	}
-}
-
-// Re-paint the sliders' fills after a theme/accent change.
-static void refresh_eq_sliders(void) {
-	for (int i = 0; i < EQ_BANDS; i++) {
-		theme_apply_slider_knob(eq_sliders[i]);
-		if (eq_sliders[i]) {
-			lv_obj_set_style_bg_color(eq_sliders[i], theme()->accent, LV_PART_INDICATOR);
-			lv_obj_set_style_bg_color(eq_sliders[i], theme()->text_secondary, LV_PART_MAIN);
-		}
-	}
-}
-
-static void build_eq_page(gui_config_t *cfg) {
-	eq_screen = lv_obj_create(NULL);
-	lv_obj_t *container = settingsrow_page(eq_screen, cfg, "equaliser");
-
-	settingsrow_toggle(container, "on", &eq_enable_switch, eq_enable_cb);
-	if (eq_get_enabled()) {
-		lv_obj_add_state(eq_enable_switch, LV_STATE_CHECKED);
-	}
-
-	// The band card: ten vertical sliders side by side, frequency underneath.
-	lv_obj_t *card = lv_obj_create(container);
-	lv_obj_set_width(card, lv_pct(100));
-	lv_obj_set_height(card, 360);
-	lv_obj_add_style(card, &theme_style_card, 0);
-	lv_obj_set_style_radius(card, 12, 0);
-	lv_obj_set_style_border_width(card, 0, 0);
-	lv_obj_set_style_shadow_width(card, 0, 0);
-	lv_obj_set_style_pad_all(card, 14, 0);
-	lv_obj_set_style_pad_gap(card, 0, 0);
-	lv_obj_set_scrollable(card, false);
-	lv_obj_set_flex_flow(card, LV_FLEX_FLOW_ROW);
-	lv_obj_set_flex_align(card, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-	for (int i = 0; i < EQ_BANDS; i++) {
-		lv_obj_t *column = lv_obj_create(card);
-		lv_obj_set_size(column, 38, lv_pct(100));
-		lv_obj_set_style_bg_opa(column, 0, 0);
-		lv_obj_set_style_border_width(column, 0, 0);
-		lv_obj_set_style_pad_all(column, 0, 0);
-		lv_obj_set_style_pad_gap(column, 8, 0);
-		lv_obj_set_scrollable(column, false);
-		lv_obj_set_flex_flow(column, LV_FLEX_FLOW_COLUMN);
-		lv_obj_set_flex_align(column, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-		lv_obj_t *slider = lv_slider_create(column);
-		lv_obj_set_size(slider, 6, lv_pct(80));
-		lv_slider_set_range(slider, EQ_GAIN_MIN_DB, EQ_GAIN_MAX_DB);
-		lv_slider_set_value(slider, eq_get_band(i), LV_ANIM_OFF);
-
-		lv_obj_set_style_radius(slider, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-		lv_obj_set_style_bg_color(slider, theme()->text_secondary, LV_PART_MAIN);
-		lv_obj_set_style_bg_opa(slider, LV_OPA_40, LV_PART_MAIN);
-		lv_obj_set_style_radius(slider, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
-		lv_obj_set_style_bg_color(slider, theme()->accent, LV_PART_INDICATOR);
-		lv_obj_set_style_radius(slider, LV_RADIUS_CIRCLE, LV_PART_KNOB);
-		lv_obj_set_style_bg_color(slider, lv_color_white(), LV_PART_KNOB);
-		theme_apply_slider_knob(slider);
-		lv_obj_set_style_pad_all(slider, 7, LV_PART_KNOB);
-		lv_obj_set_style_shadow_width(slider, 6, LV_PART_KNOB);
-		lv_obj_set_style_shadow_opa(slider, LV_OPA_30, LV_PART_KNOB);
-		lv_obj_set_style_shadow_color(slider, lv_color_black(), LV_PART_KNOB);
-		// A 6 px trough is no touch target; each column's full width is.
-		lv_obj_set_ext_click_area(slider, 16);
-		lv_obj_add_event_cb(slider, eq_slider_cb, LV_EVENT_VALUE_CHANGED, (void *)(intptr_t)i);
-
-		eq_sliders[i] = slider;
-
-		char text[8];
-		eq_freq_text(eq_band_freq[i], text, sizeof(text));
-		lv_obj_t *label = lv_label_create(column);
-		lv_label_set_text(label, text);
-		lv_obj_add_style(label, &theme_style_text_dim, 0);
-		lv_obj_set_style_text_font(label, &font_ui_18, 0);
-	}
-
-	// A dead slider looks dead: half opacity while the EQ is off.
-	for (int i = 0; i < EQ_BANDS; i++) {
-		lv_obj_set_style_opa(eq_sliders[i], LV_OPA_40, LV_STATE_DISABLED);
-	}
-	eq_apply_sliders_enabled(eq_get_enabled());
-
-	// The gear and the reset, in the corner, like the MSEB page.
-	corner_button(eq_screen, cfg, 0, &icon_music_settings, eq_open_settings_cb, NULL);
-	eq_reset_btn = corner_button(eq_screen, cfg, 1, &icon_reset, eq_reset_cb, NULL);
-	reset_button_enabled(eq_reset_btn, eq_get_enabled());
-	eqsettings_set_reload_cb(refresh_eq_sliders_values);
-
-	// What the scale means, in one dim line under the sliders.
-	lv_obj_t *note = lv_label_create(container);
-	lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
-	lv_obj_set_width(note, lv_pct(100));
-	lv_obj_add_style(note, &theme_style_text_dim, 0);
-	lv_obj_set_style_text_font(note, &font_ui_18, 0);
-	lv_label_set_text(note, tr("musicsettings_eq_note"));
-
-	switcher_attach_back_gesture(eq_screen);
-	theme_register_refresh(refresh_eq_sliders);
-}
 
 // ---------------------------------------------------------------------------
 // What the control centre's quick buttons reach in here: the two pages, and
@@ -1172,15 +1024,7 @@ void musicsettings_set_high_gain(bool enabled) {
 
 void musicsettings_set_eq_enabled(bool enabled) {
 	eq_set_enabled(enabled);
-	if (eq_enable_switch) {
-		if (enabled) {
-			lv_obj_add_state(eq_enable_switch, LV_STATE_CHECKED);
-		} else {
-			lv_obj_remove_state(eq_enable_switch, LV_STATE_CHECKED);
-		}
-	}
-	eq_apply_sliders_enabled(enabled);
-	reset_button_enabled(eq_reset_btn, enabled);
+	eqpage_refresh();
 	refresh_active_chevrons();
 }
 
@@ -1765,12 +1609,6 @@ static void build_nowplaying_page(gui_config_t *cfg) {
 }
 
 static lv_obj_t *endless_shuffle_switch;
-static lv_obj_t *mono_switch;
-
-static void mono_cb(lv_event_t *e) {
-	(void)e;
-	mono_set_enabled(lv_obj_has_state(mono_switch, LV_STATE_CHECKED));
-}
 
 static void endless_shuffle_cb(lv_event_t *e) {
 	(void)e;
@@ -1831,39 +1669,10 @@ static void queue_add_pick_cb(lv_event_t *e) {
 
 static void build_playback_page(gui_config_t *cfg) {
 	playback_screen = lv_obj_create(NULL);
-	lv_obj_t *container = settingsrow_page(playback_screen, cfg, "musicsettings_playback_options");
+	lv_obj_t *container = settingsrow_page(playback_screen, cfg, "musicsettings_playback_queue");
 	// No corner buttons on this page, so the heading can have the width the
-	// default reserves for one -- "Opzioni di riproduzione" does not fit without
-	// it.
+	// default reserves for one.
 	settingsrow_title_corner_slots(settingsrow_page_title(playback_screen), cfg, 0);
-
-	// No gaps between tracks. Underneath it is a PCM that stays open (see
-	// audio.h): it works only for music on the card, and only between tracks of
-	// the same format.
-	// The engine's state and not the file's: with nothing saved the engine
-	// starts with gapless off (see main.c), and the switch has to say so.
-	settingsrow_toggle(container, "musicsettings_gapless_playback", &gapless_switch, gapless_toggle_cb);
-	if (musicsettings_gapless_enabled()) {
-		lv_obj_add_state(gapless_switch, LV_STATE_CHECKED);
-	}
-
-	// ReplayGain: off, corrected per track, corrected per album or corrected per track when shuffled.
-	rg_card = settingsrow_toggle_pills(container, "musicsettings_replay_gain", rg_toggle_cb, &rg_switch, &rg_pills);
-	rg_track_pill = settingsrow_pill(rg_pills, "track", REPLAYGAIN_TRACK, rg_pick_cb);
-	rg_album_pill = settingsrow_pill(rg_pills, "albums", REPLAYGAIN_ALBUM, rg_pick_cb);
-	rg_track_when_shuffled_pill = settingsrow_pill(rg_pills, "track_when_shuffled", REPLAYGAIN_TRACK_WHEN_SHUFFLED, rg_pick_cb);
-	rg_refresh();
-
-	// The fade at the two ends of a track: a page of its own because it carries
-	// a length as well as a switch.
-	build_fade_page(cfg);
-	fade_row = settingsrow_add(container, "fade", NULL, switch_screen_cb, fade_screen);
-
-	// Both channels as one, for a single earbud or one ear.
-	settingsrow_toggle(container, "musicsettings_mono_audio", &mono_switch, mono_cb);
-	if (mono_get_enabled()) {
-		lv_obj_add_state(mono_switch, LV_STATE_CHECKED);
-	}
 
 	// "Add to queue" in the library, the search and the browser: next, as it
 	// always was, or at the end.
@@ -1926,6 +1735,147 @@ static void build_playback_page(gui_config_t *cfg) {
 	switcher_attach_back_gesture(playback_screen);
 }
 
+// ---------------------------------------------------------------------------
+// DSD: how loud it comes out.
+// ---------------------------------------------------------------------------
+
+static lv_obj_t *dsd_screen;
+
+static void build_dsd_page(gui_config_t *cfg) {
+	dsd_screen = lv_obj_create(NULL);
+	lv_obj_t *container = settingsrow_page(dsd_screen, cfg, "musicsettings_dsd");
+
+	// The DAC is the only thing that plays DSD here, so this is the only place
+	// its level can be touched at all. Loaded before the row: the row paints
+	// itself from what the audio side holds.
+	alsa_set_dsd_gain_index((int)config_get_int("audio", "dsd_gain", 0));
+	settingsrow_toggle_pills(container, "musicsettings_dsd_gain", dsd_gain_toggle_cb, &dsd_gain_switch,
+							 &dsd_gain_pills);
+	for (int i = 0; i < DSD_GAIN_MAX_DB; i++) {
+		char text[16];
+		snprintf(text, sizeof(text), "+%d dB", i + 1);
+		dsd_gain_pill[i] = settingsrow_pill_text(dsd_gain_pills, text, i + 1, dsd_gain_pick_cb);
+	}
+	dsd_gain_refresh();
+
+	switcher_attach_back_gesture(dsd_screen);
+}
+
+// ---------------------------------------------------------------------------
+// Bit-perfect: the samples reach the DAC as the decoder made them, every
+// effect passed over (audio_set_bit_perfect). The settings that touch the sound
+// are switched off for as long as it is on, and put back as they were when it
+// goes off (bit_perfect_hold); their rows and the control centre's buttons are
+// greyed out meanwhile.
+//
+// What was on is written down in [bit_perfect_hold] the moment it comes on;
+// `held` while the settings are switched off.
+// ---------------------------------------------------------------------------
+
+#define BP_SECTION "bit_perfect_hold"
+
+static lv_obj_t *bit_perfect_switch;
+
+static bool bp_saved(const char *key) { return config_get_int(BP_SECTION, key, 0) != 0; }
+
+static void bp_note(const char *key, long value) { config_set_int(BP_SECTION, key, value); }
+
+// Greyed out and deaf to touch, or back as it was.
+static void bp_dim(lv_obj_t *obj, bool off) {
+	if (!obj) {
+		return;
+	}
+	lv_obj_set_state(obj, LV_STATE_DISABLED, off);
+	lv_obj_set_style_opa(obj, off ? LV_OPA_40 : LV_OPA_COVER, 0);
+	// The default theme greys a disabled button over: the page rows would turn
+	// a different grey from the cards beside them. The fade alone says it.
+	lv_obj_set_style_recolor_opa(obj, LV_OPA_TRANSP, LV_STATE_DISABLED);
+}
+
+static void bp_disable(lv_obj_t *obj, bool off) {
+	if (obj) {
+		lv_obj_set_state(obj, LV_STATE_DISABLED, off);
+	}
+}
+
+static void bit_perfect_paint(void) {
+	bool on = audio_get_bit_perfect();
+	bp_dim(eq_row, on);
+	bp_dim(peq_row, on);
+	bp_dim(mseb_row, on);
+	bp_dim(soundfield_row, on);
+	bp_dim(crossfeed_row, on);
+	bp_dim(balance_row, on);
+	bp_dim(fade_card, on);
+	bp_disable(fade_switch, on);
+	bp_disable(fade_slider, on);
+	bp_dim(rg_card, on);
+	bp_disable(rg_switch, on);
+	bp_dim(mono_row, on);
+	bp_disable(mono_switch, on);
+}
+
+// Holds the settings off (`on`) or puts them back, when they are not already
+// that way.
+static void bit_perfect_hold(bool on) {
+	if (on == bp_saved("held")) {
+		return;
+	}
+	if (on) {
+		// Written down before anything is switched off.
+		bp_note("replaygain", (long)replaygain_mode());
+		bp_note("eq", eq_get_enabled());
+		bp_note("peq", peq_get_enabled());
+		bp_note("mseb", mseb_get_enabled());
+		bp_note("soundfield", soundfield_get_enabled());
+		bp_note("crossfeed", crossfeed_get_enabled());
+		bp_note("balance", balance_get_enabled());
+		bp_note("mono", mono_get_enabled());
+		bp_note("fade", musicsettings_fade_enabled());
+		bp_note("held", 1);
+		config_save();
+	}
+
+	replaygain_set_mode(on ? REPLAYGAIN_OFF
+						   : (replaygain_mode_t)config_get_int(BP_SECTION, "replaygain", REPLAYGAIN_OFF));
+	rg_apply_to_loaded_track();
+	rg_refresh();
+	musicsettings_set_eq_enabled(!on && bp_saved("eq"));
+	peq_set_enabled(!on && bp_saved("peq"));
+	musicsettings_set_mseb_enabled(!on && bp_saved("mseb"));
+	soundfield_set_enabled(!on && bp_saved("soundfield"));
+	if (soundfield_switch) {
+		soundfield_refresh();
+	}
+	crossfeed_set_enabled(!on && bp_saved("crossfeed"));
+	if (crossfeed_switch) {
+		crossfeed_refresh();
+	}
+	balance_set_enabled(!on && bp_saved("balance"));
+	if (balance_switch) {
+		balance_refresh();
+	}
+	mono_set_enabled(!on && bp_saved("mono"));
+	if (mono_switch) {
+		lv_obj_set_state(mono_switch, LV_STATE_CHECKED, mono_get_enabled());
+	}
+	musicsettings_set_fade_enabled(!on && bp_saved("fade"));
+
+	bp_note("held", on ? 1 : 0);
+	config_save();
+	refresh_active_chevrons();
+}
+
+static void bit_perfect_toggle_cb(lv_event_t *e) {
+	(void)e;
+	bool on = lv_obj_has_state(bit_perfect_switch, LV_STATE_CHECKED);
+	config_set_int("audio", "bit_perfect", on ? 1 : 0);
+	config_save();
+	audio_set_bit_perfect(on);
+	bit_perfect_hold(on);
+	bit_perfect_paint();
+}
+
 static void musicsettings_loaded_cb(lv_event_t *e) {
 	(void)e;
 	rg_refresh();
@@ -1934,16 +1884,13 @@ static void musicsettings_loaded_cb(lv_event_t *e) {
 void musicsettings_init(gui_config_t *cfg) {
 	lv_obj_t *container = settingsrow_page(musicsettings_screen, cfg, "music");
 
-	// The pages of behaviour first: how the index is built, what playback does
-	// around a track, how the library's lists and the now-playing page look,
-	// and Last.fm, which only reports what was played. Then the sound, from the
-	// widest tool to the narrowest, and the DAC's own switches at the end.
+	// In groups: the library, what playback does around a track, the sound from
+	// the engine's gains to the effects, the volume, and the DAC's own switches
+	// at the end.
+	settingsrow_heading(container, "musicsettings_section_library");
 	artistexceptions_init(cfg, organize_touched);
 	build_scan_page(cfg);
 	settingsrow_add(container, "musicsettings_scan_options", NULL, switch_screen_cb, scan_screen);
-
-	build_playback_page(cfg);
-	settingsrow_add(container, "musicsettings_playback_options", NULL, switch_screen_cb, playback_screen);
 
 	build_library_page(cfg);
 	settingsrow_add(container, "musicsettings_library", NULL, switch_screen_cb, library_screen);
@@ -1954,55 +1901,64 @@ void musicsettings_init(gui_config_t *cfg) {
 	lastfmsettings_init(cfg);
 	settingsrow_add(container, "lastfm", NULL, switch_screen_cb, lastfmsettings_screen());
 
-	build_eq_page(cfg);
+	settingsrow_heading(container, "musicsettings_section_playback");
+	build_playback_page(cfg);
+	settingsrow_add(container, "musicsettings_playback_queue", NULL, switch_screen_cb, playback_screen);
+
+	build_fade_page(cfg);
+	fade_row = settingsrow_add(container, "musicsettings_crossfade_gapless", NULL, switch_screen_cb, fade_screen);
+
+	settingsrow_heading(container, "musicsettings_section_sound");
+	// First: while it is on, nothing under it acts on the sound.
+	settingsrow_toggle(container, "musicsettings_bit_perfect", &bit_perfect_switch, bit_perfect_toggle_cb);
+	bool bit_perfect_on = config_get_int("audio", "bit_perfect", 0) != 0;
+	if (bit_perfect_on) {
+		lv_obj_add_state(bit_perfect_switch, LV_STATE_CHECKED);
+	}
+	audio_set_bit_perfect(bit_perfect_on);
+
+	// ReplayGain: off, corrected per track, corrected per album or corrected
+	// per track when shuffled.
+	rg_card = settingsrow_toggle_pills(container, "musicsettings_replay_gain", rg_toggle_cb, &rg_switch, &rg_pills);
+	rg_track_pill = settingsrow_pill(rg_pills, "track", REPLAYGAIN_TRACK, rg_pick_cb);
+	rg_album_pill = settingsrow_pill(rg_pills, "albums", REPLAYGAIN_ALBUM, rg_pick_cb);
+	rg_track_when_shuffled_pill =
+		settingsrow_pill(rg_pills, "track_when_shuffled", REPLAYGAIN_TRACK_WHEN_SHUFFLED, rg_pick_cb);
+	rg_refresh();
+
+	eqpage_init(cfg);
+	eq_screen = eqpage_screen();
 	eq_row = settingsrow_add(container, "equaliser", NULL, switch_screen_cb, eq_screen);
 
-	// PEQ right below: the same thing said more precisely, so whoever comes
-	// looking for the equaliser finds the slider one first and the parametric
-	// one next to it.
+	// PEQ right below: the same thing said more precisely.
 	peqpage_init(cfg);
 	peq_row = settingsrow_add(container, "peq", NULL, switch_screen_cb, peqpage_screen());
 
 	build_mseb_page(cfg);
 	mseb_row = settingsrow_add(container, "mseb", NULL, switch_screen_cb, mseb_screen);
 
+	settingsrow_heading(container, "musicsettings_section_effects");
 	build_soundfield_page(cfg);
 	soundfield_row = settingsrow_add(container, "musicsettings_soundfield", NULL, switch_screen_cb, soundfield_screen);
 
-	// Crossfeed sits next to soundfield because they are relatives: one widens
-	// the stereo image, the other pulls it back inside the head. Anyone looking
-	// for one wants to see the other.
+	// Crossfeed next to soundfield: one widens the stereo image, the other
+	// pulls it back inside the head.
 	build_crossfeed_page(cfg);
 	crossfeed_row = settingsrow_add(container, "musicsettings_crossfeed", NULL, switch_screen_cb, crossfeed_screen);
 
 	build_balance_page(cfg);
-	balance_row = settingsrow_add(container, "musicsettings_channel_balance", NULL, switch_screen_cb, balance_screen);
+	balance_row = settingsrow_add(container, "musicsettings_balance_mono", NULL, switch_screen_cb, balance_screen);
 
+	settingsrow_heading(container, "musicsettings_section_volume");
 	build_volume_limit_page(cfg);
 	vlimit_row = settingsrow_add(container, "musicsettings_volume_limit", NULL, switch_screen_cb, vlimit_screen);
 
+	settingsrow_heading(container, "musicsettings_section_dac");
 	// The gain step: off = low gain (the stock default), on = +6 dB.
 	settingsrow_toggle(container, "musicsettings_high_gain", &gain_switch, gain_toggle_cb);
 	if (config_get_int("audio", "high_gain", 0)) {
 		lv_obj_add_state(gain_switch, LV_STATE_CHECKED);
 	}
-
-	// How loud DSD comes out. The DAC is the only thing that plays it here, so
-	// this is the only place its level can be touched at all.
-	//
-	// What was chosen last time is loaded before the row rather than with the
-	// other settings at the end of this function: the row paints itself from
-	// what the audio side holds, so a load after it would leave the switch off
-	// with the compensation on.
-	alsa_set_dsd_gain_index((int)config_get_int("audio", "dsd_gain", 0));
-	settingsrow_toggle_pills(container, "musicsettings_dsd_gain", dsd_gain_toggle_cb, &dsd_gain_switch,
-							 &dsd_gain_pills);
-	for (int i = 0; i < DSD_GAIN_MAX_DB; i++) {
-		char text[16];
-		snprintf(text, sizeof(text), "+%d dB", i + 1);
-		dsd_gain_pill[i] = settingsrow_pill_text(dsd_gain_pills, text, i + 1, dsd_gain_pick_cb);
-	}
-	dsd_gain_refresh();
 
 	build_filter_page(cfg);
 	settingsrow_add(container, "musicsettings_filters", NULL, switch_screen_cb, dacfilter_screen);
@@ -2022,6 +1978,9 @@ void musicsettings_init(gui_config_t *cfg) {
 		}
 	}
 
+	build_dsd_page(cfg);
+	settingsrow_add(container, "musicsettings_dsd", NULL, switch_screen_cb, dsd_screen);
+
 	theme_register_refresh(rg_refresh);
 	theme_register_refresh(dsd_gain_refresh);
 	lv_obj_add_event_cb(musicsettings_screen, musicsettings_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
@@ -2036,9 +1995,13 @@ void musicsettings_init(gui_config_t *cfg) {
 	set_dac_nos((int)config_get_int("audio", "dac_nos", 0));
 	set_high_gain((int)config_get_int("audio", "high_gain", 0));
 
-
 	lv_obj_add_event_cb(musicsettings_screen, screen_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
 	// The parametric equaliser's chevron, which no setter on this page repaints,
 	// follows the control centre's button while the page is under it.
 	lv_obj_add_event_cb(musicsettings_screen, screen_loaded_cb, LV_EVENT_REFRESH, NULL);
+
+	// The hold made to match the switch where the two disagree: a run cut
+	// short between switching and writing it down.
+	bit_perfect_hold(bit_perfect_on);
+	bit_perfect_paint();
 }

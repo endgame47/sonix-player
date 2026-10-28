@@ -679,6 +679,20 @@ lv_obj_t *settingsrow_action(lv_obj_t *parent, const char *name, lv_event_cb_t c
 	return row;
 }
 
+lv_obj_t *settingsrow_heading(lv_obj_t *parent, const char *title) {
+	lv_obj_t *heading = lv_label_create(parent);
+	lv_label_set_text(heading, tr(title));
+	lv_label_set_long_mode(heading, LV_LABEL_LONG_WRAP);
+	lv_obj_set_width(heading, lv_pct(100));
+	lv_obj_add_style(heading, &theme_style_text_dim, 0);
+	// The face of an album's disc headings ("Disc 2"), so a section of a page
+	// and a disc of a record read as the same kind of heading.
+	lv_obj_set_style_text_font(heading, &font_ui_20_bold, 0);
+	lv_obj_set_style_pad_top(heading, 14, 0);
+	lv_obj_set_style_pad_hor(heading, 6, 0);
+	return heading;
+}
+
 lv_obj_t *settingsrow_add(lv_obj_t *parent, const char *name, lv_obj_t **value_out, lv_event_cb_t cb,
 						  void *user_data) {
 	lv_obj_t *row = lv_btn_create(parent);

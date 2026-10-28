@@ -47,6 +47,10 @@ lv_obj_t *settingsrow_name_label(lv_obj_t *row);
 // in an ellipsis past that.
 void settingsrow_name_lines(lv_obj_t *row, int lines);
 
+// A section heading between groups of rows: small dimmed bold text, as an
+// album's disc headings, no card.
+lv_obj_t *settingsrow_heading(lv_obj_t *parent, const char *title);
+
 // The same row without the chevron, for an action that does not open a page:
 // the two library scans, which ask for confirmation instead.
 lv_obj_t *settingsrow_action(lv_obj_t *parent, const char *name, lv_event_cb_t cb, void *user_data);

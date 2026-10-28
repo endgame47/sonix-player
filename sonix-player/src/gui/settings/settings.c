@@ -55,6 +55,7 @@ static void headset_toggled_cb(lv_event_t *e) {
 
 static lv_obj_t *screensettings_screen;
 static lv_obj_t *othersettings_screen;
+static lv_obj_t *keyboard_screen;
 static lv_obj_t *brightness_slider;
 static lv_obj_t *brightness_value;
 static lv_obj_t *screen_off_value;
@@ -432,9 +433,11 @@ static void screenshot_toggled_cb(lv_event_t *e) {
 	screenshot_set_enabled(lv_obj_has_state(screenshot_switch, LV_STATE_CHECKED));
 }
 
+static void build_screenshot_card(lv_obj_t *container);
+
 static void build_other_page(gui_config_t *cfg) {
 	othersettings_screen = lv_obj_create(NULL);
-	lv_obj_t *container = settingsrow_page(othersettings_screen, cfg, "more");
+	lv_obj_t *container = settingsrow_page(othersettings_screen, cfg, "settings_keys");
 
 	settingsrow_toggle(container, "settings_in_line_remote", &headset_switch, headset_toggled_cb);
 	if (headset_controls_enabled()) {
@@ -449,7 +452,17 @@ static void build_other_page(gui_config_t *cfg) {
 	lv_slider_set_value(volume_step_slider, step - VOLUME_STEP_MIN, LV_ANIM_OFF);
 	lv_label_set_text_fmt(volume_step_value, "%d", step);
 	input_set_volume_step(step);
-	settingsrow_add(container, "control_centre", NULL, switch_screen_cb, ccsettings_screen);
+
+	// Screenshots: the option carries the key combination as a fixed subtitle.
+	// Without it the switch would enable something without saying how to use it.
+	build_screenshot_card(container);
+
+	switcher_attach_back_gesture(othersettings_screen);
+}
+
+static void build_keyboard_page(gui_config_t *cfg) {
+	keyboard_screen = lv_obj_create(NULL);
+	lv_obj_t *container = settingsrow_page(keyboard_screen, cfg, "settings_keyboard");
 
 	// Which alphabets the keyboard can be laid out in, above the shape of the
 	// keys: the letters matter more than whether they come ten to a row or
@@ -491,8 +504,10 @@ static void build_other_page(gui_config_t *cfg) {
 	refresh_kbtype_buttons();
 	theme_register_refresh(refresh_kbtype_buttons);
 
-	// Screenshots: the option carries the key combination as a fixed subtitle.
-	// Without it the switch would enable something without saying how to use it.
+	switcher_attach_back_gesture(keyboard_screen);
+}
+
+static void build_screenshot_card(lv_obj_t *container) {
 	lv_obj_t *shot_card = settingsrow_toggle(container, "devoptions_enable_screenshots", &screenshot_switch, screenshot_toggled_cb);
 	lv_obj_t *shot_name = lv_obj_get_child(shot_card, 0);
 	lv_obj_t *shot_toggle = lv_obj_get_child(shot_card, 1);
@@ -519,8 +534,6 @@ static void build_other_page(gui_config_t *cfg) {
 	if (screenshot_enabled()) {
 		lv_obj_add_state(screenshot_switch, LV_STATE_CHECKED);
 	}
-
-	switcher_attach_back_gesture(othersettings_screen);
 }
 
 void settings_init(gui_config_t *cfg) {
@@ -528,14 +541,22 @@ void settings_init(gui_config_t *cfg) {
 
 	build_screen_page(cfg);
 	build_other_page(cfg);
+	build_keyboard_page(cfg);
 
+	// In groups, like Music: how it looks, how it is driven, the device.
+	settingsrow_heading(container, "settings_section_personal");
 	settingsrow_add(container, "appearance", NULL, switch_screen_cb, appearance_screen);
 	settingsrow_add(container, "settings_screen", NULL, switch_screen_cb, screensettings_screen);
-	settingsrow_add(container, "date_and_time", NULL, clock_clicked_cb, NULL);
-	settingsrow_add(container, "power", NULL, switch_screen_cb, powersettings_screen);
 	language_bind_menu_row(settingsrow_add(container, "language", NULL, switch_screen_cb, language_screen));
 
-	settingsrow_add(container, "more", NULL, switch_screen_cb, othersettings_screen);
+	settingsrow_heading(container, "settings_section_controls");
+	settingsrow_add(container, "settings_keys", NULL, switch_screen_cb, othersettings_screen);
+	settingsrow_add(container, "control_centre", NULL, switch_screen_cb, ccsettings_screen);
+	settingsrow_add(container, "settings_keyboard", NULL, switch_screen_cb, keyboard_screen);
+
+	settingsrow_heading(container, "settings_section_device");
+	settingsrow_add(container, "date_and_time", NULL, clock_clicked_cb, NULL);
+	settingsrow_add(container, "power", NULL, switch_screen_cb, powersettings_screen);
 	settingsrow_add(container, "system", NULL, switch_screen_cb, systempage_screen);
 	// Hidden until the build number in System > Info is tapped five times.
 	// Built regardless, so unlocking is a visibility change rather than a

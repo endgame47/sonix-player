@@ -19,6 +19,7 @@
 #include "src/gui/wireless/sonixlink.h"
 #include "src/gui/wireless/wifitransfer.h"
 #include "src/gui/shell/theme.h"
+#include "src/gui/shell/toast.h"
 #include "src/system/playback/audiobook.h"
 #include "src/system/streaming/podcast.h"
 #include "src/system/streaming/podcastcache.h"
@@ -31,6 +32,7 @@
 #include "src/gui/wireless/wifisettings.h"
 #include "src/system/remote/airplay.h"
 #include "src/system/audio/alsa-controls.h"
+#include "src/system/audio/audio.h"
 #include "src/system/bluetooth/bluetooth.h"
 #include "src/system/core/config.h"
 #include "src/system/playback/device_state.h"
@@ -1474,6 +1476,17 @@ static void refresh_audio_buttons(void) {
 	circle_button_set_on(sleep_podcast_btn, sleep_timer_armed(SLEEPTIMER_PODCAST));
 	circle_button_set_on(wifi_transfer_btn, wifitransfer_get_enabled());
 
+	// Bit-perfect holds the effects off (musicsettings.c): their buttons are
+	// greyed out and take no touch, the press that opens their page included.
+	bool pure = audio_get_bit_perfect();
+	lv_obj_t *effects[] = {eq_btn, mseb_btn, peq_btn, fade_btn};
+	for (size_t i = 0; i < sizeof(effects) / sizeof(effects[0]); i++) {
+		if (effects[i]) {
+			lv_obj_set_state(effects[i], LV_STATE_DISABLED, pure);
+			lv_obj_set_style_opa(effects[i], pure ? LV_OPA_40 : LV_OPA_COVER, 0);
+		}
+	}
+
 	bool high = musicsettings_high_gain();
 	if (gain_btn) {
 		lv_obj_t *icon = lv_obj_get_child(gain_btn, 0);
@@ -1630,11 +1643,24 @@ static void airplay_clicked_cb(lv_event_t *e) {
 	toggled();
 }
 
+// Bit-perfect holds the effects off (musicsettings.c) and their buttons are
+// disabled: a click that still reaches one changes nothing and says why.
+static bool held_by_bit_perfect(void) {
+	if (!audio_get_bit_perfect()) {
+		return false;
+	}
+	toast_plain("bit_perfect_holds_off");
+	return true;
+}
+
 static void mseb_clicked_cb(lv_event_t *e) {
 	(void)e;
 	if (long_press_consumed) {
 		long_press_consumed = false;
 		return; // the long press that opened the page must not also toggle
+	}
+	if (held_by_bit_perfect()) {
+		return;
 	}
 	musicsettings_set_mseb_enabled(!mseb_get_enabled());
 	toggled();
@@ -1646,6 +1672,9 @@ static void eq_clicked_cb(lv_event_t *e) {
 		long_press_consumed = false;
 		return;
 	}
+	if (held_by_bit_perfect()) {
+		return;
+	}
 	musicsettings_set_eq_enabled(!eq_get_enabled());
 	toggled();
 }
@@ -1654,6 +1683,9 @@ static void fade_clicked_cb(lv_event_t *e) {
 	(void)e;
 	if (long_press_consumed) {
 		long_press_consumed = false;
+		return;
+	}
+	if (held_by_bit_perfect()) {
 		return;
 	}
 	musicsettings_set_fade_enabled(!musicsettings_fade_enabled());
@@ -1814,11 +1846,14 @@ static void peq_clicked_cb(lv_event_t *e) {
 		long_press_consumed = false;
 		return;
 	}
+	if (held_by_bit_perfect()) {
+		return;
+	}
 	peq_set_enabled(!peq_get_enabled());
 	toggled();
 }
 
-// Gapless, the switch on the playback options page: a tap flips it, a hold
+// Gapless, the switch on the fade and gapless page: a tap flips it, a hold
 // opens that page. Looked up at the press, like the sleep timer's page.
 static void gapless_clicked_cb(lv_event_t *e) {
 	(void)e;
@@ -1832,7 +1867,7 @@ static void gapless_clicked_cb(lv_event_t *e) {
 
 static void gapless_page_cb(lv_event_t *e) {
 	(void)e;
-	open_page(musicsettings_playback_screen());
+	open_page(musicsettings_fade_screen());
 }
 
 static void gain_clicked_cb(lv_event_t *e) {

@@ -17,8 +17,9 @@
 // bands the stock player's geq carries).
 const int eq_band_freq[EQ_BANDS] = {31, 63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000};
 
-// Peaking filters one octave wide read as the natural "graphic EQ" shape.
-#define EQ_BAND_Q 1.1f
+// The bands' Q for each width (eq_set_width): about an octave and a half, an
+// octave (the natural "graphic EQ" shape), two thirds of one.
+static const double EQ_WIDTH_Q[EQ_WIDTHS] = {0.7, 1.1, 2.0};
 
 // ---------------------------------------------------------------------------
 // Shared settings. Written by the UI thread, read by the audio thread; every
@@ -27,8 +28,9 @@ const int eq_band_freq[EQ_BANDS] = {31, 63, 125, 250, 500, 1000, 2000, 4000, 800
 // next buffer rebuilds again from the settled values.
 // ---------------------------------------------------------------------------
 
-static volatile int band_gain_db[EQ_BANDS];
+static volatile int band_tenths[EQ_BANDS]; // tenths of a dB, in steps of EQ_STEP_TENTHS
 static volatile int eq_enabled;
+static volatile int eq_width = EQ_WIDTH_NORMAL;
 static volatile int mseb_value[MSEB_BANDS];
 
 // PEQ. The bands are not `volatile`: they are structs, and a volatile struct is
@@ -239,20 +241,49 @@ static void peq_load(void) {
 	}
 }
 
+// A gain in tenths of a dB, inside the range and on a step.
+static int band_clamp(long tenths) {
+	if (tenths < EQ_GAIN_MIN_DB * 10) {
+		tenths = EQ_GAIN_MIN_DB * 10;
+	}
+	if (tenths > EQ_GAIN_MAX_DB * 10) {
+		tenths = EQ_GAIN_MAX_DB * 10;
+	}
+	long half = EQ_STEP_TENTHS / 2;
+	tenths = tenths >= 0 ? (tenths + half) / EQ_STEP_TENTHS : -((-tenths + half) / EQ_STEP_TENTHS);
+	return (int)(tenths * EQ_STEP_TENTHS);
+}
+
+// A band in whole dB, rounded half away from zero.
+static int band_whole_db(int tenths) { return (tenths >= 0 ? tenths + 5 : tenths - 5) / 10; }
+
+// "t<band>" in tenths of a dB; "band<band>" in whole dB, which is all an older
+// configuration has.
+#define NO_TENTHS 100000
+
+// Both keys of a band, so an older build reading the file still finds its own.
+static void band_store(int i) {
+	char key[16];
+	snprintf(key, sizeof(key), "band%d", i);
+	config_set_int("eq", key, band_whole_db(band_tenths[i]));
+	snprintf(key, sizeof(key), "t%d", i);
+	config_set_int("eq", key, band_tenths[i]);
+}
+
 void eq_init(void) {
 	eq_enabled = (int)config_get_int("eq", "enabled", 0);
 	for (int i = 0; i < EQ_BANDS; i++) {
 		char key[16];
-		snprintf(key, sizeof(key), "band%d", i);
-		long g = config_get_int("eq", key, 0);
-		if (g < EQ_GAIN_MIN_DB) {
-			g = EQ_GAIN_MIN_DB;
+		snprintf(key, sizeof(key), "t%d", i);
+		long t = config_get_int("eq", key, NO_TENTHS);
+		if (t == NO_TENTHS) {
+			snprintf(key, sizeof(key), "band%d", i);
+			t = config_get_int("eq", key, 0) * 10;
 		}
-		if (g > EQ_GAIN_MAX_DB) {
-			g = EQ_GAIN_MAX_DB;
-		}
-		band_gain_db[i] = (int)g;
+		band_tenths[i] = band_clamp(t);
 	}
+	long width = config_get_int("eq", "width", EQ_WIDTH_NORMAL);
+	eq_width = width >= 0 && width < EQ_WIDTHS ? (int)width : EQ_WIDTH_NORMAL;
 	sf_enabled = (int)config_get_int("soundfield", "enabled", 0);
 	sf_width = clamp_width((int)config_get_int("soundfield", "width", SOUNDFIELD_WIDTH_DEFAULT));
 
@@ -302,26 +333,35 @@ void eq_set_enabled(bool enabled) {
 
 bool eq_get_enabled(void) { return eq_enabled != 0; }
 
-void eq_set_band(int band, int gain_db) {
+void eq_set_band_tenths(int band, int tenths) {
 	if (band < 0 || band >= EQ_BANDS) {
 		return;
 	}
-	if (gain_db < EQ_GAIN_MIN_DB) {
-		gain_db = EQ_GAIN_MIN_DB;
-	}
-	if (gain_db > EQ_GAIN_MAX_DB) {
-		gain_db = EQ_GAIN_MAX_DB;
-	}
-	band_gain_db[band] = gain_db;
+	band_tenths[band] = band_clamp(tenths);
 	settings_version++;
+	band_store(band);
+}
 
-	char key[16];
-	snprintf(key, sizeof(key), "band%d", band);
-	config_set_int("eq", key, gain_db);
+int eq_get_band_tenths(int band) { return (band >= 0 && band < EQ_BANDS) ? band_tenths[band] : 0; }
+
+void eq_save(void) { config_save(); }
+
+void eq_set_band(int band, int gain_db) {
+	eq_set_band_tenths(band, gain_db * 10);
 	config_save();
 }
 
-int eq_get_band(int band) { return (band >= 0 && band < EQ_BANDS) ? band_gain_db[band] : 0; }
+void eq_set_width(int width) {
+	if (width < 0 || width >= EQ_WIDTHS) {
+		return;
+	}
+	eq_width = width;
+	settings_version++;
+	config_set_int("eq", "width", width);
+	config_save();
+}
+
+int eq_get_width(void) { return eq_width; }
 
 // ---------------------------------------------------------------------------
 // MSEB settings. Same contract as the graphic EQ's: UI writes, audio thread
@@ -428,6 +468,41 @@ static void mkdir_with_parent(const char *dir) {
 	mkdir(dir, 0777);
 }
 
+// The bands of the preset file at `path` in tenths of a dB, and its width (-1
+// when it names none). "t<band>" in tenths wins over "b<band>" in whole dB,
+// which is all a file from an older build has. False when the file cannot be
+// read or holds no band.
+static bool preset_read(const char *path, int tenths[EQ_BANDS], int *width) {
+	FILE *f = fopen(path, "r");
+	if (!f) {
+		return false;
+	}
+	bool fine[EQ_BANDS] = {false};
+	bool any = false;
+	*width = -1;
+	for (int i = 0; i < EQ_BANDS; i++) {
+		tenths[i] = 0;
+	}
+	char line[128];
+	while (fgets(line, sizeof(line), f)) {
+		int index = 0, value = 0;
+		if (sscanf(line, "t%d=%d", &index, &value) == 2 && index >= 0 && index < EQ_BANDS) {
+			tenths[index] = band_clamp(value);
+			fine[index] = true;
+			any = true;
+		} else if (sscanf(line, "b%d=%d", &index, &value) == 2 && index >= 0 && index < EQ_BANDS) {
+			if (!fine[index]) {
+				tenths[index] = band_clamp((long)value * 10);
+			}
+			any = true;
+		} else if (sscanf(line, "w=%d", &value) == 1) {
+			*width = value;
+		}
+	}
+	fclose(f);
+	return any;
+}
+
 bool eq_preset_save(const char *name) {
 	if (!eq_preset_dir[0] || !name_is_usable(name)) {
 		return false;
@@ -444,8 +519,12 @@ bool eq_preset_save(const char *name) {
 	}
 	fputs("# equalizer preset\n", f);
 	for (int i = 0; i < EQ_BANDS; i++) {
-		fprintf(f, "b%d=%d\n", i, band_gain_db[i]);
+		fprintf(f, "b%d=%d\n", i, band_whole_db(band_tenths[i]));
 	}
+	for (int i = 0; i < EQ_BANDS; i++) {
+		fprintf(f, "t%d=%d\n", i, band_tenths[i]);
+	}
+	fprintf(f, "w=%d\n", eq_width);
 	fclose(f);
 	return true;
 }
@@ -458,19 +537,20 @@ bool eq_preset_load(const char *name) {
 	char path[700];
 	snprintf(path, sizeof(path), "%s/%s.ini", eq_preset_dir, name);
 
-	FILE *f = fopen(path, "r");
-	if (!f) {
+	int tenths[EQ_BANDS], width;
+	if (!preset_read(path, tenths, &width)) {
 		return false;
 	}
-
-	char line[128];
-	while (fgets(line, sizeof(line), f)) {
-		int index = 0, value = 0;
-		if (sscanf(line, "b%d=%d", &index, &value) == 2 && index >= 0 && index < EQ_BANDS) {
-			eq_set_band(index, value);
-		}
+	for (int i = 0; i < EQ_BANDS; i++) {
+		band_tenths[i] = tenths[i];
+		band_store(i);
 	}
-	fclose(f);
+	if (width >= 0 && width < EQ_WIDTHS) {
+		eq_width = width;
+		config_set_int("eq", "width", width);
+	}
+	settings_version++;
+	config_save();
 	return true;
 }
 
@@ -1425,6 +1505,65 @@ static double biquad_gain_db_at(const biquad_t *f, double w) {
 	return 10.0 * log10(ratio);
 }
 
+// The graphic equaliser's ten filters at `rate`, for measuring its curve:
+// `live[i]` false for a band at 0 dB, which adds nothing. False when the rate
+// is unusable.
+static bool graphic_filters(biquad_t f[EQ_BANDS], bool live[EQ_BANDS], int rate) {
+	if (rate <= 0) {
+		return false;
+	}
+	for (int i = 0; i < EQ_BANDS; i++) {
+		int tenths = band_tenths[i];
+		memset(&f[i], 0, sizeof(f[i]));
+		live[i] = tenths != 0 &&
+				  biquad_set_coeffs(&f[i], F_PEAK, eq_band_freq[i], (double)tenths / 10.0, EQ_WIDTH_Q[eq_width], rate);
+	}
+	return true;
+}
+
+// The curve of those filters at `freq`, in dB.
+static double graphic_db_at(const biquad_t f[EQ_BANDS], const bool live[EQ_BANDS], double freq, int rate) {
+	if (freq * 2.0 >= (double)rate) {
+		return 0.0;
+	}
+	double w = 2.0 * M_PI * freq / (double)rate;
+	double total = 0.0;
+	for (int i = 0; i < EQ_BANDS; i++) {
+		if (live[i]) {
+			total += biquad_gain_db_at(&f[i], w);
+		}
+	}
+	return total;
+}
+
+// The curve's highest point, 20 Hz to 20 kHz, never below 0 dB.
+#define GRAPHIC_PEAK_POINTS 72
+static double graphic_peak_db(int rate) {
+	biquad_t f[EQ_BANDS];
+	bool live[EQ_BANDS];
+	if (!graphic_filters(f, live, rate)) {
+		return 0.0;
+	}
+	double peak = 0.0;
+	for (int i = 0; i <= GRAPHIC_PEAK_POINTS; i++) {
+		double db = graphic_db_at(f, live, 20.0 * pow(1000.0, (double)i / GRAPHIC_PEAK_POINTS), rate);
+		if (db > peak) {
+			peak = db;
+		}
+	}
+	return peak;
+}
+
+void eq_response_curve(const int *freqs, int count, int sample_rate, int *out_tenths) {
+	biquad_t f[EQ_BANDS];
+	bool live[EQ_BANDS];
+	bool ok = graphic_filters(f, live, sample_rate);
+	for (int i = 0; i < count; i++) {
+		double db = ok ? graphic_db_at(f, live, (double)freqs[i], sample_rate) : 0.0;
+		out_tenths[i] = (int)(db >= 0 ? db * 10.0 + 0.5 : db * 10.0 - 0.5);
+	}
+}
+
 // ---------------------------------------------------------------------------
 // MSEB's own pre-gain
 //
@@ -1582,13 +1721,22 @@ static void filters_rebuild(int rate) {
 		}
 	}
 	for (int i = 0; i < EQ_BANDS; i++) {
-		double gain = eq_enabled ? (double)band_gain_db[i] : 0.0;
-		slot_update(MSEB_FILTERS + i, F_PEAK, eq_band_freq[i], gain, EQ_BAND_Q, rate, rate_changed);
+		double gain = eq_enabled ? (double)band_tenths[i] / 10.0 : 0.0;
+		slot_update(MSEB_FILTERS + i, F_PEAK, eq_band_freq[i], gain, EQ_WIDTH_Q[eq_width], rate, rate_changed);
 		if (chain_active[MSEB_FILTERS + i]) {
 			active++;
 			if (gain > max_boost) {
 				max_boost = gain;
 			}
+		}
+	}
+
+	// Neighbouring bands overlap, the wider the more, and two boosted side by
+	// side rise above either: the curve's own peak is what has to fit.
+	if (eq_enabled) {
+		double peak = graphic_peak_db(rate);
+		if (peak > max_boost) {
+			max_boost = peak;
 		}
 	}
 
@@ -1708,12 +1856,7 @@ int eq_auto_headroom_tenths(void) {
 	double total = (double)mseb_auto_preamp_db(EQ_HEADROOM_REFERENCE_RATE);
 
 	if (eq_enabled) {
-		for (int i = 0; i < EQ_BANDS; i++) {
-			double gain = (double)band_gain_db[i];
-			if (gain > max_boost) {
-				max_boost = gain;
-			}
-		}
+		max_boost = graphic_peak_db(EQ_HEADROOM_REFERENCE_RATE);
 	}
 	if (peq_enabled) {
 		for (int i = 0; i < PEQ_BANDS; i++) {

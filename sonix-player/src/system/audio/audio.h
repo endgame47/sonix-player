@@ -124,6 +124,13 @@ unsigned audio_loop_turns(void);
 void audio_set_gapless(bool enabled);
 bool audio_get_gapless(void);
 
+// Bit-perfect: the samples reach the DAC as the decoder made them -- no
+// ReplayGain, equaliser, effect or fade -- from the next buffer on. Over
+// Bluetooth the chain still runs. The software volume of a USB device with no
+// control of its own still applies.
+void audio_set_bit_perfect(bool on);
+bool audio_get_bit_perfect(void);
+
 // Fade: ramp the last seconds of a track down to silence and the first seconds
 // of the next up from it. One decoder means the two cannot truly overlap, so
 // this is the ramp-out/ramp-in version of the effect. `seconds` is clamped to

@@ -450,6 +450,12 @@ bool audio_output_is_bluetooth(void) { return output_is_bluetooth(); }
 static volatile bool fade_enabled;
 static volatile int fade_secs = 3;
 
+// Bit-perfect (audio_set_bit_perfect): the samples reach the output as the
+// decoder made them, with no effect and no fade. Read at every buffer, so a
+// change takes effect at once. Bluetooth is left out: the link has a rate and
+// a codec of its own whatever is sent to it.
+static volatile bool bit_perfect;
+
 void audio_set_fade(bool enabled, int seconds) {
 	if (seconds < 1) {
 		seconds = 1;
@@ -869,6 +875,16 @@ void audio_set_gapless(bool enabled) {
 }
 
 bool audio_get_gapless(void) { return gapless_enabled; }
+
+// Whether the decoded path passes this buffer through untouched.
+static bool pure_now(void) { return bit_perfect && !output_is_bluetooth(); }
+
+void audio_set_bit_perfect(bool on) {
+	bit_perfect = on;
+	printf("audio: bit-perfect %s\n", on ? "on" : "off");
+}
+
+bool audio_get_bit_perfect(void) { return bit_perfect; }
 
 // How long a stream is given to play out what it still holds before it is
 // dropped instead. Comfortably more than the deepest buffer this player opens,
@@ -2961,7 +2977,9 @@ static void play_wav_file(const char *filepath) {
 				wav_convert(&info, raw, buffer, (size_t)frames_read);
 			}
 			health_lap(&health, STAGE_READ);
-			if (info.out_bits == 16) {
+			if (pure_now()) {
+				// Bit-perfect: as read.
+			} else if (info.out_bits == 16) {
 				replaygain_process((short *)buffer, frames_read, info.channels);
 				eq_process((short *)buffer, frames_read, info.channels, info.sample_rate);
 				// Soundfield last, on the finished stereo pair -- the stock
@@ -3017,7 +3035,7 @@ static void play_wav_file(const char *filepath) {
 		}
 
 		snd_pcm_uframes_t frames_to_write = (snd_pcm_uframes_t)frames_read;
-		if (fade_enabled) {
+		if (fade_enabled && !pure_now()) {
 			int gain = fade_gain_q10((double)bytes_played / bytes_per_sec, (double)info.data_size / bytes_per_sec);
 			int samples = (int)frames_to_write * info.channels;
 			if (info.out_bits == 32) {
@@ -3650,7 +3668,7 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 					continue;
 				}
 			}
-			if (frames_read != 0 && !passthrough) {
+			if (frames_read != 0 && !passthrough && !pure_now()) {
 				// ReplayGain first: it is a correction to the source level, so
 				// everything after it works on the level the listener will
 				// actually hear.
@@ -3682,7 +3700,7 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 				input_frames = frames_read;
 			}
 			health_lap(&health, STAGE_READ);
-			if (frames_read != 0) {
+			if (frames_read != 0 && !pure_now()) {
 				replaygain_process((short *)buffer, (int)frames_read, channels);
 				// The graphic EQ, in place on the decoded block. A no-op when off.
 				eq_process((short *)buffer, (int)frames_read, channels, sample_rate);
@@ -3798,7 +3816,7 @@ static void play_decoded_file(const char *filepath, decode_format_t format) {
 		}
 
 		// The fade is a gain, so it is one more thing a DoP stream cannot have.
-		if (fade_enabled && !passthrough) {
+		if (fade_enabled && !passthrough && !pure_now()) {
 			int gain = fade_gain_q10((double)bytes_played / bytes_per_sec, (double)total_frames / sample_rate);
 			int samples = (int)frames_read * channels;
 			if (out_bits == 32) {
